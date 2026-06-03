@@ -1,816 +1,1085 @@
-from flask import Flask, request, jsonify, render_template_string
-import requests
+from __future__ import annotations
+
+import json
+import logging
 import os
-import datetime
-import re
-import xml.etree.ElementTree as ET
+import threading
+import time
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
+
+import requests
+import websocket
+from flask import Flask, jsonify, render_template_string
+
 
 app = Flask(__name__)
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-def get_btc_price():
-    try:
-        res = requests.get("https://mempool.space/api/v1/prices", timeout=5)
-        return res.json().get("USD", 75000)
-    except:
-        return 75000
+BINANCE_REST = os.environ.get("BINANCE_REST", "https://fapi.binance.com")
+BINANCE_WS = os.environ.get("BINANCE_WS", "wss://fstream.binance.com")
 
-# ─── 1. 链上巨鲸转账 ───────────────────────────────────────
-def get_whale_txns():
-    try:
-        res = requests.get("https://mempool.space/api/mempool/recent", timeout=10)
-        txns = res.json()
-        btc_price = get_btc_price()
-        big = []
-        for tx in txns:
-            btc = tx.get("value", 0) / 1e8
-            if btc >= 100:
-                usd = round(btc * btc_price)
-                big.append({
-                    "hash": tx.get("txid", "")[:20] + "...",
-                    "btc": round(btc, 2),
-                    "usd": usd,
-                    "fee": round(tx.get("fee", 0) / 1e8, 6),
-                    "alert": btc >= 500
-                })
-        big.sort(key=lambda x: x["btc"], reverse=True)
-        return big[:20]
-    except:
-        return []
+SNAPSHOT_INTERVAL = int(os.environ.get("SNAPSHOT_INTERVAL", "12"))
+RADAR_SYMBOL_LIMIT = int(os.environ.get("RADAR_SYMBOL_LIMIT", "45"))
+LARGE_TRADE_USD = float(os.environ.get("LARGE_TRADE_USD", "80000"))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "12"))
 
-# ─── 2. 成交量异动监控 ─────────────────────────────────────
-def get_volume_alerts():
+DEFAULT_WATCH_SYMBOLS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "SUIUSDT",
+    "TONUSDT",
+    "TRXUSDT",
+    "NEARUSDT",
+    "APTUSDT",
+    "OPUSDT",
+    "ARBUSDT",
+    "SEIUSDT",
+    "INJUSDT",
+    "RUNEUSDT",
+    "DOTUSDT",
+    "UNIUSDT",
+    "AAVEUSDT",
+    "FILUSDT",
+    "LTCUSDT",
+    "WIFUSDT",
+    "ORDIUSDT",
+    "ENAUSDT",
+    "1000PEPEUSDT",
+    "1000SHIBUSDT",
+    "1000BONKUSDT",
+]
+
+WATCH_SYMBOLS = [
+    s.strip().upper()
+    for s in os.environ.get("WATCH_SYMBOLS", ",".join(DEFAULT_WATCH_SYMBOLS)).split(",")
+    if s.strip()
+]
+
+MAJORS = {"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"}
+SYMBOL_BLOCKLIST = {
+    "USDCUSDT",
+    "BUSDUSDT",
+    "FDUSDUSDT",
+    "TUSDUSDT",
+    "USDPUSDT",
+    "DAIUSDT",
+}
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def pct_change(new: float, old: float) -> float:
+    if not old:
+        return 0.0
+    return (new - old) / old * 100
+
+
+def fmt_symbol(symbol: str) -> str:
+    return symbol.replace("USDT", "")
+
+
+class MarketState:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.trade_tape: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=1400))
+        self.liquidations: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=700))
+        self.recent_events: deque[dict[str, Any]] = deque(maxlen=240)
+        self.radar: list[dict[str, Any]] = []
+        self.summary: dict[str, Any] = {}
+        self.meta: dict[str, Any] = {
+            "updated_at": 0,
+            "snapshot_interval": SNAPSHOT_INTERVAL,
+            "large_trade_usd": LARGE_TRADE_USD,
+            "watch_symbols": WATCH_SYMBOLS,
+            "ws_trade_connected": False,
+            "ws_liq_connected": False,
+            "snapshot_error": None,
+        }
+
+    def add_large_trade(self, event: dict[str, Any]) -> None:
+        with self.lock:
+            self.trade_tape[event["symbol"]].append(event)
+            self.recent_events.appendleft(event)
+
+    def add_liquidation(self, event: dict[str, Any]) -> None:
+        with self.lock:
+            self.liquidations[event["symbol"]].append(event)
+            self.recent_events.appendleft(event)
+
+    def set_ws_status(self, key: str, value: bool) -> None:
+        with self.lock:
+            self.meta[key] = value
+
+    def set_snapshot_error(self, error: str | None) -> None:
+        with self.lock:
+            self.meta["snapshot_error"] = error
+
+    def flow_for(self, symbol: str, seconds: int) -> dict[str, Any]:
+        cutoff = time.time() - seconds
+        with self.lock:
+            rows = [x for x in self.trade_tape.get(symbol, []) if x["ts"] >= cutoff]
+        buy = sum(x["notional"] for x in rows if x["side"] == "BUY")
+        sell = sum(x["notional"] for x in rows if x["side"] == "SELL")
+        largest = max((x["notional"] for x in rows), default=0.0)
+        return {
+            "buy_usd": round(buy, 2),
+            "sell_usd": round(sell, 2),
+            "net_usd": round(buy - sell, 2),
+            "total_usd": round(buy + sell, 2),
+            "largest_usd": round(largest, 2),
+            "buy_count": sum(1 for x in rows if x["side"] == "BUY"),
+            "sell_count": sum(1 for x in rows if x["side"] == "SELL"),
+        }
+
+    def liq_for(self, symbol: str, seconds: int) -> dict[str, Any]:
+        cutoff = time.time() - seconds
+        with self.lock:
+            rows = [x for x in self.liquidations.get(symbol, []) if x["ts"] >= cutoff]
+        long_liq = sum(x["notional"] for x in rows if x["side"] == "SELL")
+        short_liq = sum(x["notional"] for x in rows if x["side"] == "BUY")
+        largest = max((x["notional"] for x in rows), default=0.0)
+        return {
+            "long_liq_usd": round(long_liq, 2),
+            "short_liq_usd": round(short_liq, 2),
+            "total_usd": round(long_liq + short_liq, 2),
+            "largest_usd": round(largest, 2),
+            "count": len(rows),
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "radar": list(self.radar),
+                "events": list(self.recent_events)[:80],
+                "summary": dict(self.summary),
+                "meta": dict(self.meta),
+            }
+
+    def set_radar(self, radar: list[dict[str, Any]], summary: dict[str, Any]) -> None:
+        with self.lock:
+            self.radar = radar
+            self.summary = summary
+            self.meta["updated_at"] = now_ms()
+            self.meta["snapshot_error"] = None
+
+
+STATE = MarketState()
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": "BinanceFlowRadar/1.0"})
+
+
+def request_json(path: str, params: dict[str, Any] | None = None, timeout: float = 8) -> Any:
+    url = BINANCE_REST + path
+    response = HTTP.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def get_exchange_symbols() -> set[str]:
+    data = request_json("/fapi/v1/exchangeInfo", timeout=10)
+    symbols = set()
+    for item in data.get("symbols", []):
+        if (
+            item.get("status") == "TRADING"
+            and item.get("contractType") == "PERPETUAL"
+            and item.get("quoteAsset") == "USDT"
+            and item.get("symbol") not in SYMBOL_BLOCKLIST
+        ):
+            symbols.add(item["symbol"])
+    return symbols
+
+
+def get_all_tickers() -> dict[str, dict[str, Any]]:
+    rows = request_json("/fapi/v1/ticker/24hr", timeout=10)
+    return {x["symbol"]: x for x in rows if x.get("symbol", "").endswith("USDT")}
+
+
+def get_funding_map() -> dict[str, float]:
+    rows = request_json("/fapi/v1/premiumIndex", timeout=10)
+    return {x["symbol"]: float(x.get("lastFundingRate") or 0) * 100 for x in rows}
+
+
+def get_symbol_micro(symbol: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "symbol": symbol,
+        "oi_5m_pct": 0.0,
+        "oi_15m_pct": 0.0,
+        "oi_value": 0.0,
+        "taker_ratio": 1.0,
+        "taker_buy_pct": 50.0,
+        "price_5m_pct": 0.0,
+        "quote_volume_5m": 0.0,
+    }
     try:
-        # 获取所有币种24h数据
-        res = requests.get(
-            "https://api.coingecko.com/api/v3/coins/markets"
-            "?vs_currency=usd&order=volume_desc&per_page=100&page=1"
-            "&sparkline=false&price_change_percentage=24h",
-            timeout=10
+        oi_rows = request_json(
+            "/futures/data/openInterestHist",
+            {"symbol": symbol, "period": "5m", "limit": 4},
+            timeout=6,
         )
-        coins = res.json()
-        alerts = []
-        for c in coins:
-            vol = c.get("total_volume", 0)
-            mcap = c.get("market_cap", 0)
-            change = c.get("price_change_percentage_24h") or 0
-            # 成交量/市值比 > 0.5 且价格变动 > 5% 视为异动
-            if mcap > 0 and vol / mcap > 0.5 and abs(change) > 5:
-                alerts.append({
-                    "symbol": c.get("symbol", "").upper(),
-                    "name": c.get("name", ""),
-                    "price": c.get("current_price", 0),
-                    "change": round(change, 2),
-                    "volume": vol,
-                    "mcap": mcap,
-                    "vol_mcap_ratio": round(vol / mcap, 2),
-                    "alert": abs(change) > 15 or vol / mcap > 1.0
-                })
-        alerts.sort(key=lambda x: x["vol_mcap_ratio"], reverse=True)
-        return alerts[:30]
-    except:
-        return []
+        if isinstance(oi_rows, list) and oi_rows:
+            latest = float(oi_rows[-1].get("sumOpenInterestValue") or 0)
+            result["oi_value"] = latest
+            if len(oi_rows) >= 2:
+                prev = float(oi_rows[-2].get("sumOpenInterestValue") or 0)
+                result["oi_5m_pct"] = round(pct_change(latest, prev), 2)
+            if len(oi_rows) >= 4:
+                first = float(oi_rows[0].get("sumOpenInterestValue") or 0)
+                result["oi_15m_pct"] = round(pct_change(latest, first), 2)
+    except Exception:
+        pass
 
-# ─── 3. 合约未平仓量异动 ───────────────────────────────────
-def get_oi_alerts():
     try:
-        # 用CoinGlass公开API获取OI数据
-        symbols = [
-            "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
-            "DOGEUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","DOTUSDT",
-            "MATICUSDT","LTCUSDT","ATOMUSDT","UNIUSDT","TRXUSDT",
-            "NEARUSDT","APTUSDT","OPUSDT","ARBUSDT","SEIUSDT"
-        ]
-        res = requests.get(
-            "https://fapi.binance.com/fapi/v1/openInterest",
-            timeout=8
+        taker_rows = request_json(
+            "/futures/data/takerlongshortRatio",
+            {"symbol": symbol, "period": "5m", "limit": 1},
+            timeout=6,
         )
-        # Binance逐个查
-        results = []
-        for sym in symbols:
-            try:
-                r = requests.get(
-                    "https://fapi.binance.com/fapi/v1/openInterest?symbol=" + sym,
-                    timeout=5
-                )
-                d = r.json()
-                ticker_r = requests.get(
-                    "https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=" + sym,
-                    timeout=5
-                )
-                t = ticker_r.json()
-                oi = float(d.get("openInterest", 0))
-                price = float(t.get("lastPrice", 0))
-                oi_usd = oi * price
-                change = float(t.get("priceChangePercent", 0))
-                vol = float(t.get("quoteVolume", 0))
-                results.append({
-                    "symbol": sym.replace("USDT", ""),
-                    "price": price,
-                    "change": round(change, 2),
-                    "oi": round(oi, 0),
-                    "oi_usd": round(oi_usd),
-                    "volume": round(vol),
-                    "alert": abs(change) > 10 or vol > oi_usd * 2
-                })
-            except:
-                continue
-        results.sort(key=lambda x: abs(x["change"]), reverse=True)
-        return results
-    except:
-        return []
+        if isinstance(taker_rows, list) and taker_rows:
+            item = taker_rows[-1]
+            buy_vol = float(item.get("buyVol") or 0)
+            sell_vol = float(item.get("sellVol") or 0)
+            ratio = float(item.get("buySellRatio") or (buy_vol / sell_vol if sell_vol else 1))
+            total = buy_vol + sell_vol
+            result["taker_ratio"] = round(ratio, 3)
+            result["taker_buy_pct"] = round(buy_vol / total * 100, 1) if total else 50.0
+    except Exception:
+        pass
 
-# ─── 4. 巨鲸钱包监控 ──────────────────────────────────────
-def get_wallet_balances():
-    wallets = [
-        {"name": "Binance Cold Wallet 1", "address": "34xp4vRoCGJym3xR7yCVPFHoCNxv4Twseo", "emoji": "🟡"},
-        {"name": "MicroStrategy (Saylor)", "address": "1P5ZEDWTKTFGxQjZphgWPQUpe554WKDfHQ", "emoji": "📊"},
-        {"name": "Bitfinex Cold Wallet", "address": "3D2oetdNuZUqQHPJmcMDDHYoqkyNVsFk9r", "emoji": "💹"},
-        {"name": "Binance Hot Wallet", "address": "1NDyJtNTjmwk5xPNhjgAMu4HDHigtobu1s", "emoji": "🔥"},
-        {"name": "Kraken Exchange", "address": "3FupZp77ySr7jwoLYEJ9mwzJpvoNBXsBnE", "emoji": "🐙"},
-    ]
-    btc_price = get_btc_price()
-    result = []
-    for w in wallets:
-        try:
-            r = requests.get(
-                "https://blockchain.info/balance?active=" + w["address"],
-                timeout=6
-            )
-            bal = r.json().get(w["address"], {}).get("final_balance", 0) / 1e8
-            result.append({
-                "name": w["name"],
-                "address": w["address"][:14] + "...",
-                "full_address": w["address"],
-                "emoji": w["emoji"],
-                "btc": round(bal, 2),
-                "usd": round(bal * btc_price)
-            })
-        except:
-            result.append({
-                "name": w["name"],
-                "address": w["address"][:14] + "...",
-                "full_address": w["address"],
-                "emoji": w["emoji"],
-                "btc": None,
-                "usd": None
-            })
+    try:
+        klines = request_json(
+            "/fapi/v1/klines",
+            {"symbol": symbol, "interval": "1m", "limit": 6},
+            timeout=6,
+        )
+        if isinstance(klines, list) and len(klines) >= 2:
+            open_price = float(klines[0][1])
+            last_price = float(klines[-1][4])
+            quote_volume = sum(float(k[7]) for k in klines[-5:])
+            result["price_5m_pct"] = round(pct_change(last_price, open_price), 2)
+            result["quote_volume_5m"] = round(quote_volume, 2)
+    except Exception:
+        pass
+
     return result
 
-# ─── 5. SEC 13F 机构持仓 ───────────────────────────────────
-def get_sec_holdings(cik):
-    try:
-        headers = {"User-Agent": "WhaleTracker admin@whaletracker.com"}
-        cik_clean = str(int(cik))
-        cik_padded = cik_clean.zfill(10)
-        url = "https://data.sec.gov/submissions/CIK" + cik_padded + ".json"
-        res = requests.get(url, headers=headers, timeout=10)
-        data = res.json()
-        recent = data.get("filings", {}).get("recent", {})
-        forms = recent.get("form", [])
-        dates = recent.get("filingDate", [])
-        accessions = recent.get("accessionNumber", [])
-        latest_acc = None
-        latest_date = None
-        for i, form in enumerate(forms):
-            if form == "13F-HR":
-                latest_acc = accessions[i].replace("-", "")
-                latest_date = dates[i]
-                break
-        if not latest_acc:
-            return {"date": "N/A", "holdings": [], "total": 0, "error": "No 13F found"}
-        idx_res = requests.get(
-            "https://www.sec.gov/Archives/edgar/data/" + cik_clean + "/" + latest_acc + "/",
-            headers=headers, timeout=10
-        )
-        infotable_match = re.search(r'href="([^"]*infotable[^"]*)"', idx_res.text, re.IGNORECASE)
-        if not infotable_match:
-            infotable_match = re.search(r'href="([^"]*Information[^"]*\.xml)"', idx_res.text, re.IGNORECASE)
-        if infotable_match:
-            infotable_name = infotable_match.group(1).split("/")[-1]
-            h_url = "https://www.sec.gov/Archives/edgar/data/" + cik_clean + "/" + latest_acc + "/" + infotable_name
-            h_res = requests.get(h_url, headers=headers, timeout=10)
-            root = ET.fromstring(h_res.content)
-            holdings = []
-            total = 0
-            for info in root.iter():
-                if info.tag.endswith("infoTable"):
-                    try:
-                        name = ""
-                        value = 0
-                        shares = 0
-                        for child in info:
-                            tag = child.tag.split("}")[-1].lower()
-                            if tag == "nameofissuer":
-                                name = child.text or ""
-                            elif tag == "value":
-                                value = int(child.text or 0) * 1000
-                            elif tag == "sshprnamt":
-                                shares = int(child.text or 0)
-                        if name and value > 0:
-                            holdings.append({"name": name, "value": value, "shares": shares})
-                            total += value
-                    except:
-                        continue
-            holdings.sort(key=lambda x: x["value"], reverse=True)
-            return {"date": latest_date, "holdings": holdings[:15], "total": total}
-        return {"date": latest_date, "holdings": [], "total": 0, "error": "File not found"}
-    except Exception as e:
-        return {"date": "N/A", "holdings": [], "total": 0, "error": str(e)}
 
-# ─── 6. 国会交易 ───────────────────────────────────────────
-def get_congress_trades():
-    try:
-        res = requests.get(
-            "https://house-stock-watcher-data.s3-us-gov-west-1.amazonaws.com/data/all_transactions.json",
-            timeout=10
-        )
-        data = res.json()
-        valid = [t for t in data if t.get("transaction_date") and t.get("ticker") and t.get("ticker") != "--"]
-        recent = sorted(valid, key=lambda x: x.get("transaction_date", ""), reverse=True)[:25]
-        result = []
-        for t in recent:
-            trade_type = t.get("type", "").lower()
-            is_buy = "purchase" in trade_type
-            result.append({
-                "name": t.get("representative", "Unknown"),
-                "ticker": t.get("ticker", "N/A").strip(),
-                "type": "买入" if is_buy else "卖出",
-                "is_buy": is_buy,
-                "amount": t.get("amount", "N/A"),
-                "date": t.get("transaction_date", ""),
-                "asset": t.get("asset_description", "")[:50],
-                "party": t.get("party", "")
-            })
-        return result
-    except:
-        return []
+def choose_candidates(symbols: set[str], tickers: dict[str, dict[str, Any]]) -> list[str]:
+    available_watch = [s for s in WATCH_SYMBOLS if s in symbols]
+    ranked = sorted(
+        [
+            s
+            for s in symbols
+            if s in tickers and s not in SYMBOL_BLOCKLIST
+        ],
+        key=lambda s: float(tickers[s].get("quoteVolume") or 0),
+        reverse=True,
+    )
+    merged = []
+    for symbol in available_watch + ranked:
+        if symbol not in merged:
+            merged.append(symbol)
+        if len(merged) >= RADAR_SYMBOL_LIMIT:
+            break
+    return merged
 
-HTML = """<!DOCTYPE html>
-<html lang="zh">
+
+def reason_list(row: dict[str, Any]) -> list[str]:
+    reasons = []
+    if abs(row["flow_60s"]["net_usd"]) >= LARGE_TRADE_USD:
+        side = "主动买入" if row["flow_60s"]["net_usd"] > 0 else "主动卖出"
+        reasons.append(f"{side}净额 {money_short(abs(row['flow_60s']['net_usd']))}")
+    if row["oi_15m_pct"] >= 2:
+        reasons.append(f"OI 15m +{row['oi_15m_pct']}%")
+    elif row["oi_15m_pct"] <= -2:
+        reasons.append(f"OI 15m {row['oi_15m_pct']}%")
+    if row["taker_ratio"] >= 1.15:
+        reasons.append(f"主动买卖比 {row['taker_ratio']}")
+    elif row["taker_ratio"] <= 0.87:
+        reasons.append(f"主动买卖比 {row['taker_ratio']}")
+    if row["liq_5m"]["long_liq_usd"] >= LARGE_TRADE_USD:
+        reasons.append(f"多头爆仓 {money_short(row['liq_5m']['long_liq_usd'])}")
+    if row["liq_5m"]["short_liq_usd"] >= LARGE_TRADE_USD:
+        reasons.append(f"空头爆仓 {money_short(row['liq_5m']['short_liq_usd'])}")
+    if abs(row["funding_rate"]) >= 0.03:
+        reasons.append(f"资金费率 {row['funding_rate']:.4f}%")
+    if not reasons:
+        reasons.append("暂无强资金流证据")
+    return reasons[:4]
+
+
+def score_symbol(row: dict[str, Any]) -> dict[str, Any]:
+    flow = row["flow_60s"]
+    liq = row["liq_5m"]
+    total_flow = flow["total_usd"]
+    net_ratio = flow["net_usd"] / total_flow if total_flow else 0.0
+
+    long_score = 0.0
+    short_score = 0.0
+
+    if net_ratio > 0:
+        long_score += min(35, net_ratio * 35)
+    else:
+        short_score += min(35, abs(net_ratio) * 35)
+
+    flow_size_points = min(18, total_flow / max(LARGE_TRADE_USD, 1) * 4)
+    long_score += flow_size_points if flow["net_usd"] > 0 else 0
+    short_score += flow_size_points if flow["net_usd"] < 0 else 0
+
+    taker_ratio = row["taker_ratio"]
+    if taker_ratio > 1:
+        long_score += min(18, (taker_ratio - 1) * 28)
+    else:
+        short_score += min(18, (1 - taker_ratio) * 28)
+
+    if row["oi_15m_pct"] > 0:
+        if row["price_5m_pct"] >= 0:
+            long_score += min(22, row["oi_15m_pct"] * 4)
+        else:
+            short_score += min(22, row["oi_15m_pct"] * 4)
+
+    if row["price_5m_pct"] > 0:
+        long_score += min(12, row["price_5m_pct"] * 2)
+    else:
+        short_score += min(12, abs(row["price_5m_pct"]) * 2)
+
+    long_score += min(10, liq["short_liq_usd"] / max(LARGE_TRADE_USD, 1) * 3)
+    short_score += min(10, liq["long_liq_usd"] / max(LARGE_TRADE_USD, 1) * 3)
+
+    if row["funding_rate"] > 0.04:
+        long_score -= 8
+    if row["funding_rate"] < -0.04:
+        short_score -= 8
+
+    long_score = clamp(long_score, 0, 100)
+    short_score = clamp(short_score, 0, 100)
+
+    if long_score >= short_score and long_score >= 35:
+        signal = "LONG_PRESSURE"
+        score = round(long_score)
+    elif short_score > long_score and short_score >= 35:
+        signal = "SHORT_PRESSURE"
+        score = round(short_score)
+    else:
+        signal = "WATCH"
+        score = round(max(long_score, short_score))
+
+    return {
+        "signal": signal,
+        "score": score,
+        "long_score": round(long_score),
+        "short_score": round(short_score),
+        "reasons": reason_list(row),
+    }
+
+
+def money_short(value: float) -> str:
+    if value >= 1_000_000_000:
+        return f"${value / 1_000_000_000:.2f}B"
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"${value / 1_000:.0f}K"
+    return f"${value:.0f}"
+
+
+def build_radar() -> None:
+    symbols = get_exchange_symbols()
+    tickers = get_all_tickers()
+    funding = get_funding_map()
+    candidates = choose_candidates(symbols, tickers)
+
+    micro_map: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(get_symbol_micro, symbol): symbol for symbol in candidates}
+        for future in as_completed(futures):
+            data = future.result()
+            micro_map[data["symbol"]] = data
+
+    radar = []
+    for symbol in candidates:
+        ticker = tickers.get(symbol, {})
+        micro = micro_map.get(symbol, {"symbol": symbol})
+        price = float(ticker.get("lastPrice") or 0)
+        row = {
+            "symbol": symbol,
+            "base": fmt_symbol(symbol),
+            "is_major": symbol in MAJORS,
+            "price": price,
+            "change_24h_pct": round(float(ticker.get("priceChangePercent") or 0), 2),
+            "volume_24h": round(float(ticker.get("quoteVolume") or 0), 2),
+            "trade_count_24h": int(float(ticker.get("count") or 0)),
+            "funding_rate": round(funding.get(symbol, 0.0), 5),
+            "oi_5m_pct": micro.get("oi_5m_pct", 0.0),
+            "oi_15m_pct": micro.get("oi_15m_pct", 0.0),
+            "oi_value": round(micro.get("oi_value", 0.0), 2),
+            "taker_ratio": micro.get("taker_ratio", 1.0),
+            "taker_buy_pct": micro.get("taker_buy_pct", 50.0),
+            "price_5m_pct": micro.get("price_5m_pct", 0.0),
+            "quote_volume_5m": micro.get("quote_volume_5m", 0.0),
+            "flow_60s": STATE.flow_for(symbol, 60),
+            "flow_5m": STATE.flow_for(symbol, 300),
+            "liq_5m": STATE.liq_for(symbol, 300),
+        }
+        row.update(score_symbol(row))
+        radar.append(row)
+
+    radar.sort(
+        key=lambda x: (
+            x["score"],
+            abs(x["flow_60s"]["net_usd"]),
+            abs(x["oi_15m_pct"]),
+            x["volume_24h"],
+        ),
+        reverse=True,
+    )
+    strong_long = sum(1 for x in radar if x["signal"] == "LONG_PRESSURE" and x["score"] >= 60)
+    strong_short = sum(1 for x in radar if x["signal"] == "SHORT_PRESSURE" and x["score"] >= 60)
+    big_flow_60s = sum(x["flow_60s"]["total_usd"] for x in radar)
+    liq_5m = sum(x["liq_5m"]["total_usd"] for x in radar)
+    summary = {
+        "symbols": len(radar),
+        "strong_long": strong_long,
+        "strong_short": strong_short,
+        "large_flow_60s": round(big_flow_60s, 2),
+        "liquidation_5m": round(liq_5m, 2),
+        "binance_rest": BINANCE_REST,
+    }
+    STATE.set_radar(radar, summary)
+
+
+def snapshot_loop() -> None:
+    while True:
+        started = time.time()
+        try:
+            build_radar()
+        except Exception as exc:
+            logging.exception("snapshot failed")
+            STATE.set_snapshot_error(str(exc))
+        elapsed = time.time() - started
+        time.sleep(max(2, SNAPSHOT_INTERVAL - elapsed))
+
+
+def trade_ws_loop() -> None:
+    streams = "/".join(f"{symbol.lower()}@aggTrade" for symbol in WATCH_SYMBOLS)
+    if not streams:
+        return
+    url = f"{BINANCE_WS}/stream?streams={streams}"
+
+    def on_open(_: websocket.WebSocketApp) -> None:
+        logging.info("trade websocket connected")
+        STATE.set_ws_status("ws_trade_connected", True)
+
+    def on_close(_: websocket.WebSocketApp, __: Any, ___: Any) -> None:
+        logging.info("trade websocket closed")
+        STATE.set_ws_status("ws_trade_connected", False)
+
+    def on_error(_: websocket.WebSocketApp, error: Any) -> None:
+        logging.warning("trade websocket error: %s", error)
+        STATE.set_ws_status("ws_trade_connected", False)
+
+    def on_message(_: websocket.WebSocketApp, raw: str) -> None:
+        try:
+            payload = json.loads(raw).get("data", {})
+            symbol = payload.get("s")
+            price = float(payload.get("p") or 0)
+            qty = float(payload.get("q") or 0)
+            notional = price * qty
+            if not symbol or notional < LARGE_TRADE_USD:
+                return
+            side = "SELL" if payload.get("m") else "BUY"
+            STATE.add_large_trade(
+                {
+                    "type": "LARGE_TRADE",
+                    "ts": (payload.get("T") or now_ms()) / 1000,
+                    "symbol": symbol,
+                    "base": fmt_symbol(symbol),
+                    "side": side,
+                    "price": price,
+                    "qty": qty,
+                    "notional": round(notional, 2),
+                }
+            )
+        except Exception:
+            logging.exception("failed to parse trade message")
+
+    while True:
+        ws = websocket.WebSocketApp(
+            url,
+            on_open=on_open,
+            on_close=on_close,
+            on_error=on_error,
+            on_message=on_message,
+        )
+        ws.run_forever(ping_interval=20, ping_timeout=10)
+        STATE.set_ws_status("ws_trade_connected", False)
+        time.sleep(3)
+
+
+def liquidation_ws_loop() -> None:
+    url = f"{BINANCE_WS}/ws/!forceOrder@arr"
+
+    def on_open(_: websocket.WebSocketApp) -> None:
+        logging.info("liquidation websocket connected")
+        STATE.set_ws_status("ws_liq_connected", True)
+
+    def on_close(_: websocket.WebSocketApp, __: Any, ___: Any) -> None:
+        logging.info("liquidation websocket closed")
+        STATE.set_ws_status("ws_liq_connected", False)
+
+    def on_error(_: websocket.WebSocketApp, error: Any) -> None:
+        logging.warning("liquidation websocket error: %s", error)
+        STATE.set_ws_status("ws_liq_connected", False)
+
+    def on_message(_: websocket.WebSocketApp, raw: str) -> None:
+        try:
+            payload = json.loads(raw)
+            order = payload.get("o", {})
+            symbol = order.get("s")
+            price = float(order.get("ap") or order.get("p") or 0)
+            qty = float(order.get("q") or 0)
+            notional = price * qty
+            if not symbol or notional < LARGE_TRADE_USD:
+                return
+            side = order.get("S", "")
+            STATE.add_liquidation(
+                {
+                    "type": "LIQUIDATION",
+                    "ts": (order.get("T") or payload.get("E") or now_ms()) / 1000,
+                    "symbol": symbol,
+                    "base": fmt_symbol(symbol),
+                    "side": side,
+                    "price": price,
+                    "qty": qty,
+                    "notional": round(notional, 2),
+                }
+            )
+        except Exception:
+            logging.exception("failed to parse liquidation message")
+
+    while True:
+        ws = websocket.WebSocketApp(
+            url,
+            on_open=on_open,
+            on_close=on_close,
+            on_error=on_error,
+            on_message=on_message,
+        )
+        ws.run_forever(ping_interval=20, ping_timeout=10)
+        STATE.set_ws_status("ws_liq_connected", False)
+        time.sleep(3)
+
+
+def start_background_threads() -> None:
+    if getattr(app, "_radar_threads_started", False):
+        return
+    app._radar_threads_started = True
+    for target, name in [
+        (snapshot_loop, "snapshot-loop"),
+        (trade_ws_loop, "trade-ws"),
+        (liquidation_ws_loop, "liquidation-ws"),
+    ]:
+        thread = threading.Thread(target=target, name=name, daemon=True)
+        thread.start()
+
+
+HTML = r"""
+<!doctype html>
+<html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Whale Tracker Pro</title>
-<style>
-:root {
-  --bg: #f0f4ff;
-  --surface: #ffffff;
-  --surface2: #f8faff;
-  --border: #e2e8f8;
-  --accent: #6366f1;
-  --accent2: #8b5cf6;
-  --green: #059669;
-  --green-bg: #ecfdf5;
-  --red: #dc2626;
-  --red-bg: #fef2f2;
-  --orange: #ea580c;
-  --orange-bg: #fff7ed;
-  --yellow: #d97706;
-  --yellow-bg: #fffbeb;
-  --text: #0f172a;
-  --text2: #334155;
-  --muted: #64748b;
-}
-* { margin:0; padding:0; box-sizing:border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, "Inter", sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
-
-.header {
-  background: rgba(255,255,255,0.97);
-  backdrop-filter: blur(20px);
-  border-bottom: 1px solid var(--border);
-  padding: 0 24px; height: 60px;
-  display: flex; align-items: center; justify-content: space-between;
-  position: sticky; top: 0; z-index: 100;
-  box-shadow: 0 1px 12px rgba(99,102,241,0.06);
-}
-.logo { display: flex; align-items: center; gap: 10px; font-size: 18px; font-weight: 800; }
-.logo-icon {
-  width: 36px; height: 36px; border-radius: 10px;
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
-  display: flex; align-items: center; justify-content: center;
-  color: white; font-size: 18px;
-  box-shadow: 0 4px 12px rgba(99,102,241,0.3);
-}
-.logo span { background: linear-gradient(90deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-.header-right { display: flex; align-items: center; gap: 10px; }
-.live-badge { display: flex; align-items: center; gap: 7px; background: var(--green-bg); border: 1px solid #a7f3d0; color: var(--green); padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; }
-.live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 2s infinite; }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
-.countdown { font-size: 12px; color: var(--muted); background: var(--surface2); border: 1px solid var(--border); padding: 6px 12px; border-radius: 20px; }
-.refresh-btn { background: var(--accent); color: white; border: none; border-radius: 10px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 12px rgba(99,102,241,0.25); }
-.refresh-btn:hover { transform: scale(1.03); }
-
-.tabs { display: flex; background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 24px; overflow-x: auto; }
-.tab { padding: 14px 18px; font-size: 13px; font-weight: 600; color: var(--muted); cursor: pointer; border: none; background: none; border-bottom: 2px solid transparent; white-space: nowrap; transition: all 0.2s; }
-.tab:hover { color: var(--accent); }
-.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-.tab .alert-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--red); margin-left: 5px; vertical-align: middle; animation: pulse 1s infinite; }
-
-.content { max-width: 1400px; margin: 0 auto; padding: 20px 24px; }
-.section-title { font-size: 18px; font-weight: 800; color: var(--text); margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
-.section-sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
-
-.stat-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
-.stat-card { background: var(--surface); border: 1.5px solid var(--border); border-radius: 14px; padding: 16px; box-shadow: 0 4px 16px rgba(99,102,241,0.05); }
-.stat-label { font-size: 11px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
-.stat-value { font-size: 22px; font-weight: 900; color: var(--text); }
-.stat-sub { font-size: 11px; color: var(--muted); margin-top: 4px; }
-
-.grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(500px, 1fr)); gap: 16px; }
-.card { background: var(--surface); border: 1.5px solid var(--border); border-radius: 16px; padding: 18px; box-shadow: 0 4px 24px rgba(99,102,241,0.06); margin-bottom: 16px; }
-.card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; }
-.card-title { font-size: 14px; font-weight: 800; color: var(--text); display: flex; align-items: center; gap: 8px; }
-.card-sub { color: var(--muted); font-size: 11px; margin-top: 3px; }
-
-.badge { padding: 3px 9px; border-radius: 7px; font-size: 11px; font-weight: 700; }
-.badge-purple { background: #f0f1ff; color: var(--accent); }
-.badge-orange { background: var(--orange-bg); color: var(--orange); }
-.badge-red { background: var(--red-bg); color: var(--red); }
-.badge-green { background: var(--green-bg); color: var(--green); }
-.badge-yellow { background: var(--yellow-bg); color: var(--yellow); }
-
-.table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-.table th { color: var(--muted); font-weight: 600; padding: 7px 10px; text-align: left; border-bottom: 1.5px solid var(--border); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-.table td { padding: 9px 10px; border-top: 1px solid var(--border); color: var(--text2); vertical-align: middle; }
-.table tr:hover td { background: #f8faff; }
-.table .alert-row td { background: #fff7ed !important; }
-
-.alert-tag { display: inline-flex; align-items: center; gap: 4px; background: var(--red-bg); color: var(--red); padding: 2px 7px; border-radius: 6px; font-size: 10px; font-weight: 700; }
-.up { color: var(--green); font-weight: 700; }
-.down { color: var(--red); font-weight: 700; }
-.mono { font-family: monospace; font-size: 11px; color: var(--muted); }
-
-.filer-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 18px; }
-.filer-card { background: var(--surface); border: 1.5px solid var(--border); border-radius: 12px; padding: 12px; cursor: pointer; transition: all 0.2s; }
-.filer-card:hover, .filer-card.active { border-color: var(--accent); background: #f0f1ff; }
-.filer-name { font-size: 12px; font-weight: 800; color: var(--text); margin-bottom: 3px; }
-.filer-cik { font-size: 10px; color: var(--muted); }
-
-.total-box { background: linear-gradient(135deg, #f0f1ff, #f5f3ff); border: 1px solid #e0e7ff; border-radius: 12px; padding: 12px 16px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; }
-.total-label { font-size: 12px; color: var(--muted); font-weight: 600; }
-.total-value { font-size: 20px; font-weight: 900; color: var(--accent); }
-
-.loading { text-align: center; padding: 36px; color: var(--muted); font-size: 13px; }
-.spinner { display: inline-block; width: 22px; height: 22px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 8px; }
-@keyframes spin { to { transform: rotate(360deg); } }
-.error-box { text-align: center; padding: 28px; color: var(--muted); font-size: 13px; background: var(--surface2); border-radius: 12px; border: 1px dashed var(--border); }
-.hidden { display: none; }
-
-.signal-card { border-radius: 12px; padding: 14px 16px; margin-bottom: 10px; border: 1.5px solid; display: flex; align-items: center; justify-content: space-between; }
-.signal-buy { background: var(--green-bg); border-color: #a7f3d0; }
-.signal-sell { background: var(--red-bg); border-color: #fecaca; }
-.signal-watch { background: var(--yellow-bg); border-color: #fde68a; }
-.signal-title { font-size: 14px; font-weight: 800; }
-.signal-desc { font-size: 12px; color: var(--muted); margin-top: 3px; }
-.signal-time { font-size: 11px; color: var(--muted); }
-
-.orange-pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--orange); box-shadow: 0 0 6px var(--orange); animation: pulse 1.5s infinite; display: inline-block; margin-right: 6px; }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Binance Flow Radar</title>
+  <style>
+    :root {
+      --bg: #eef2f6;
+      --surface: #ffffff;
+      --surface-2: #f7f9fb;
+      --line: #d7dee8;
+      --text: #142033;
+      --muted: #627086;
+      --blue: #2563eb;
+      --green: #087f5b;
+      --green-bg: #e9f8f1;
+      --red: #c92a2a;
+      --red-bg: #fff0f0;
+      --amber: #b7791f;
+      --amber-bg: #fff7df;
+      --ink: #0f172a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background: var(--bg);
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    button, input, select { font: inherit; }
+    .topbar {
+      height: 58px;
+      padding: 0 22px;
+      background: rgba(255, 255, 255, 0.96);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; }
+    .brand-mark {
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      background: var(--ink);
+      color: #fff;
+      display: grid;
+      place-items: center;
+      font-size: 13px;
+      letter-spacing: 0;
+    }
+    .statusbar { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #9aa5b5; }
+    .dot.ok { background: var(--green); box-shadow: 0 0 0 3px rgba(8, 127, 91, 0.12); }
+    .page { max-width: 1500px; margin: 0 auto; padding: 16px 20px 24px; }
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .search {
+      width: 100%;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: var(--text);
+      outline: none;
+    }
+    .segmented {
+      display: flex;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .segmented button {
+      border: 0;
+      border-right: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      padding: 9px 12px;
+      cursor: pointer;
+      min-width: 68px;
+    }
+    .segmented button:last-child { border-right: 0; }
+    .segmented button.active { color: #fff; background: var(--ink); }
+    .refresh {
+      border: 1px solid var(--ink);
+      background: var(--ink);
+      color: #fff;
+      border-radius: 8px;
+      padding: 9px 13px;
+      cursor: pointer;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .stat {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      min-height: 82px;
+    }
+    .label { color: var(--muted); font-size: 12px; font-weight: 700; margin-bottom: 8px; }
+    .value { color: var(--ink); font-size: 22px; font-weight: 900; white-space: nowrap; }
+    .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 12px;
+      align-items: start;
+    }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-2);
+    }
+    .panel-title { font-weight: 850; }
+    .panel-note { color: var(--muted); font-size: 12px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    th {
+      color: var(--muted);
+      text-align: left;
+      font-weight: 750;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfe;
+      white-space: nowrap;
+    }
+    td {
+      padding: 10px;
+      border-bottom: 1px solid #edf1f5;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+    tbody tr:hover { background: #f9fbfd; }
+    .symbol { font-weight: 900; color: var(--ink); font-size: 13px; }
+    .small { color: var(--muted); font-size: 11px; }
+    .num { font-variant-numeric: tabular-nums; }
+    .up { color: var(--green); font-weight: 800; }
+    .down { color: var(--red); font-weight: 800; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 86px;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-weight: 850;
+      font-size: 11px;
+    }
+    .badge.long { background: var(--green-bg); color: var(--green); }
+    .badge.short { background: var(--red-bg); color: var(--red); }
+    .badge.watch { background: var(--amber-bg); color: var(--amber); }
+    .score {
+      width: 52px;
+      height: 28px;
+      border-radius: 6px;
+      display: inline-grid;
+      place-items: center;
+      color: #fff;
+      background: var(--ink);
+      font-weight: 900;
+    }
+    .reason {
+      display: flex;
+      gap: 5px;
+      flex-wrap: wrap;
+      min-width: 260px;
+      white-space: normal;
+    }
+    .chip {
+      border: 1px solid var(--line);
+      background: var(--surface-2);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 3px 6px;
+      font-size: 11px;
+    }
+    .event-list { max-height: 690px; overflow: auto; }
+    .event {
+      display: grid;
+      grid-template-columns: 58px 1fr;
+      gap: 8px;
+      padding: 10px 12px;
+      border-bottom: 1px solid #edf1f5;
+    }
+    .event-side { font-size: 11px; font-weight: 900; }
+    .event-side.buy { color: var(--green); }
+    .event-side.sell { color: var(--red); }
+    .event-main { min-width: 0; }
+    .event-title { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; font-weight: 850; }
+    .event-meta { color: var(--muted); font-size: 11px; margin-top: 3px; }
+    .warn {
+      margin-top: 12px;
+      border: 1px solid #efd897;
+      background: var(--amber-bg);
+      color: #7a4d00;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    @media (max-width: 1100px) {
+      .layout { grid-template-columns: 1fr; }
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .controls { grid-template-columns: 1fr; }
+      .segmented { overflow-x: auto; }
+      .statusbar { display: none; }
+    }
+  </style>
 </head>
 <body>
-
-<div class="header">
-  <div class="logo">
-    <div class="logo-icon">🐋</div>
-    <span>Whale Tracker Pro</span>
-  </div>
-  <div class="header-right">
-    <div class="countdown" id="countdown">刷新倒计时: 30s</div>
-    <div class="live-badge"><div class="live-dot"></div>Auto Refresh</div>
-    <button class="refresh-btn" onclick="refreshAll()">↻ 立即刷新</button>
-  </div>
-</div>
-
-<div class="tabs">
-  <button class="tab active" onclick="showTab('signals')">⚡ 跟庄信号<span class="alert-dot"></span></button>
-  <button class="tab" onclick="showTab('volume')">📊 成交量异动</button>
-  <button class="tab" onclick="showTab('oi')">📈 合约OI监控</button>
-  <button class="tab" onclick="showTab('whale')">🐋 链上巨鲸</button>
-  <button class="tab" onclick="showTab('wallets')">👛 巨鲸钱包</button>
-  <button class="tab" onclick="showTab('institutions')">🏦 机构持仓</button>
-  <button class="tab" onclick="showTab('congress')">🏛️ 国会交易</button>
-</div>
-
-<div class="content">
-
-  <!-- 跟庄信号 -->
-  <div id="tab-signals">
-    <div class="section-title">⚡ 跟庄信号汇总</div>
-    <div class="section-sub">综合链上巨鲸、成交量异动、合约OI变化，自动生成跟庄参考信号</div>
-    <div class="stat-row">
-      <div class="stat-card"><div class="stat-label">强烈买入信号</div><div class="stat-value" style="color:var(--green)" id="sig-buy">--</div><div class="stat-sub">综合评分≥80</div></div>
-      <div class="stat-card"><div class="stat-label">观察信号</div><div class="stat-value" style="color:var(--yellow)" id="sig-watch">--</div><div class="stat-sub">综合评分50-80</div></div>
-      <div class="stat-card"><div class="stat-label">卖出信号</div><div class="stat-value" style="color:var(--red)" id="sig-sell">--</div><div class="stat-sub">大资金出逃</div></div>
-      <div class="stat-card"><div class="stat-label">BTC实时价格</div><div class="stat-value" id="sig-btc">--</div><div class="stat-sub">USD</div></div>
-    </div>
-    <div id="signalsList"><div class="loading"><div class="spinner"></div><br>生成跟庄信号...</div></div>
-  </div>
-
-  <!-- 成交量异动 -->
-  <div id="tab-volume" class="hidden">
-    <div class="section-title">📊 成交量异动监控</div>
-    <div class="section-sub">成交量/市值比 &gt; 50% 且价格变动 &gt; 5% 视为异动，可能有大资金介入</div>
-    <div id="volumeContent"><div class="loading"><div class="spinner"></div><br>加载中...</div></div>
-  </div>
-
-  <!-- 合约OI -->
-  <div id="tab-oi" class="hidden">
-    <div class="section-title">📈 合约未平仓量监控</div>
-    <div class="section-sub">Binance U本位合约，OI突增代表大资金建仓，价格变动&gt;10%标记异动</div>
-    <div id="oiContent"><div class="loading"><div class="spinner"></div><br>加载中...</div></div>
-  </div>
-
-  <!-- 链上巨鲸 -->
-  <div id="tab-whale" class="hidden">
-    <div class="section-title">🐋 链上巨鲸转账</div>
-    <div class="section-sub">BTC链上单笔 ≥100 BTC 大额转账，500 BTC以上标记为超级巨鲸</div>
-    <div class="stat-row">
-      <div class="stat-card"><div class="stat-label">大额交易数</div><div class="stat-value" id="w-count">--</div><div class="stat-sub">≥100 BTC</div></div>
-      <div class="stat-card"><div class="stat-label">最大单笔</div><div class="stat-value" id="w-max">--</div><div class="stat-sub">BTC</div></div>
-      <div class="stat-card"><div class="stat-label">总转移量</div><div class="stat-value" id="w-total">--</div><div class="stat-sub">BTC</div></div>
-      <div class="stat-card"><div class="stat-label">折合美元</div><div class="stat-value" id="w-usd">--</div><div class="stat-sub">USD</div></div>
-    </div>
-    <div class="card">
-      <div id="whaleTable"><div class="loading"><div class="spinner"></div><br>加载中...</div></div>
+  <div class="topbar">
+    <div class="brand"><div class="brand-mark">FR</div><div>Binance Flow Radar</div></div>
+    <div class="statusbar">
+      <span class="dot" id="tradeDot"></span><span>大单流</span>
+      <span class="dot" id="liqDot"></span><span>爆仓流</span>
+      <span id="updatedAt">等待数据</span>
     </div>
   </div>
 
-  <!-- 巨鲸钱包 -->
-  <div id="tab-wallets" class="hidden">
-    <div class="section-title">👛 巨鲸钱包余额</div>
-    <div class="section-sub">交易所和机构主要冷钱包实时余额监控</div>
-    <div class="card">
-      <div id="walletContent"><div class="loading"><div class="spinner"></div><br>查询链上余额...</div></div>
+  <main class="page">
+    <div class="controls">
+      <input class="search" id="search" placeholder="搜索交易对，例如 SOL、1000PEPE、WIF">
+      <div class="segmented" id="filters">
+        <button class="active" data-filter="all">全部</button>
+        <button data-filter="long">做多压力</button>
+        <button data-filter="short">做空压力</button>
+        <button data-filter="hot">高分</button>
+        <button data-filter="alts">山寨</button>
+      </div>
+      <button class="refresh" id="refresh">刷新</button>
     </div>
-  </div>
 
-  <!-- 机构持仓 -->
-  <div id="tab-institutions" class="hidden">
-    <div class="section-title">🏦 机构持仓监控</div>
-    <div class="section-sub">SEC EDGAR 13F季报，每季度更新</div>
-    <div class="filer-grid" id="filerGrid"></div>
-    <div id="holdingsContent"><div class="loading"><div class="spinner"></div><br>加载持仓数据...</div></div>
-  </div>
+    <section class="stats">
+      <div class="stat"><div class="label">监控交易对</div><div class="value" id="statSymbols">--</div><div class="sub">USDT 永续</div></div>
+      <div class="stat"><div class="label">强做多压力</div><div class="value up" id="statLong">--</div><div class="sub">评分不低于 60</div></div>
+      <div class="stat"><div class="label">强做空压力</div><div class="value down" id="statShort">--</div><div class="sub">评分不低于 60</div></div>
+      <div class="stat"><div class="label">60 秒大单流</div><div class="value" id="statFlow">--</div><div class="sub">WebSocket 实时累计</div></div>
+      <div class="stat"><div class="label">5 分钟爆仓</div><div class="value" id="statLiq">--</div><div class="sub">强平订单流</div></div>
+    </section>
 
-  <!-- 国会交易 -->
-  <div id="tab-congress" class="hidden">
-    <div class="section-title">🏛️ 国会议员交易</div>
-    <div class="section-sub">依据STOCK法案强制公开申报的股票交易记录</div>
-    <div class="card">
-      <div id="congressTable"><div class="loading"><div class="spinner"></div><br>加载中...</div></div>
+    <section class="layout">
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">资金压力雷达</div>
+            <div class="panel-note">大额主动成交、OI、taker 方向、资金费率、爆仓组合评分</div>
+          </div>
+          <div class="panel-note" id="errorNote"></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>交易对</th>
+                <th>信号</th>
+                <th>分数</th>
+                <th>价格</th>
+                <th>5m</th>
+                <th>OI 15m</th>
+                <th>Taker 比</th>
+                <th>60s 净流</th>
+                <th>最大单</th>
+                <th>5m 爆仓</th>
+                <th>资金费率</th>
+                <th>依据</th>
+              </tr>
+            </thead>
+            <tbody id="radarBody">
+              <tr><td colspan="12">正在连接 Binance 数据源...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <aside class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">实时大单与爆仓</div>
+            <div class="panel-note">达到阈值后进入事件流</div>
+          </div>
+        </div>
+        <div class="event-list" id="eventList"></div>
+      </aside>
+    </section>
+
+    <div class="warn">
+      这套雷达只用于缩小观察范围，不构成投资建议。OI 增加只能说明新仓位进入，不能单独证明庄家方向；高分信号也可能是诱多、诱空或出货，实际交易请结合止损、仓位和自己的交易计划。
     </div>
-  </div>
+  </main>
 
-</div>
+  <script>
+    let rawData = null;
+    let activeFilter = "all";
+    const majorSymbols = new Set(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]);
 
-<script>
-var activeTab = 'signals';
-var countdown = 30;
-var timerInterval = null;
-var activeFiler = 0;
-var filers = [
-  {name:"Berkshire Hathaway (Buffett)", cik:"0001067983", emoji:"🏦"},
-  {name:"Bridgewater (Dalio)", cik:"0001350694", emoji:"🌉"},
-  {name:"Soros Fund", cik:"0001029160", emoji:"💰"},
-  {name:"Renaissance Tech", cik:"0001037389", emoji:"🔬"},
-  {name:"Citadel Advisors", cik:"0001423298", emoji:"🏰"},
-];
-
-function showTab(tab) {
-  activeTab = tab;
-  var tabs = ['signals','volume','oi','whale','wallets','institutions','congress'];
-  tabs.forEach(function(t) {
-    document.getElementById('tab-'+t).classList.toggle('hidden', t !== tab);
-  });
-  document.querySelectorAll('.tab').forEach(function(el, i) {
-    el.classList.toggle('active', tabs[i] === tab);
-  });
-  loadTab(tab);
-}
-
-function loadTab(tab) {
-  if (tab === 'signals') loadSignals();
-  else if (tab === 'volume') loadVolume();
-  else if (tab === 'oi') loadOI();
-  else if (tab === 'whale') loadWhale();
-  else if (tab === 'wallets') loadWallets();
-  else if (tab === 'institutions') { renderFilerGrid(); loadHoldings(filers[0].cik, filers[0].name); }
-  else if (tab === 'congress') loadCongress();
-}
-
-function startCountdown() {
-  clearInterval(timerInterval);
-  countdown = 30;
-  timerInterval = setInterval(function() {
-    countdown--;
-    document.getElementById('countdown').textContent = '刷新倒计时: ' + countdown + 's';
-    if (countdown <= 0) {
-      countdown = 30;
-      loadTab(activeTab);
-    }
-  }, 1000);
-}
-
-function refreshAll() {
-  countdown = 30;
-  loadTab(activeTab);
-}
-
-// ── 跟庄信号 ──────────────────────────────
-function loadSignals() {
-  Promise.all([
-    fetch('/volume_alerts').then(function(r){return r.json();}).catch(function(){return[];}),
-    fetch('/oi_alerts').then(function(r){return r.json();}).catch(function(){return[];}),
-    fetch('/btc_price').then(function(r){return r.json();}).catch(function(){return{price:75000};})
-  ]).then(function(results) {
-    var volAlerts = results[0];
-    var oiAlerts = results[1];
-    var btcPrice = results[2].price;
-
-    document.getElementById('sig-btc').textContent = '$' + btcPrice.toLocaleString();
-
-    var signals = [];
-
-    // 从成交量异动生成信号
-    volAlerts.forEach(function(v) {
-      if (Math.abs(v.change) > 10) {
-        var isBuy = v.change > 0;
-        signals.push({
-          symbol: v.symbol,
-          type: isBuy ? 'buy' : 'sell',
-          score: Math.min(95, Math.round(Math.abs(v.change) * 2 + v.vol_mcap_ratio * 20)),
-          reason: '成交量异动 ' + v.vol_mcap_ratio + 'x | 价格' + (isBuy?'上涨':'下跌') + ' ' + Math.abs(v.change) + '%',
-          price: v.price,
-          change: v.change
-        });
-      }
-    });
-
-    // 从OI异动生成信号
-    oiAlerts.forEach(function(o) {
-      if (Math.abs(o.change) > 10) {
-        var isBuy = o.change > 0;
-        signals.push({
-          symbol: o.symbol,
-          type: isBuy ? 'buy' : 'watch',
-          score: Math.min(90, Math.round(Math.abs(o.change) * 1.5 + 30)),
-          reason: '合约OI异动 | 价格' + (isBuy?'上涨':'下跌') + ' ' + Math.abs(o.change) + '%',
-          price: o.price,
-          change: o.change
-        });
-      }
-    });
-
-    signals.sort(function(a,b){return b.score - a.score;});
-
-    var buyCount = signals.filter(function(s){return s.type==='buy' && s.score>=80;}).length;
-    var watchCount = signals.filter(function(s){return s.type==='watch' || s.score<80;}).length;
-    var sellCount = signals.filter(function(s){return s.type==='sell';}).length;
-
-    document.getElementById('sig-buy').textContent = buyCount;
-    document.getElementById('sig-watch').textContent = watchCount;
-    document.getElementById('sig-sell').textContent = sellCount;
-
-    if (!signals.length) {
-      document.getElementById('signalsList').innerHTML = '<div class="error-box">暂无明显异动信号，市场平静</div>';
-      return;
+    function money(value) {
+      value = Number(value || 0);
+      if (Math.abs(value) >= 1e9) return "$" + (value / 1e9).toFixed(2) + "B";
+      if (Math.abs(value) >= 1e6) return "$" + (value / 1e6).toFixed(2) + "M";
+      if (Math.abs(value) >= 1e3) return "$" + (value / 1e3).toFixed(0) + "K";
+      return "$" + value.toFixed(0);
     }
 
-    var html = '';
-    signals.slice(0,20).forEach(function(s) {
-      var cls = s.type === 'buy' ? 'signal-buy' : s.type === 'sell' ? 'signal-sell' : 'signal-watch';
-      var icon = s.type === 'buy' ? '🟢' : s.type === 'sell' ? '🔴' : '🟡';
-      var label = s.type === 'buy' ? '买入信号' : s.type === 'sell' ? '卖出信号' : '观察信号';
-      html += '<div class="signal-card ' + cls + '">' +
-        '<div>' +
-          '<div class="signal-title">' + icon + ' ' + s.symbol + ' — ' + label + ' (评分: ' + s.score + ')</div>' +
-          '<div class="signal-desc">' + s.reason + '</div>' +
-        '</div>' +
-        '<div style="text-align:right">' +
-          '<div style="font-weight:800;font-size:15px">$' + (s.price||0).toLocaleString('en-US',{maximumFractionDigits:6}) + '</div>' +
-          '<div class="' + (s.change>=0?'up':'down') + '" style="font-size:12px">' + (s.change>=0?'+':'') + s.change + '%</div>' +
-        '</div>' +
-        '</div>';
-    });
-
-    html += '<div style="color:var(--muted);font-size:11px;margin-top:16px;padding:12px;background:var(--yellow-bg);border-radius:10px;border:1px solid #fde68a;">⚠️ 免责声明：本工具仅供参考，不构成投资建议。加密货币投资风险极高，请勿全仓操作。</div>';
-    document.getElementById('signalsList').innerHTML = html;
-  });
-}
-
-// ── 成交量异动 ─────────────────────────────
-function loadVolume() {
-  document.getElementById('volumeContent').innerHTML = '<div class="loading"><div class="spinner"></div><br>加载中...</div>';
-  fetch('/volume_alerts').then(function(r){return r.json();}).then(function(data) {
-    if (!data || !data.length) {
-      document.getElementById('volumeContent').innerHTML = '<div class="error-box">暂无异动数据</div>';
-      return;
+    function price(value) {
+      value = Number(value || 0);
+      if (value >= 100) return "$" + value.toLocaleString(undefined, {maximumFractionDigits: 2});
+      if (value >= 1) return "$" + value.toLocaleString(undefined, {maximumFractionDigits: 4});
+      return "$" + value.toLocaleString(undefined, {maximumFractionDigits: 8});
     }
-    var html = '<div class="card"><table class="table">' +
-      '<tr><th>币种</th><th>当前价格</th><th>24h涨跌</th><th>成交量</th><th>量/市值</th><th>状态</th></tr>';
-    data.forEach(function(v) {
-      var isAlert = v.alert;
-      html += '<tr class="' + (isAlert?'alert-row':'') + '">' +
-        '<td><div style="font-weight:800">' + v.symbol + '</div><div style="color:var(--muted);font-size:11px">' + v.name + '</div></td>' +
-        '<td style="font-weight:700">$' + (v.price||0).toLocaleString('en-US',{maximumFractionDigits:6}) + '</td>' +
-        '<td class="' + (v.change>=0?'up':'down') + '">' + (v.change>=0?'+':'') + v.change + '%</td>' +
-        '<td style="color:var(--muted)">$' + (v.volume/1e6).toFixed(1) + 'M</td>' +
-        '<td style="font-weight:700;color:var(--orange)">' + v.vol_mcap_ratio + 'x</td>' +
-        '<td>' + (isAlert ? '<span class="alert-tag">🔥 强异动</span>' : '<span class="badge badge-yellow">异动</span>') + '</td>' +
-        '</tr>';
-    });
-    html += '</table></div>';
-    document.getElementById('volumeContent').innerHTML = html;
-  }).catch(function() {
-    document.getElementById('volumeContent').innerHTML = '<div class="error-box">网络错误，请重试</div>';
-  });
-}
 
-// ── 合约OI ─────────────────────────────────
-function loadOI() {
-  document.getElementById('oiContent').innerHTML = '<div class="loading"><div class="spinner"></div><br>加载中...</div>';
-  fetch('/oi_alerts').then(function(r){return r.json();}).then(function(data) {
-    if (!data || !data.length) {
-      document.getElementById('oiContent').innerHTML = '<div class="error-box">暂无数据</div>';
-      return;
+    function signedPct(value) {
+      value = Number(value || 0);
+      const cls = value >= 0 ? "up" : "down";
+      const sign = value > 0 ? "+" : "";
+      return `<span class="${cls}">${sign}${value.toFixed(2)}%</span>`;
     }
-    var html = '<div class="card"><table class="table">' +
-      '<tr><th>合约</th><th>价格</th><th>24h涨跌</th><th>未平仓量(OI)</th><th>OI美元值</th><th>成交量</th><th>状态</th></tr>';
-    data.forEach(function(o) {
-      html += '<tr class="' + (o.alert?'alert-row':'') + '">' +
-        '<td style="font-weight:800">' + o.symbol + '/USDT</td>' +
-        '<td style="font-weight:700">$' + o.price.toLocaleString('en-US',{maximumFractionDigits:4}) + '</td>' +
-        '<td class="' + (o.change>=0?'up':'down') + '">' + (o.change>=0?'+':'') + o.change + '%</td>' +
-        '<td style="color:var(--muted)">' + o.oi.toLocaleString() + '</td>' +
-        '<td style="font-weight:700;color:var(--accent)">$' + (o.oi_usd/1e6).toFixed(1) + 'M</td>' +
-        '<td style="color:var(--muted)">$' + (o.volume/1e6).toFixed(1) + 'M</td>' +
-        '<td>' + (o.alert ? '<span class="alert-tag">⚡ 异动</span>' : '<span class="badge badge-purple">正常</span>') + '</td>' +
-        '</tr>';
-    });
-    html += '</table></div>';
-    document.getElementById('oiContent').innerHTML = html;
-  }).catch(function() {
-    document.getElementById('oiContent').innerHTML = '<div class="error-box">网络错误，请重试</div>';
-  });
-}
 
-// ── 链上巨鲸 ───────────────────────────────
-function loadWhale() {
-  fetch('/whale_txns').then(function(r){return r.json();}).then(function(data) {
-    if (!data || !data.length) {
-      document.getElementById('whaleTable').innerHTML = '<div class="error-box">暂无大额交易</div>';
-      return;
+    function signalBadge(signal) {
+      if (signal === "LONG_PRESSURE") return '<span class="badge long">做多压力</span>';
+      if (signal === "SHORT_PRESSURE") return '<span class="badge short">做空压力</span>';
+      return '<span class="badge watch">观察</span>';
     }
-    var total = data.reduce(function(s,t){return s+t.btc;},0);
-    var totalUsd = data.reduce(function(s,t){return s+t.usd;},0);
-    var max = Math.max.apply(null, data.map(function(t){return t.btc;}));
-    document.getElementById('w-count').textContent = data.length;
-    document.getElementById('w-max').textContent = max.toFixed(1);
-    document.getElementById('w-total').textContent = total.toFixed(1);
-    document.getElementById('w-usd').textContent = '$' + (totalUsd/1e6).toFixed(1) + 'M';
-    var html = '<table class="table"><tr><th>交易Hash</th><th>BTC金额</th><th>USD价值</th><th>手续费</th><th>状态</th></tr>';
-    data.forEach(function(t) {
-      html += '<tr class="' + (t.alert?'alert-row':'') + '">' +
-        '<td class="mono">' + t.hash + '</td>' +
-        '<td style="font-weight:800;color:' + (t.alert?'var(--orange)':'var(--text)') + '">' + t.btc.toLocaleString() + ' BTC</td>' +
-        '<td style="color:var(--muted)">$' + t.usd.toLocaleString() + '</td>' +
-        '<td style="color:var(--muted)">' + t.fee + ' BTC</td>' +
-        '<td>' + (t.alert ? '<span class="alert-tag">🐋 超级巨鲸</span>' : '<span class="badge badge-purple">大额</span>') + '</td>' +
-        '</tr>';
-    });
-    html += '</table>';
-    document.getElementById('whaleTable').innerHTML = html;
-  }).catch(function() {
-    document.getElementById('whaleTable').innerHTML = '<div class="error-box">网络错误</div>';
-  });
-}
 
-// ── 巨鲸钱包 ───────────────────────────────
-function loadWallets() {
-  fetch('/wallet_balances').then(function(r){return r.json();}).then(function(data) {
-    var html = '<table class="table"><tr><th>钱包名称</th><th>地址</th><th>BTC余额</th><th>USD价值</th><th>链接</th></tr>';
-    data.forEach(function(w) {
-      html += '<tr>' +
-        '<td style="font-weight:700">' + w.emoji + ' ' + w.name + '</td>' +
-        '<td class="mono">' + w.address + '</td>' +
-        '<td style="font-weight:800;color:var(--orange)">' + (w.btc !== null ? w.btc.toLocaleString() + ' BTC' : '查询失败') + '</td>' +
-        '<td style="color:var(--muted)">' + (w.usd !== null ? '$' + w.usd.toLocaleString() : '--') + '</td>' +
-        '<td><a href="https://www.blockchain.com/btc/address/' + w.full_address + '" target="_blank" style="color:var(--accent);font-size:12px">查看 ↗</a></td>' +
-        '</tr>';
-    });
-    html += '</table>';
-    document.getElementById('walletContent').innerHTML = html;
-  }).catch(function() {
-    document.getElementById('walletContent').innerHTML = '<div class="error-box">网络错误</div>';
-  });
-}
+    function applyFilter(rows) {
+      const query = document.getElementById("search").value.trim().toUpperCase();
+      return rows.filter(row => {
+        if (query && !row.symbol.includes(query) && !row.base.includes(query)) return false;
+        if (activeFilter === "long") return row.signal === "LONG_PRESSURE";
+        if (activeFilter === "short") return row.signal === "SHORT_PRESSURE";
+        if (activeFilter === "hot") return row.score >= 60;
+        if (activeFilter === "alts") return !majorSymbols.has(row.symbol);
+        return true;
+      });
+    }
 
-// ── 机构持仓 ───────────────────────────────
-function renderFilerGrid() {
-  var grid = document.getElementById('filerGrid');
-  grid.innerHTML = filers.map(function(f, i) {
-    return '<div class="filer-card' + (i===activeFiler?' active':'') + '" onclick="selectFiler(' + i + ')">' +
-      '<div class="filer-name">' + f.emoji + ' ' + f.name + '</div>' +
-      '<div class="filer-cik">CIK: ' + f.cik + '</div></div>';
-  }).join('');
-}
+    function renderStats(data) {
+      const s = data.summary || {};
+      document.getElementById("statSymbols").textContent = s.symbols ?? "--";
+      document.getElementById("statLong").textContent = s.strong_long ?? "--";
+      document.getElementById("statShort").textContent = s.strong_short ?? "--";
+      document.getElementById("statFlow").textContent = money(s.large_flow_60s);
+      document.getElementById("statLiq").textContent = money(s.liquidation_5m);
 
-function selectFiler(idx) {
-  activeFiler = idx;
-  renderFilerGrid();
-  loadHoldings(filers[idx].cik, filers[idx].name);
-}
+      const meta = data.meta || {};
+      document.getElementById("tradeDot").classList.toggle("ok", !!meta.ws_trade_connected);
+      document.getElementById("liqDot").classList.toggle("ok", !!meta.ws_liq_connected);
+      document.getElementById("updatedAt").textContent = meta.updated_at
+        ? "更新 " + new Date(meta.updated_at).toLocaleTimeString()
+        : "等待数据";
+      document.getElementById("errorNote").textContent = meta.snapshot_error ? "数据源错误：" + meta.snapshot_error : "";
+    }
 
-function loadHoldings(cik, name) {
-  document.getElementById('holdingsContent').innerHTML = '<div class="loading"><div class="spinner"></div><br>从SEC EDGAR获取数据...</div>';
-  fetch('/sec_holdings?cik=' + encodeURIComponent(cik))
-    .then(function(r){return r.json();})
-    .then(function(data) {
-      if (!data || !data.holdings || !data.holdings.length) {
-        document.getElementById('holdingsContent').innerHTML = '<div class="error-box">⚠️ ' + (data.error||'暂无数据，请稍后重试') + '</div>';
+    function renderRadar() {
+      if (!rawData) return;
+      const rows = applyFilter(rawData.radar || []);
+      const body = document.getElementById("radarBody");
+      if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="12">当前筛选条件下暂无强信号。</td></tr>';
         return;
       }
-      var total = data.total ? '$' + (data.total/1e9).toFixed(2) + 'B' : 'N/A';
-      var html = '<div class="card">' +
-        '<div class="card-header"><div><div class="card-title">' + name + ' 持仓明细</div><div class="card-sub">报告日期：' + data.date + '</div></div><span class="badge badge-purple">13F-HR</span></div>' +
-        '<div class="total-box"><div class="total-label">总持仓市值</div><div class="total-value">' + total + '</div></div>' +
-        '<table class="table"><tr><th>#</th><th>股票名称</th><th>持仓市值</th><th>持仓份额</th></tr>';
-      data.holdings.forEach(function(h, i) {
-        html += '<tr><td style="color:var(--muted)">' + (i+1) + '</td><td style="font-weight:700">' + h.name + '</td><td style="font-weight:700;color:var(--accent)">$' + (h.value/1e6).toFixed(1) + 'M</td><td style="color:var(--muted)">' + h.shares.toLocaleString() + '</td></tr>';
-      });
-      html += '</table></div>';
-      document.getElementById('holdingsContent').innerHTML = html;
-    })
-    .catch(function() {
-      document.getElementById('holdingsContent').innerHTML = '<div class="error-box">网络错误</div>';
-    });
-}
-
-// ── 国会交易 ───────────────────────────────
-function loadCongress() {
-  fetch('/congress_trades').then(function(r){return r.json();}).then(function(data) {
-    if (!data || !data.length) {
-      document.getElementById('congressTable').innerHTML = '<div class="error-box">暂无数据</div>';
-      return;
+      body.innerHTML = rows.slice(0, 80).map(row => {
+        const net = row.flow_60s?.net_usd || 0;
+        const largest = row.flow_60s?.largest_usd || 0;
+        const liq = row.liq_5m?.total_usd || 0;
+        const netCls = net >= 0 ? "up" : "down";
+        const reasons = (row.reasons || []).map(x => `<span class="chip">${x}</span>`).join("");
+        return `<tr>
+          <td><div class="symbol">${row.base}</div><div class="small">${row.symbol}</div></td>
+          <td>${signalBadge(row.signal)}</td>
+          <td><span class="score">${row.score}</span></td>
+          <td class="num">${price(row.price)}</td>
+          <td class="num">${signedPct(row.price_5m_pct)}</td>
+          <td class="num">${signedPct(row.oi_15m_pct)}</td>
+          <td class="num">${row.taker_ratio}</td>
+          <td class="num ${netCls}">${net >= 0 ? "+" : "-"}${money(Math.abs(net))}</td>
+          <td class="num">${money(largest)}</td>
+          <td class="num">${money(liq)}</td>
+          <td class="num">${Number(row.funding_rate || 0).toFixed(4)}%</td>
+          <td><div class="reason">${reasons}</div></td>
+        </tr>`;
+      }).join("");
     }
-    var html = '<table class="table"><tr><th>议员</th><th>政党</th><th>股票代码</th><th>资产名称</th><th>操作</th><th>金额</th><th>日期</th></tr>';
-    data.forEach(function(t) {
-      html += '<tr>' +
-        '<td style="font-weight:700">' + t.name + '</td>' +
-        '<td style="color:var(--muted);font-size:11px">' + (t.party||'') + '</td>' +
-        '<td style="font-weight:800;color:var(--accent)">' + t.ticker + '</td>' +
-        '<td style="color:var(--muted);font-size:11px">' + (t.asset||'') + '</td>' +
-        '<td><span class="' + (t.is_buy?'up':'down') + '">' + t.type + '</span></td>' +
-        '<td style="font-weight:600">' + t.amount + '</td>' +
-        '<td style="color:var(--muted);font-size:11px">' + t.date + '</td>' +
-        '</tr>';
-    });
-    html += '</table>';
-    document.getElementById('congressTable').innerHTML = html;
-  }).catch(function() {
-    document.getElementById('congressTable').innerHTML = '<div class="error-box">网络错误</div>';
-  });
-}
 
-loadSignals();
-startCountdown();
-</script>
+    function renderEvents(data) {
+      const list = document.getElementById("eventList");
+      const events = data.events || [];
+      if (!events.length) {
+        list.innerHTML = '<div class="event"><div></div><div class="event-main"><div class="event-title">等待大额事件</div><div class="event-meta">阈值达到后会显示在这里</div></div></div>';
+        return;
+      }
+      list.innerHTML = events.slice(0, 80).map(ev => {
+        const side = ev.side === "BUY" ? "buy" : "sell";
+        const label = ev.type === "LIQUIDATION"
+          ? (ev.side === "BUY" ? "空爆" : "多爆")
+          : (ev.side === "BUY" ? "主动买" : "主动卖");
+        return `<div class="event">
+          <div class="event-side ${side}">${label}</div>
+          <div class="event-main">
+            <div class="event-title"><span>${ev.base}</span><span>${money(ev.notional)}</span></div>
+            <div class="event-meta">${price(ev.price)} · ${new Date(ev.ts * 1000).toLocaleTimeString()}</div>
+          </div>
+        </div>`;
+      }).join("");
+    }
+
+    async function load() {
+      const res = await fetch("/api/radar", {cache: "no-store"});
+      rawData = await res.json();
+      renderStats(rawData);
+      renderRadar();
+      renderEvents(rawData);
+    }
+
+    document.getElementById("refresh").addEventListener("click", load);
+    document.getElementById("search").addEventListener("input", renderRadar);
+    document.getElementById("filters").addEventListener("click", event => {
+      if (!event.target.dataset.filter) return;
+      activeFilter = event.target.dataset.filter;
+      document.querySelectorAll("#filters button").forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.filter === activeFilter);
+      });
+      renderRadar();
+    });
+
+    load().catch(console.error);
+    setInterval(() => load().catch(console.error), 2000);
+  </script>
 </body>
-</html>"""
+</html>
+"""
+
 
 @app.route("/")
-def index():
+def index() -> str:
     return render_template_string(HTML)
 
-@app.route("/btc_price")
-def btc_price():
-    return jsonify({"price": get_btc_price()})
 
-@app.route("/volume_alerts")
-def volume_alerts():
-    return jsonify(get_volume_alerts())
+@app.route("/api/radar")
+def api_radar() -> Any:
+    return jsonify(STATE.snapshot())
 
-@app.route("/oi_alerts")
-def oi_alerts():
-    return jsonify(get_oi_alerts())
 
-@app.route("/whale_txns")
-def whale_txns():
-    return jsonify(get_whale_txns())
+@app.route("/health")
+def health() -> Any:
+    data = STATE.snapshot()
+    return jsonify(
+        {
+            "ok": data["meta"].get("updated_at", 0) > 0,
+            "updated_at": data["meta"].get("updated_at"),
+            "snapshot_error": data["meta"].get("snapshot_error"),
+        }
+    )
 
-@app.route("/wallet_balances")
-def wallet_balances():
-    return jsonify(get_wallet_balances())
 
-@app.route("/sec_holdings")
-def sec_holdings():
-    cik = request.args.get("cik", "0001067983")
-    return jsonify(get_sec_holdings(cik))
-
-@app.route("/congress_trades")
-def congress_trades():
-    return jsonify(get_congress_trades())
+start_background_threads()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, threaded=True)
