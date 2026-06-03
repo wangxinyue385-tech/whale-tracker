@@ -98,3 +98,4 @@ def pct_change(new: float, old: float) -> float:
 
 
 def fmt_symbol(symbol: str) -> str:
+    return symbol.replace("USDT", "")
