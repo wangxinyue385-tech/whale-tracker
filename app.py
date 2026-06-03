@@ -63,6 +63,16 @@ BINANCE_WS_BASES = [
 if BINANCE_WS.rstrip("/") not in BINANCE_WS_BASES:
     BINANCE_WS_BASES.insert(0, BINANCE_WS.rstrip("/"))
 BINANCE_REST = os.environ.get("BINANCE_REST", "https://fapi.binance.com")
+BINANCE_REST_BASES = [
+    url.strip().rstrip("/")
+    for url in os.environ.get(
+        "BINANCE_REST_BASES",
+        "https://fapi.binance.com,https://fapi.binancefuture.com",
+    ).split(",")
+    if url.strip()
+]
+if BINANCE_REST.rstrip("/") not in BINANCE_REST_BASES:
+    BINANCE_REST_BASES.insert(0, BINANCE_REST.rstrip("/"))
 AI_API_KEY = os.environ.get("AI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
 AI_API_BASE = os.environ.get("AI_API_BASE") or (
     "https://api.deepseek.com" if os.environ.get("DEEPSEEK_API_KEY") else "https://api.openai.com/v1"
@@ -84,6 +94,7 @@ def money_short(value: float) -> str:
 def rule_based_analysis(payload: dict) -> str:
     rows = payload.get("rows") or []
     events = payload.get("events") or []
+    signals = payload.get("signals") or []
     rows = rows[:12]
     hot = [row for row in rows if int(row.get("score") or 0) >= 50]
     long_rows = [row for row in hot if row.get("signal") == "LONG"]
@@ -110,6 +121,16 @@ def rule_based_analysis(payload: dict) -> str:
     elif short_rows:
         names = "、".join(row.get("base", "") for row in short_rows[:4])
         lines.append(f"- 做空压力集中在 {names}，若价格没有继续下行，可能是诱空或吸筹。")
+
+    completed5m = [item for item in signals if item.get("result_5m_pct") is not None]
+    if completed5m:
+        wins = [item for item in completed5m if float(item.get("result_5m_pct") or 0) > 0]
+        avg = sum(float(item.get("result_5m_pct") or 0) for item in completed5m) / len(completed5m)
+        lines.append(
+            f"- 最近已复盘 5m 信号 {len(completed5m)} 个，胜率 {len(wins) / len(completed5m) * 100:.0f}%，平均结果 {avg:+.2f}%。"
+        )
+        if len(completed5m) >= 8 and avg <= 0:
+            lines.append("- 当前规则近期平均表现不佳，强信号也应降仓或只观察。")
 
     lines.append("")
     lines.append("入场前要等的确认：")
@@ -147,6 +168,7 @@ def call_ai_analysis(payload: dict, fallback: str) -> tuple[str, str]:
         "summary": payload.get("summary", {}),
         "rows": (payload.get("rows") or [])[:12],
         "events": (payload.get("events") or [])[:25],
+        "signals": (payload.get("signals") or [])[:20],
     }
     messages = [
         {
@@ -420,6 +442,19 @@ HTML = r"""
       white-space: nowrap;
     }
     .ai-btn:disabled { opacity: .55; cursor: wait; }
+    .review-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .review-meta {
+      color: var(--muted);
+      font-size: 12px;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
     .warn {
       margin-top: 12px;
       border: 1px solid #efd897;
@@ -500,6 +535,8 @@ HTML = r"""
                 <th>分数</th>
                 <th>价格</th>
                 <th>5m</th>
+                <th>OI 15m</th>
+                <th>Taker</th>
                 <th>60s 净流</th>
                 <th>5m 净流</th>
                 <th>最大单</th>
@@ -508,7 +545,7 @@ HTML = r"""
               </tr>
             </thead>
             <tbody id="radarBody">
-              <tr><td colspan="10">正在连接 Binance WebSocket...</td></tr>
+              <tr><td colspan="12">正在连接 Binance WebSocket...</td></tr>
             </tbody>
           </table>
         </div>
@@ -525,6 +562,36 @@ HTML = r"""
       </aside>
     </section>
 
+    <section class="panel review-grid">
+      <div class="panel-head">
+        <div>
+          <div class="panel-title">信号复盘</div>
+          <div class="panel-note">自动记录评分不低于 60 的信号，跟踪 1/3/5/15 分钟后结果</div>
+        </div>
+        <div class="review-meta" id="signalStats">等待强信号</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>交易对</th>
+              <th>方向</th>
+              <th>分数</th>
+              <th>入场价</th>
+              <th>1m</th>
+              <th>3m</th>
+              <th>5m</th>
+              <th>15m</th>
+            </tr>
+          </thead>
+          <tbody id="signalBody">
+            <tr><td colspan="9">暂无强信号记录。</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <div class="warn">
       Render 服务器访问 Binance 会被地区限制，所以这版改为浏览器直连 Binance WebSocket。若你的浏览器也无法连接 Binance，页面会显示连接错误。此工具只用于缩小观察范围，不构成投资建议；高分信号也可能是诱多、诱空或出货。
     </div>
@@ -534,7 +601,14 @@ HTML = r"""
     const WATCH_SYMBOLS = __WATCH_SYMBOLS__;
     const LARGE_TRADE_USD = __LARGE_TRADE_USD__;
     const BINANCE_WS_BASES = __BINANCE_WS_BASES__;
+    const BINANCE_REST_BASES = __BINANCE_REST_BASES__;
     const PRICE_STREAMS = ["!markPrice@arr@1s", "!ticker@arr"];
+    const SIGNAL_HORIZONS = [
+      {key: "m1", label: "1m", ms: 60 * 1000},
+      {key: "m3", label: "3m", ms: 3 * 60 * 1000},
+      {key: "m5", label: "5m", ms: 5 * 60 * 1000},
+      {key: "m15", label: "15m", ms: 15 * 60 * 1000},
+    ];
     const MAJORS = new Set(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]);
 
     const state = {
@@ -542,7 +616,10 @@ HTML = r"""
       liquidations: new Map(),
       prices: new Map(),
       priceHistory: new Map(),
+      derivatives: new Map(),
       events: [],
+      signalLog: [],
+      signalCooldown: new Map(),
       sockets: [],
       priceConnected: false,
       tradeConnected: false,
@@ -553,6 +630,10 @@ HTML = r"""
       priceMessages: 0,
       tradeMessages: 0,
       liqMessages: 0,
+      derivativesUpdatedAt: 0,
+      derivativesError: "",
+      derivativesTimer: null,
+      runId: 0,
       activeFilter: "all",
     };
 
@@ -586,6 +667,28 @@ HTML = r"""
       const sign = value > 0 ? "+" : "";
       return `<span class="${cls}">${sign}${value.toFixed(2)}%</span>`;
     }
+    function plainSignedPct(value) {
+      value = Number(value || 0);
+      const sign = value > 0 ? "+" : "";
+      return `${sign}${value.toFixed(2)}%`;
+    }
+    function resultCell(value) {
+      if (value === null || value === undefined) return '<span class="small">等待</span>';
+      const cls = value >= 0 ? "up" : "down";
+      const sign = value > 0 ? "+" : "";
+      return `<span class="${cls}">${sign}${value.toFixed(2)}%</span>`;
+    }
+    function derivative(symbol) {
+      return state.derivatives.get(symbol) || {
+        oi5Pct: null,
+        oi15Pct: null,
+        oiValue: 0,
+        takerRatio: null,
+        takerBuyPct: null,
+        fundingRate: null,
+        updatedAt: 0,
+      };
+    }
     function signalBadge(signal) {
       if (signal === "LONG") return '<span class="badge long">做多压力</span>';
       if (signal === "SHORT") return '<span class="badge short">做空压力</span>';
@@ -605,6 +708,73 @@ HTML = r"""
       const rows = ensureList(state.priceHistory, symbol);
       rows.push({ts, value});
       while (rows.length > 600 || (rows.length && rows[0].ts < now() - 6 * 60 * 1000)) rows.shift();
+    }
+    async function fetchJsonFromBinance(path) {
+      let lastError = null;
+      for (const baseUrl of BINANCE_REST_BASES) {
+        try {
+          const res = await fetch(baseUrl + path, {cache: "no-store"});
+          if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+          return await res.json();
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw lastError || new Error("Binance REST unavailable");
+    }
+    async function fetchDerivativeSymbol(symbol) {
+      const current = derivative(symbol);
+      const next = {...current, updatedAt: Date.now()};
+      try {
+        const oiRows = await fetchJsonFromBinance(`/futures/data/openInterestHist?symbol=${encodeURIComponent(symbol)}&period=5m&limit=4`);
+        if (Array.isArray(oiRows) && oiRows.length) {
+          const latest = Number(oiRows[oiRows.length - 1].sumOpenInterestValue || 0);
+          const prev = Number((oiRows[oiRows.length - 2] || {}).sumOpenInterestValue || 0);
+          const first = Number(oiRows[0].sumOpenInterestValue || 0);
+          next.oiValue = latest;
+          next.oi5Pct = prev ? (latest - prev) / prev * 100 : null;
+          next.oi15Pct = first ? (latest - first) / first * 100 : null;
+        }
+      } catch (_) {}
+      try {
+        const takerRows = await fetchJsonFromBinance(`/futures/data/takerlongshortRatio?symbol=${encodeURIComponent(symbol)}&period=5m&limit=1`);
+        if (Array.isArray(takerRows) && takerRows.length) {
+          const item = takerRows[takerRows.length - 1];
+          const buyVol = Number(item.buyVol || 0);
+          const sellVol = Number(item.sellVol || 0);
+          const total = buyVol + sellVol;
+          next.takerRatio = Number(item.buySellRatio || (sellVol ? buyVol / sellVol : 1));
+          next.takerBuyPct = total ? buyVol / total * 100 : null;
+        }
+      } catch (_) {}
+      state.derivatives.set(symbol, next);
+    }
+    async function fetchDerivatives() {
+      state.derivativesError = "";
+      try {
+        const premium = await fetchJsonFromBinance("/fapi/v1/premiumIndex");
+        if (Array.isArray(premium)) {
+          const ts = Date.now();
+          for (const item of premium) {
+            const symbol = item.symbol;
+            if (!WATCH_SYMBOLS.includes(symbol)) continue;
+            const next = {...derivative(symbol), updatedAt: ts};
+            next.fundingRate = Number(item.lastFundingRate || 0) * 100;
+            const markPrice = Number(item.markPrice || 0);
+            if (markPrice > 0) rememberPrice(symbol, markPrice, ts);
+            state.derivatives.set(symbol, next);
+          }
+        }
+        const ranked = rows().slice(0, 14).map(row => row.symbol);
+        const targets = Array.from(new Set([...ranked, "BTCUSDT", "ETHUSDT", "SOLUSDT"].filter(symbol => WATCH_SYMBOLS.includes(symbol))));
+        for (let i = 0; i < targets.length; i += 4) {
+          await Promise.all(targets.slice(i, i + 4).map(fetchDerivativeSymbol));
+        }
+        state.derivativesUpdatedAt = Date.now();
+      } catch (error) {
+        state.derivativesError = `衍生品数据受限：${error}`;
+      }
+      renderRadar();
     }
     function price5m(symbol) {
       const rows = state.priceHistory.get(symbol) || [];
@@ -639,6 +809,7 @@ HTML = r"""
       const f5 = flow(symbol, 5 * 60 * 1000);
       const l5 = liq(symbol, 5 * 60 * 1000);
       const p5 = price5m(symbol);
+      const d = derivative(symbol);
       const netRatio = f60.total ? f60.net / f60.total : 0;
       let longScore = 0;
       let shortScore = 0;
@@ -653,6 +824,14 @@ HTML = r"""
       if (p5 < 0) shortScore += Math.min(14, Math.abs(p5) * 2.5);
       longScore += Math.min(10, l5.shortLiq / Math.max(LARGE_TRADE_USD, 1) * 3);
       shortScore += Math.min(10, l5.longLiq / Math.max(LARGE_TRADE_USD, 1) * 3);
+      if (d.oi15Pct !== null && d.oi15Pct > 1.2) {
+        if (p5 >= 0 && f5.net >= 0) longScore += Math.min(18, d.oi15Pct * 4);
+        if (p5 <= 0 && f5.net <= 0) shortScore += Math.min(18, d.oi15Pct * 4);
+      }
+      if (d.takerRatio !== null && d.takerRatio > 1.12) longScore += Math.min(12, (d.takerRatio - 1) * 24);
+      if (d.takerRatio !== null && d.takerRatio < 0.9) shortScore += Math.min(12, (1 - d.takerRatio) * 24);
+      if (d.fundingRate !== null && d.fundingRate > 0.04) longScore -= 5;
+      if (d.fundingRate !== null && d.fundingRate < -0.04) shortScore -= 5;
       longScore = Math.max(0, Math.min(100, longScore));
       shortScore = Math.max(0, Math.min(100, shortScore));
       let signal = "WATCH";
@@ -665,8 +844,11 @@ HTML = r"""
       if (Math.abs(p5) >= 1) reasons.push("5m 价格 " + (p5 > 0 ? "+" : "") + p5.toFixed(2) + "%");
       if (l5.longLiq >= LARGE_TRADE_USD) reasons.push("多头爆仓 " + money(l5.longLiq));
       if (l5.shortLiq >= LARGE_TRADE_USD) reasons.push("空头爆仓 " + money(l5.shortLiq));
+      if (d.oi15Pct !== null && Math.abs(d.oi15Pct) >= 1.2) reasons.push("OI 15m " + plainSignedPct(d.oi15Pct));
+      if (d.takerRatio !== null && (d.takerRatio >= 1.12 || d.takerRatio <= 0.9)) reasons.push("Taker " + d.takerRatio.toFixed(2));
+      if (d.fundingRate !== null && Math.abs(d.fundingRate) >= 0.04) reasons.push("资金费率 " + d.fundingRate.toFixed(4) + "%");
       if (!reasons.length) reasons.push("等待大额资金流");
-      return {symbol, base: base(symbol), price: state.prices.get(symbol) || 0, p5, f60, f5, l5, signal, score, reasons};
+      return {symbol, base: base(symbol), price: state.prices.get(symbol) || 0, p5, f60, f5, l5, d, signal, score, reasons};
     }
     function rows() {
       return WATCH_SYMBOLS.map(scoreRow).sort((a, b) => {
@@ -697,18 +879,22 @@ HTML = r"""
       setDot("priceDot", state.priceConnected, state.priceError);
       setDot("tradeDot", state.tradeConnected, state.tradeError);
       setDot("liqDot", state.liqConnected, state.liqError);
-      const errors = [state.priceError, state.tradeError, state.liqError].filter(Boolean);
+      const errors = [state.priceError, state.tradeError, state.liqError, state.derivativesError].filter(Boolean);
       const connectedCount = [state.priceConnected, state.tradeConnected, state.liqConnected].filter(Boolean).length;
-      document.getElementById("connText").textContent = errors.length ? "连接错误" : (connectedCount ? `实时连接中 · 价格${state.priceMessages} 大单${state.tradeMessages}` : "连接中");
+      const derivText = state.derivativesUpdatedAt ? " 衍生品OK" : " 衍生品等待";
+      document.getElementById("connText").textContent = errors.length ? "连接错误" : (connectedCount ? `实时连接中 · 价格${state.priceMessages} 大单${state.tradeMessages}${derivText}` : "连接中");
       document.getElementById("errorNote").textContent = errors[0] || "";
     }
     function renderRadar() {
       const all = rows();
       const visible = filteredRows();
       renderStats(all);
+      maybeRecordSignals(all);
+      updateSignalOutcomes();
+      renderSignalReview();
       const body = document.getElementById("radarBody");
       if (!visible.length) {
-        body.innerHTML = '<tr><td colspan="10">当前筛选条件下暂无信号。</td></tr>';
+        body.innerHTML = '<tr><td colspan="12">当前筛选条件下暂无信号。</td></tr>';
         return;
       }
       body.innerHTML = visible.slice(0, 80).map(row => {
@@ -721,6 +907,8 @@ HTML = r"""
           <td><span class="score">${row.score}</span></td>
           <td class="num">${price(row.price)}</td>
           <td class="num">${signedPct(row.p5)}</td>
+          <td class="num">${row.d.oi15Pct === null ? '<span class="small">--</span>' : signedPct(row.d.oi15Pct)}</td>
+          <td class="num">${row.d.takerRatio === null ? '<span class="small">--</span>' : row.d.takerRatio.toFixed(2)}</td>
           <td class="num ${net60Cls}">${row.f60.net >= 0 ? "+" : "-"}${money(Math.abs(row.f60.net))}</td>
           <td class="num ${net5Cls}">${row.f5.net >= 0 ? "+" : "-"}${money(Math.abs(row.f5.net))}</td>
           <td class="num">${money(row.f60.largest || row.f5.largest)}</td>
@@ -746,6 +934,99 @@ HTML = r"""
         </div>`;
       }).join("");
     }
+    function loadSignalLog() {
+      try {
+        const raw = localStorage.getItem("flowRadarSignalLogV1");
+        state.signalLog = raw ? JSON.parse(raw) : [];
+      } catch (_) {
+        state.signalLog = [];
+      }
+    }
+    function saveSignalLog() {
+      try {
+        localStorage.setItem("flowRadarSignalLogV1", JSON.stringify(state.signalLog.slice(0, 120)));
+      } catch (_) {}
+    }
+    function signalDirection(signal) {
+      return signal === "LONG" ? 1 : signal === "SHORT" ? -1 : 0;
+    }
+    function maybeRecordSignals(allRows) {
+      const ts = Date.now();
+      let changed = false;
+      for (const row of allRows) {
+        if (row.score < 60 || !row.price || !["LONG", "SHORT"].includes(row.signal)) continue;
+        const key = `${row.symbol}|${row.signal}`;
+        const last = state.signalCooldown.get(key) || 0;
+        if (ts - last < 3 * 60 * 1000) continue;
+        state.signalCooldown.set(key, ts);
+        state.signalLog.unshift({
+          id: `${ts}-${row.symbol}-${row.signal}`,
+          ts,
+          symbol: row.symbol,
+          base: row.base,
+          signal: row.signal,
+          score: row.score,
+          entryPrice: row.price,
+          reasons: row.reasons,
+          checks: {m1: null, m3: null, m5: null, m15: null},
+        });
+        changed = true;
+      }
+      if (state.signalLog.length > 120) {
+        state.signalLog = state.signalLog.slice(0, 120);
+        changed = true;
+      }
+      if (changed) saveSignalLog();
+    }
+    function updateSignalOutcomes() {
+      let changed = false;
+      const ts = Date.now();
+      for (const item of state.signalLog) {
+        const current = state.prices.get(item.symbol);
+        if (!current || !item.entryPrice) continue;
+        for (const horizon of SIGNAL_HORIZONS) {
+          if (item.checks[horizon.key] !== null) continue;
+          if (ts - item.ts < horizon.ms) continue;
+          const rawPct = (current - item.entryPrice) / item.entryPrice * 100;
+          const resultPct = rawPct * signalDirection(item.signal);
+          item.checks[horizon.key] = Number(resultPct.toFixed(3));
+          changed = true;
+        }
+      }
+      if (changed) saveSignalLog();
+    }
+    function renderSignalReview() {
+      const body = document.getElementById("signalBody");
+      const stats = document.getElementById("signalStats");
+      if (!state.signalLog.length) {
+        body.innerHTML = '<tr><td colspan="9">暂无强信号记录。</td></tr>';
+        stats.textContent = "等待强信号";
+        return;
+      }
+      const completed5m = state.signalLog.filter(item => item.checks.m5 !== null);
+      const wins5m = completed5m.filter(item => item.checks.m5 > 0).length;
+      const avg5m = completed5m.length
+        ? completed5m.reduce((sum, item) => sum + item.checks.m5, 0) / completed5m.length
+        : 0;
+      stats.textContent = completed5m.length
+        ? `5m样本 ${completed5m.length} · 胜率 ${(wins5m / completed5m.length * 100).toFixed(0)}% · 平均 ${plainSignedPct(avg5m)}`
+        : `已记录 ${state.signalLog.length} 个信号，等待复盘`;
+      body.innerHTML = state.signalLog.slice(0, 18).map(item => {
+        const signalText = item.signal === "LONG" ? "做多" : "做空";
+        const cls = item.signal === "LONG" ? "up" : "down";
+        return `<tr>
+          <td class="small">${new Date(item.ts).toLocaleTimeString()}</td>
+          <td><div class="symbol">${item.base}</div><div class="small">${item.symbol}</div></td>
+          <td class="${cls}">${signalText}</td>
+          <td><span class="score">${item.score}</span></td>
+          <td class="num">${price(item.entryPrice)}</td>
+          <td class="num">${resultCell(item.checks.m1)}</td>
+          <td class="num">${resultCell(item.checks.m3)}</td>
+          <td class="num">${resultCell(item.checks.m5)}</td>
+          <td class="num">${resultCell(item.checks.m15)}</td>
+        </tr>`;
+      }).join("");
+    }
     function compactRowsForAi() {
       return rows().slice(0, 15).map(row => ({
         symbol: row.symbol,
@@ -760,7 +1041,24 @@ HTML = r"""
         total_5m_usd: Math.round(row.f5.total),
         largest_usd: Math.round(row.f60.largest || row.f5.largest),
         liquidation_5m_usd: Math.round(row.l5.total),
+        oi_15m_pct: row.d.oi15Pct,
+        taker_ratio: row.d.takerRatio,
+        funding_rate_pct: row.d.fundingRate,
         reasons: row.reasons,
+      }));
+    }
+    function compactSignalsForAi() {
+      return state.signalLog.slice(0, 20).map(item => ({
+        symbol: item.symbol,
+        base: item.base,
+        signal: item.signal,
+        score: item.score,
+        entry_price: item.entryPrice,
+        time: new Date(item.ts).toLocaleTimeString(),
+        result_1m_pct: item.checks.m1,
+        result_3m_pct: item.checks.m3,
+        result_5m_pct: item.checks.m5,
+        result_15m_pct: item.checks.m15,
       }));
     }
     function compactEventsForAi() {
@@ -789,10 +1087,13 @@ HTML = r"""
           strong_long: allRows.filter(row => row.signal === "LONG" && row.score >= 60).length,
           strong_short: allRows.filter(row => row.signal === "SHORT" && row.score >= 60).length,
           large_trade_threshold_usd: LARGE_TRADE_USD,
+          derivatives_updated_at: state.derivativesUpdatedAt ? new Date(state.derivativesUpdatedAt).toLocaleTimeString() : null,
+          derivatives_error: state.derivativesError,
           generated_at: new Date().toLocaleString(),
         },
         rows: compactRowsForAi(),
         events: compactEventsForAi(),
+        signals: compactSignalsForAi(),
       };
       try {
         const res = await fetch("/api/ai/analyze", {
@@ -832,10 +1133,10 @@ HTML = r"""
       state.tradeMessages = 0;
       state.liqMessages = 0;
     }
-    function connectPrices() {
-      connectPriceEndpoint(0);
+    function connectPrices(runId) {
+      connectPriceEndpoint(0, runId);
     }
-    function connectPriceEndpoint(index) {
+    function connectPriceEndpoint(index, runId) {
       const baseIndex = index % BINANCE_WS_BASES.length;
       const streamIndex = Math.floor(index / BINANCE_WS_BASES.length) % PRICE_STREAMS.length;
       const baseUrl = BINANCE_WS_BASES[baseIndex];
@@ -848,9 +1149,12 @@ HTML = r"""
       const tryNext = () => {
         if (movedOn) return;
         movedOn = true;
-        setTimeout(() => connectPriceEndpoint(index + 1), 900);
+        setTimeout(() => {
+          if (runId === state.runId) connectPriceEndpoint(index + 1, runId);
+        }, 900);
       };
       const timeoutId = setTimeout(() => {
+        if (runId !== state.runId) return;
         if (!opened && ws.readyState === WebSocket.CONNECTING) {
           state.priceError = `价格流连接超时：${baseUrl}`;
           renderRadar();
@@ -859,6 +1163,7 @@ HTML = r"""
         }
       }, 8000);
       const noDataId = setTimeout(() => {
+        if (runId !== state.runId) return;
         if (opened && state.priceMessages === startedMessages) {
           state.priceError = `价格流已连接但未收到数据：${baseUrl}/${streamName}`;
           renderRadar();
@@ -867,6 +1172,7 @@ HTML = r"""
         }
       }, 12000);
       ws.onopen = () => {
+        if (runId !== state.runId) return;
         opened = true;
         clearTimeout(timeoutId);
         state.priceConnected = true;
@@ -874,18 +1180,23 @@ HTML = r"""
         renderRadar();
       };
       ws.onclose = () => {
+        if (runId !== state.runId) return;
         clearTimeout(timeoutId);
         clearTimeout(noDataId);
         state.priceConnected = false;
         renderRadar();
-        if (opened && !movedOn) setTimeout(() => connectPriceEndpoint(index), 3000);
+        if (opened && !movedOn) setTimeout(() => {
+          if (runId === state.runId) connectPriceEndpoint(index, runId);
+        }, 3000);
         else tryNext();
       };
       ws.onerror = () => {
+        if (runId !== state.runId) return;
         state.priceError = `浏览器无法连接 Binance 价格流：${baseUrl}`;
         renderRadar();
       };
       ws.onmessage = event => {
+        if (runId !== state.runId) return;
         state.priceMessages++;
         const payload = JSON.parse(event.data);
         const rows = Array.isArray(payload) ? payload : (Array.isArray(payload.data) ? payload.data : []);
@@ -898,11 +1209,11 @@ HTML = r"""
         }
       };
     }
-    function connectTrades() {
+    function connectTrades(runId) {
       const streams = WATCH_SYMBOLS.map(symbol => symbol.toLowerCase() + "@aggTrade").join("/");
-      connectTradeEndpoint(streams, 0);
+      connectTradeEndpoint(streams, 0, runId);
     }
-    function connectTradeEndpoint(streams, index) {
+    function connectTradeEndpoint(streams, index, runId) {
       const baseUrl = BINANCE_WS_BASES[index % BINANCE_WS_BASES.length];
       const ws = new WebSocket(`${baseUrl}/stream?streams=${streams}`);
       state.sockets.push(ws);
@@ -912,9 +1223,12 @@ HTML = r"""
       const tryNext = () => {
         if (movedOn) return;
         movedOn = true;
-        setTimeout(() => connectTradeEndpoint(streams, index + 1), 900);
+        setTimeout(() => {
+          if (runId === state.runId) connectTradeEndpoint(streams, index + 1, runId);
+        }, 900);
       };
       const timeoutId = setTimeout(() => {
+        if (runId !== state.runId) return;
         if (!opened && ws.readyState === WebSocket.CONNECTING) {
           state.tradeError = `大单流连接超时：${baseUrl}`;
           renderRadar();
@@ -923,6 +1237,7 @@ HTML = r"""
         }
       }, 8000);
       const noDataId = setTimeout(() => {
+        if (runId !== state.runId) return;
         if (opened && state.tradeMessages === startedMessages) {
           state.tradeError = `大单流已连接但未收到数据：${baseUrl}`;
           renderRadar();
@@ -931,6 +1246,7 @@ HTML = r"""
         }
       }, 12000);
       ws.onopen = () => {
+        if (runId !== state.runId) return;
         opened = true;
         clearTimeout(timeoutId);
         state.tradeConnected = true;
@@ -938,18 +1254,23 @@ HTML = r"""
         renderRadar();
       };
       ws.onclose = () => {
+        if (runId !== state.runId) return;
         clearTimeout(timeoutId);
         clearTimeout(noDataId);
         state.tradeConnected = false;
         renderRadar();
-        if (opened && !movedOn) setTimeout(() => connectTradeEndpoint(streams, index), 3000);
+        if (opened && !movedOn) setTimeout(() => {
+          if (runId === state.runId) connectTradeEndpoint(streams, index, runId);
+        }, 3000);
         else tryNext();
       };
       ws.onerror = () => {
+        if (runId !== state.runId) return;
         state.tradeError = `浏览器无法连接 Binance 大单流：${baseUrl}`;
         renderRadar();
       };
       ws.onmessage = event => {
+        if (runId !== state.runId) return;
         state.tradeMessages++;
         const payload = JSON.parse(event.data).data || {};
         const symbol = payload.s;
@@ -967,10 +1288,10 @@ HTML = r"""
         }
       };
     }
-    function connectLiquidations() {
-      connectLiquidationEndpoint(0);
+    function connectLiquidations(runId) {
+      connectLiquidationEndpoint(0, runId);
     }
-    function connectLiquidationEndpoint(index) {
+    function connectLiquidationEndpoint(index, runId) {
       const baseUrl = BINANCE_WS_BASES[index % BINANCE_WS_BASES.length];
       const ws = new WebSocket(`${baseUrl}/ws/!forceOrder@arr`);
       state.sockets.push(ws);
@@ -979,9 +1300,12 @@ HTML = r"""
       const tryNext = () => {
         if (movedOn) return;
         movedOn = true;
-        setTimeout(() => connectLiquidationEndpoint(index + 1), 900);
+        setTimeout(() => {
+          if (runId === state.runId) connectLiquidationEndpoint(index + 1, runId);
+        }, 900);
       };
       const timeoutId = setTimeout(() => {
+        if (runId !== state.runId) return;
         if (!opened && ws.readyState === WebSocket.CONNECTING) {
           state.liqError = `爆仓流连接超时：${baseUrl}`;
           renderRadar();
@@ -990,6 +1314,7 @@ HTML = r"""
         }
       }, 8000);
       ws.onopen = () => {
+        if (runId !== state.runId) return;
         opened = true;
         clearTimeout(timeoutId);
         state.liqConnected = true;
@@ -997,17 +1322,22 @@ HTML = r"""
         renderRadar();
       };
       ws.onclose = () => {
+        if (runId !== state.runId) return;
         clearTimeout(timeoutId);
         state.liqConnected = false;
         renderRadar();
-        if (opened) setTimeout(() => connectLiquidationEndpoint(index), 3000);
+        if (opened) setTimeout(() => {
+          if (runId === state.runId) connectLiquidationEndpoint(index, runId);
+        }, 3000);
         else tryNext();
       };
       ws.onerror = () => {
+        if (runId !== state.runId) return;
         state.liqError = `浏览器无法连接 Binance 爆仓流：${baseUrl}`;
         renderRadar();
       };
       ws.onmessage = event => {
+        if (runId !== state.runId) return;
         state.liqMessages++;
         const payload = JSON.parse(event.data);
         const order = payload.o || {};
@@ -1025,13 +1355,20 @@ HTML = r"""
       };
     }
     function start() {
+      state.runId++;
+      const runId = state.runId;
       closeSockets();
-      connectPrices();
-      connectTrades();
-      connectLiquidations();
+      connectPrices(runId);
+      connectTrades(runId);
+      connectLiquidations(runId);
+      fetchDerivatives();
+      if (!state.derivativesTimer) {
+        state.derivativesTimer = setInterval(fetchDerivatives, 45 * 1000);
+      }
       renderRadar();
       renderEvents();
     }
+    loadSignalLog();
     document.getElementById("refresh").addEventListener("click", start);
     document.getElementById("aiBtn").addEventListener("click", runAiAnalysis);
     document.getElementById("search").addEventListener("input", renderRadar);
@@ -1056,6 +1393,7 @@ def index() -> str:
     html = HTML.replace("__WATCH_SYMBOLS__", json.dumps(WATCH_SYMBOLS))
     html = html.replace("__LARGE_TRADE_USD__", json.dumps(LARGE_TRADE_USD))
     html = html.replace("__BINANCE_WS_BASES__", json.dumps(BINANCE_WS_BASES))
+    html = html.replace("__BINANCE_REST_BASES__", json.dumps(BINANCE_REST_BASES))
     return render_template_string(html)
 
 
@@ -1068,6 +1406,7 @@ def health():
             "watch_symbols": WATCH_SYMBOLS,
             "large_trade_usd": LARGE_TRADE_USD,
             "binance_ws_bases": BINANCE_WS_BASES,
+            "binance_rest_bases": BINANCE_REST_BASES,
         }
     )
 
@@ -1078,6 +1417,7 @@ def debug_binance():
         {
             "message": "Render no longer fetches Binance. The browser connects directly to Binance WebSocket.",
             "binance_ws_bases": BINANCE_WS_BASES,
+            "binance_rest_bases": BINANCE_REST_BASES,
         }
     )
 
