@@ -48,6 +48,16 @@ WATCH_SYMBOLS = [
 ]
 LARGE_TRADE_USD = float(os.environ.get("LARGE_TRADE_USD", "50000"))
 BINANCE_WS = os.environ.get("BINANCE_WS", "wss://fstream.binance.com")
+BINANCE_WS_BASES = [
+    url.strip().rstrip("/")
+    for url in os.environ.get(
+        "BINANCE_WS_BASES",
+        "wss://fstream.binance.com,wss://fstream.binance.com/market,wss://fstream.binancefuture.com",
+    ).split(",")
+    if url.strip()
+]
+if BINANCE_WS.rstrip("/") not in BINANCE_WS_BASES:
+    BINANCE_WS_BASES.insert(0, BINANCE_WS.rstrip("/"))
 BINANCE_REST = os.environ.get("BINANCE_REST", "https://fapi.binance.com")
 
 
@@ -368,7 +378,7 @@ HTML = r"""
   <script>
     const WATCH_SYMBOLS = __WATCH_SYMBOLS__;
     const LARGE_TRADE_USD = __LARGE_TRADE_USD__;
-    const BINANCE_WS = "__BINANCE_WS__";
+    const BINANCE_WS_BASES = __BINANCE_WS_BASES__;
     const MAJORS = new Set(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]);
 
     const state = {
@@ -594,11 +604,45 @@ HTML = r"""
     }
     function connectTrades() {
       const streams = WATCH_SYMBOLS.map(symbol => symbol.toLowerCase() + "@aggTrade").join("/");
-      const ws = new WebSocket(`${BINANCE_WS}/stream?streams=${streams}`);
+      connectTradeEndpoint(streams, 0);
+    }
+    function connectTradeEndpoint(streams, index) {
+      const baseUrl = BINANCE_WS_BASES[index % BINANCE_WS_BASES.length];
+      const ws = new WebSocket(`${baseUrl}/stream?streams=${streams}`);
       state.sockets.push(ws);
-      ws.onopen = () => { state.tradeConnected = true; state.tradeError = ""; renderRadar(); };
-      ws.onclose = () => { state.tradeConnected = false; renderRadar(); setTimeout(connectTrades, 3000); };
-      ws.onerror = () => { state.tradeError = "浏览器无法连接 Binance 大单流 WebSocket"; renderRadar(); };
+      let opened = false;
+      let movedOn = false;
+      const tryNext = () => {
+        if (movedOn) return;
+        movedOn = true;
+        setTimeout(() => connectTradeEndpoint(streams, index + 1), 900);
+      };
+      const timeoutId = setTimeout(() => {
+        if (!opened && ws.readyState === WebSocket.CONNECTING) {
+          state.tradeError = `大单流连接超时：${baseUrl}`;
+          renderRadar();
+          try { ws.close(); } catch (_) {}
+          tryNext();
+        }
+      }, 8000);
+      ws.onopen = () => {
+        opened = true;
+        clearTimeout(timeoutId);
+        state.tradeConnected = true;
+        state.tradeError = "";
+        renderRadar();
+      };
+      ws.onclose = () => {
+        clearTimeout(timeoutId);
+        state.tradeConnected = false;
+        renderRadar();
+        if (opened) setTimeout(() => connectTradeEndpoint(streams, index), 3000);
+        else tryNext();
+      };
+      ws.onerror = () => {
+        state.tradeError = `浏览器无法连接 Binance 大单流：${baseUrl}`;
+        renderRadar();
+      };
       ws.onmessage = event => {
         const payload = JSON.parse(event.data).data || {};
         const symbol = payload.s;
@@ -617,11 +661,45 @@ HTML = r"""
       };
     }
     function connectLiquidations() {
-      const ws = new WebSocket(`${BINANCE_WS}/ws/!forceOrder@arr`);
+      connectLiquidationEndpoint(0);
+    }
+    function connectLiquidationEndpoint(index) {
+      const baseUrl = BINANCE_WS_BASES[index % BINANCE_WS_BASES.length];
+      const ws = new WebSocket(`${baseUrl}/ws/!forceOrder@arr`);
       state.sockets.push(ws);
-      ws.onopen = () => { state.liqConnected = true; state.liqError = ""; renderRadar(); };
-      ws.onclose = () => { state.liqConnected = false; renderRadar(); setTimeout(connectLiquidations, 3000); };
-      ws.onerror = () => { state.liqError = "浏览器无法连接 Binance 爆仓流 WebSocket"; renderRadar(); };
+      let opened = false;
+      let movedOn = false;
+      const tryNext = () => {
+        if (movedOn) return;
+        movedOn = true;
+        setTimeout(() => connectLiquidationEndpoint(index + 1), 900);
+      };
+      const timeoutId = setTimeout(() => {
+        if (!opened && ws.readyState === WebSocket.CONNECTING) {
+          state.liqError = `爆仓流连接超时：${baseUrl}`;
+          renderRadar();
+          try { ws.close(); } catch (_) {}
+          tryNext();
+        }
+      }, 8000);
+      ws.onopen = () => {
+        opened = true;
+        clearTimeout(timeoutId);
+        state.liqConnected = true;
+        state.liqError = "";
+        renderRadar();
+      };
+      ws.onclose = () => {
+        clearTimeout(timeoutId);
+        state.liqConnected = false;
+        renderRadar();
+        if (opened) setTimeout(() => connectLiquidationEndpoint(index), 3000);
+        else tryNext();
+      };
+      ws.onerror = () => {
+        state.liqError = `浏览器无法连接 Binance 爆仓流：${baseUrl}`;
+        renderRadar();
+      };
       ws.onmessage = event => {
         const payload = JSON.parse(event.data);
         const order = payload.o || {};
@@ -667,7 +745,7 @@ HTML = r"""
 def index() -> str:
     html = HTML.replace("__WATCH_SYMBOLS__", json.dumps(WATCH_SYMBOLS))
     html = html.replace("__LARGE_TRADE_USD__", json.dumps(LARGE_TRADE_USD))
-    html = html.replace("__BINANCE_WS__", BINANCE_WS.rstrip("/"))
+    html = html.replace("__BINANCE_WS_BASES__", json.dumps(BINANCE_WS_BASES))
     return render_template_string(html)
 
 
@@ -679,6 +757,7 @@ def health():
             "mode": "browser_direct_binance_websocket",
             "watch_symbols": WATCH_SYMBOLS,
             "large_trade_usd": LARGE_TRADE_USD,
+            "binance_ws_bases": BINANCE_WS_BASES,
         }
     )
 
@@ -688,7 +767,7 @@ def debug_binance():
     return jsonify(
         {
             "message": "Render no longer fetches Binance. The browser connects directly to Binance WebSocket.",
-            "binance_ws": BINANCE_WS,
+            "binance_ws_bases": BINANCE_WS_BASES,
         }
     )
 
