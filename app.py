@@ -106,6 +106,8 @@ class MarketState:
             "snapshot_interval": SNAPSHOT_INTERVAL,
             "large_trade_usd": LARGE_TRADE_USD,
             "watch_symbols": WATCH_SYMBOLS,
+            "threads_started": False,
+            "snapshot_status": "not_started",
             "ws_trade_connected": False,
             "ws_liq_connected": False,
             "snapshot_error": None,
@@ -128,6 +130,15 @@ class MarketState:
     def set_snapshot_error(self, error: str | None) -> None:
         with self.lock:
             self.meta["snapshot_error"] = error
+            self.meta["snapshot_status"] = "error" if error else self.meta.get("snapshot_status")
+
+    def set_snapshot_status(self, status: str) -> None:
+        with self.lock:
+            self.meta["snapshot_status"] = status
+
+    def mark_threads_started(self) -> None:
+        with self.lock:
+            self.meta["threads_started"] = True
 
     def flow_for(self, symbol: str, seconds: int) -> dict[str, Any]:
         cutoff = time.time() - seconds
@@ -398,12 +409,15 @@ def money_short(value: float) -> str:
 
 
 def build_radar() -> None:
+    STATE.set_snapshot_status("fetching_exchange_info")
     symbols = get_exchange_symbols()
+    STATE.set_snapshot_status("fetching_tickers")
     tickers = get_all_tickers()
     funding = get_funding_map()
     candidates = choose_candidates(symbols, tickers)
 
     micro_map: dict[str, dict[str, Any]] = {}
+    STATE.set_snapshot_status("fetching_microstructure")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(get_symbol_micro, symbol): symbol for symbol in candidates}
         for future in as_completed(futures):
@@ -460,6 +474,7 @@ def build_radar() -> None:
         "binance_rest": BINANCE_REST,
     }
     STATE.set_radar(radar, summary)
+    STATE.set_snapshot_status("ready")
 
 
 def snapshot_loop() -> None:
@@ -588,6 +603,7 @@ def start_background_threads() -> None:
     if getattr(app, "_radar_threads_started", False):
         return
     app._radar_threads_started = True
+    STATE.mark_threads_started()
     for target, name in [
         (snapshot_loop, "snapshot-loop"),
         (trade_ws_loop, "trade-ws"),
@@ -1058,22 +1074,29 @@ HTML = r"""
 
 @app.route("/")
 def index() -> str:
+    start_background_threads()
     return render_template_string(HTML)
 
 
 @app.route("/api/radar")
 def api_radar() -> Any:
+    start_background_threads()
     return jsonify(STATE.snapshot())
 
 
 @app.route("/health")
 def health() -> Any:
+    start_background_threads()
     data = STATE.snapshot()
     return jsonify(
         {
             "ok": data["meta"].get("updated_at", 0) > 0,
             "updated_at": data["meta"].get("updated_at"),
             "snapshot_error": data["meta"].get("snapshot_error"),
+            "snapshot_status": data["meta"].get("snapshot_status"),
+            "threads_started": data["meta"].get("threads_started"),
+            "ws_trade_connected": data["meta"].get("ws_trade_connected"),
+            "ws_liq_connected": data["meta"].get("ws_liq_connected"),
         }
     )
 
