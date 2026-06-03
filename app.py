@@ -300,6 +300,7 @@ HTML = r"""
   <div class="topbar">
     <div class="brand"><div class="brand-mark">FR</div><div>Binance Flow Radar</div></div>
     <div class="statusbar">
+      <span class="dot" id="priceDot"></span><span>价格流</span>
       <span class="dot" id="tradeDot"></span><span>大单流</span>
       <span class="dot" id="liqDot"></span><span>爆仓流</span>
       <span id="connText">连接中</span>
@@ -388,8 +389,10 @@ HTML = r"""
       priceHistory: new Map(),
       events: [],
       sockets: [],
+      priceConnected: false,
       tradeConnected: false,
       liqConnected: false,
+      priceError: "",
       tradeError: "",
       liqError: "",
       activeFilter: "all",
@@ -533,10 +536,12 @@ HTML = r"""
       document.getElementById("statShort").textContent = strongShort;
       document.getElementById("statFlow").textContent = money(totalFlow);
       document.getElementById("statLiq").textContent = money(totalLiq);
+      setDot("priceDot", state.priceConnected, state.priceError);
       setDot("tradeDot", state.tradeConnected, state.tradeError);
       setDot("liqDot", state.liqConnected, state.liqError);
-      const errors = [state.tradeError, state.liqError].filter(Boolean);
-      document.getElementById("connText").textContent = errors.length ? "连接错误" : (state.tradeConnected || state.liqConnected ? "实时连接中" : "连接中");
+      const errors = [state.priceError, state.tradeError, state.liqError].filter(Boolean);
+      const connectedCount = [state.priceConnected, state.tradeConnected, state.liqConnected].filter(Boolean).length;
+      document.getElementById("connText").textContent = errors.length ? "连接错误" : (connectedCount ? "实时连接中" : "连接中");
       document.getElementById("errorNote").textContent = errors[0] || "";
     }
     function renderRadar() {
@@ -597,10 +602,64 @@ HTML = r"""
         try { ws.close(); } catch (_) {}
       }
       state.sockets = [];
+      state.priceConnected = false;
       state.tradeConnected = false;
       state.liqConnected = false;
+      state.priceError = "";
       state.tradeError = "";
       state.liqError = "";
+    }
+    function connectPrices() {
+      connectPriceEndpoint(0);
+    }
+    function connectPriceEndpoint(index) {
+      const baseUrl = BINANCE_WS_BASES[index % BINANCE_WS_BASES.length];
+      const ws = new WebSocket(`${baseUrl}/ws/!markPrice@arr@1s`);
+      state.sockets.push(ws);
+      let opened = false;
+      let movedOn = false;
+      const tryNext = () => {
+        if (movedOn) return;
+        movedOn = true;
+        setTimeout(() => connectPriceEndpoint(index + 1), 900);
+      };
+      const timeoutId = setTimeout(() => {
+        if (!opened && ws.readyState === WebSocket.CONNECTING) {
+          state.priceError = `价格流连接超时：${baseUrl}`;
+          renderRadar();
+          try { ws.close(); } catch (_) {}
+          tryNext();
+        }
+      }, 8000);
+      ws.onopen = () => {
+        opened = true;
+        clearTimeout(timeoutId);
+        state.priceConnected = true;
+        state.priceError = "";
+        renderRadar();
+      };
+      ws.onclose = () => {
+        clearTimeout(timeoutId);
+        state.priceConnected = false;
+        renderRadar();
+        if (opened) setTimeout(() => connectPriceEndpoint(index), 3000);
+        else tryNext();
+      };
+      ws.onerror = () => {
+        state.priceError = `浏览器无法连接 Binance 价格流：${baseUrl}`;
+        renderRadar();
+      };
+      ws.onmessage = event => {
+        const payload = JSON.parse(event.data);
+        const rows = Array.isArray(payload) ? payload : (Array.isArray(payload.data) ? payload.data : []);
+        const ts = Date.now();
+        for (const item of rows) {
+          const symbol = item.s;
+          if (!symbol || !WATCH_SYMBOLS.includes(symbol)) continue;
+          const priceValue = Number(item.p || item.i || 0);
+          if (priceValue > 0) rememberPrice(symbol, priceValue, ts);
+        }
+      };
     }
     function connectTrades() {
       const streams = WATCH_SYMBOLS.map(symbol => symbol.toLowerCase() + "@aggTrade").join("/");
@@ -718,6 +777,7 @@ HTML = r"""
     }
     function start() {
       closeSockets();
+      connectPrices();
       connectTrades();
       connectLiquidations();
       renderRadar();
