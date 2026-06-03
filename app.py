@@ -47,12 +47,14 @@ WATCH_SYMBOLS = [
     if symbol.strip()
 ]
 LARGE_TRADE_USD = float(os.environ.get("LARGE_TRADE_USD", "50000"))
-BINANCE_WS = os.environ.get("BINANCE_WS", "wss://fstream.binance.com")
+BINANCE_WS = os.environ.get("BINANCE_WS", "wss://fstream.binance.com/market").rstrip("/")
+if BINANCE_WS in {"wss://fstream.binance.com", "wss://fstream.binancefuture.com"}:
+    BINANCE_WS += "/market"
 BINANCE_WS_BASES = [
     url.strip().rstrip("/")
     for url in os.environ.get(
         "BINANCE_WS_BASES",
-        "wss://fstream.binance.com,wss://fstream.binance.com/market,wss://fstream.binancefuture.com",
+        "wss://fstream.binance.com/market,wss://fstream.binancefuture.com/market",
     ).split(",")
     if url.strip()
 ]
@@ -380,6 +382,7 @@ HTML = r"""
     const WATCH_SYMBOLS = __WATCH_SYMBOLS__;
     const LARGE_TRADE_USD = __LARGE_TRADE_USD__;
     const BINANCE_WS_BASES = __BINANCE_WS_BASES__;
+    const PRICE_STREAMS = ["!markPrice@arr@1s", "!ticker@arr"];
     const MAJORS = new Set(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]);
 
     const state = {
@@ -395,6 +398,9 @@ HTML = r"""
       priceError: "",
       tradeError: "",
       liqError: "",
+      priceMessages: 0,
+      tradeMessages: 0,
+      liqMessages: 0,
       activeFilter: "all",
     };
 
@@ -541,7 +547,7 @@ HTML = r"""
       setDot("liqDot", state.liqConnected, state.liqError);
       const errors = [state.priceError, state.tradeError, state.liqError].filter(Boolean);
       const connectedCount = [state.priceConnected, state.tradeConnected, state.liqConnected].filter(Boolean).length;
-      document.getElementById("connText").textContent = errors.length ? "连接错误" : (connectedCount ? "实时连接中" : "连接中");
+      document.getElementById("connText").textContent = errors.length ? "连接错误" : (connectedCount ? `实时连接中 · 价格${state.priceMessages} 大单${state.tradeMessages}` : "连接中");
       document.getElementById("errorNote").textContent = errors[0] || "";
     }
     function renderRadar() {
@@ -608,16 +614,23 @@ HTML = r"""
       state.priceError = "";
       state.tradeError = "";
       state.liqError = "";
+      state.priceMessages = 0;
+      state.tradeMessages = 0;
+      state.liqMessages = 0;
     }
     function connectPrices() {
       connectPriceEndpoint(0);
     }
     function connectPriceEndpoint(index) {
-      const baseUrl = BINANCE_WS_BASES[index % BINANCE_WS_BASES.length];
-      const ws = new WebSocket(`${baseUrl}/ws/!markPrice@arr@1s`);
+      const baseIndex = index % BINANCE_WS_BASES.length;
+      const streamIndex = Math.floor(index / BINANCE_WS_BASES.length) % PRICE_STREAMS.length;
+      const baseUrl = BINANCE_WS_BASES[baseIndex];
+      const streamName = PRICE_STREAMS[streamIndex];
+      const ws = new WebSocket(`${baseUrl}/ws/${streamName}`);
       state.sockets.push(ws);
       let opened = false;
       let movedOn = false;
+      const startedMessages = state.priceMessages;
       const tryNext = () => {
         if (movedOn) return;
         movedOn = true;
@@ -631,6 +644,14 @@ HTML = r"""
           tryNext();
         }
       }, 8000);
+      const noDataId = setTimeout(() => {
+        if (opened && state.priceMessages === startedMessages) {
+          state.priceError = `价格流已连接但未收到数据：${baseUrl}/${streamName}`;
+          renderRadar();
+          try { ws.close(); } catch (_) {}
+          tryNext();
+        }
+      }, 12000);
       ws.onopen = () => {
         opened = true;
         clearTimeout(timeoutId);
@@ -640,9 +661,10 @@ HTML = r"""
       };
       ws.onclose = () => {
         clearTimeout(timeoutId);
+        clearTimeout(noDataId);
         state.priceConnected = false;
         renderRadar();
-        if (opened) setTimeout(() => connectPriceEndpoint(index), 3000);
+        if (opened && !movedOn) setTimeout(() => connectPriceEndpoint(index), 3000);
         else tryNext();
       };
       ws.onerror = () => {
@@ -650,13 +672,14 @@ HTML = r"""
         renderRadar();
       };
       ws.onmessage = event => {
+        state.priceMessages++;
         const payload = JSON.parse(event.data);
         const rows = Array.isArray(payload) ? payload : (Array.isArray(payload.data) ? payload.data : []);
         const ts = Date.now();
         for (const item of rows) {
           const symbol = item.s;
           if (!symbol || !WATCH_SYMBOLS.includes(symbol)) continue;
-          const priceValue = Number(item.p || item.i || 0);
+          const priceValue = Number(item.c || item.p || item.i || 0);
           if (priceValue > 0) rememberPrice(symbol, priceValue, ts);
         }
       };
@@ -671,6 +694,7 @@ HTML = r"""
       state.sockets.push(ws);
       let opened = false;
       let movedOn = false;
+      const startedMessages = state.tradeMessages;
       const tryNext = () => {
         if (movedOn) return;
         movedOn = true;
@@ -684,6 +708,14 @@ HTML = r"""
           tryNext();
         }
       }, 8000);
+      const noDataId = setTimeout(() => {
+        if (opened && state.tradeMessages === startedMessages) {
+          state.tradeError = `大单流已连接但未收到数据：${baseUrl}`;
+          renderRadar();
+          try { ws.close(); } catch (_) {}
+          tryNext();
+        }
+      }, 12000);
       ws.onopen = () => {
         opened = true;
         clearTimeout(timeoutId);
@@ -693,9 +725,10 @@ HTML = r"""
       };
       ws.onclose = () => {
         clearTimeout(timeoutId);
+        clearTimeout(noDataId);
         state.tradeConnected = false;
         renderRadar();
-        if (opened) setTimeout(() => connectTradeEndpoint(streams, index), 3000);
+        if (opened && !movedOn) setTimeout(() => connectTradeEndpoint(streams, index), 3000);
         else tryNext();
       };
       ws.onerror = () => {
@@ -703,6 +736,7 @@ HTML = r"""
         renderRadar();
       };
       ws.onmessage = event => {
+        state.tradeMessages++;
         const payload = JSON.parse(event.data).data || {};
         const symbol = payload.s;
         if (!symbol || !WATCH_SYMBOLS.includes(symbol)) return;
@@ -760,6 +794,7 @@ HTML = r"""
         renderRadar();
       };
       ws.onmessage = event => {
+        state.liqMessages++;
         const payload = JSON.parse(event.data);
         const order = payload.o || {};
         const symbol = order.s;
