@@ -48,6 +48,8 @@ WATCH_SYMBOLS = [
     for symbol in os.environ.get("WATCH_SYMBOLS", ",".join(DEFAULT_WATCH_SYMBOLS)).split(",")
     if symbol.strip()
 ]
+MAX_STREAM_SYMBOLS = int(os.environ.get("MAX_STREAM_SYMBOLS", "180"))
+TRADE_STREAM_CHUNK_SIZE = int(os.environ.get("TRADE_STREAM_CHUNK_SIZE", "60"))
 LARGE_TRADE_USD = float(os.environ.get("LARGE_TRADE_USD", "50000"))
 BINANCE_WS = os.environ.get("BINANCE_WS", "wss://fstream.binance.com/market").rstrip("/")
 if BINANCE_WS in {"wss://fstream.binance.com", "wss://fstream.binancefuture.com"}:
@@ -94,7 +96,6 @@ def money_short(value: float) -> str:
 def rule_based_analysis(payload: dict) -> str:
     rows = payload.get("rows") or []
     events = payload.get("events") or []
-    signals = payload.get("signals") or []
     rows = rows[:12]
     hot = [row for row in rows if int(row.get("score") or 0) >= 50]
     long_rows = [row for row in hot if row.get("signal") == "LONG"]
@@ -105,7 +106,7 @@ def rule_based_analysis(payload: dict) -> str:
     if not rows:
         return "暂无足够数据。先等待价格流和大单流累计 1-3 分钟，再分析。"
 
-    lines.append("当前结论：")
+    lines.append("当前大资金判断：")
     if top and int(top.get("score") or 0) >= 60:
         lines.append(
             f"- 最强信号是 {top.get('base')}，方向为 {top.get('signal')}，评分 {top.get('score')}。"
@@ -122,21 +123,33 @@ def rule_based_analysis(payload: dict) -> str:
         names = "、".join(row.get("base", "") for row in short_rows[:4])
         lines.append(f"- 做空压力集中在 {names}，若价格没有继续下行，可能是诱空或吸筹。")
 
-    completed5m = [item for item in signals if item.get("result_5m_pct") is not None]
-    if completed5m:
-        wins = [item for item in completed5m if float(item.get("result_5m_pct") or 0) > 0]
-        avg = sum(float(item.get("result_5m_pct") or 0) for item in completed5m) / len(completed5m)
-        lines.append(
-            f"- 最近已复盘 5m 信号 {len(completed5m)} 个，胜率 {len(wins) / len(completed5m) * 100:.0f}%，平均结果 {avg:+.2f}%。"
-        )
-        if len(completed5m) >= 8 and avg <= 0:
-            lines.append("- 当前规则近期平均表现不佳，强信号也应降仓或只观察。")
+    follow_candidates = []
+    for row in rows:
+        score = int(row.get("score") or 0)
+        p5 = float(row.get("price_5m_pct") or 0)
+        net60 = float(row.get("net_60s_usd") or 0)
+        net5 = float(row.get("net_5m_usd") or 0)
+        signal = row.get("signal")
+        aligned_long = signal == "LONG" and score >= 65 and net60 > 0 and net5 > 0 and p5 >= 0
+        aligned_short = signal == "SHORT" and score >= 65 and net60 < 0 and net5 < 0 and p5 <= 0
+        if aligned_long or aligned_short:
+            follow_candidates.append(row)
 
     lines.append("")
-    lines.append("入场前要等的确认：")
+    lines.append("是否可以跟：")
+    if follow_candidates:
+        names = "、".join(f"{row.get('base')}({row.get('score')})" for row in follow_candidates[:4])
+        lines.append(f"- 可以重点盯盘但不要市价追：{names}。")
+        lines.append("- 跟单前还要等同方向大单继续出现，价格不能立刻反抽/反砸。")
+    else:
+        lines.append("- 当前没有满足“资金流、价格、短周期净流同向”的高质量跟单信号。")
+
+    lines.append("")
+    lines.append("跟单前确认：")
     lines.append("- 资金净流连续 2-3 个刷新周期保持同方向，而不是单笔大单闪过。")
     lines.append("- 价格方向和资金方向一致：主动买净流配合价格抬高，主动卖净流配合价格走低。")
     lines.append("- 最大单不是孤立一笔，事件流里同币种要连续出现。")
+    lines.append("- BTC/ETH 不要和目标山寨币方向明显相反。")
 
     lines.append("")
     lines.append("失效/避开的情况：")
@@ -156,7 +169,7 @@ def rule_based_analysis(payload: dict) -> str:
             lines.append("- " + "、".join(f"{name}({count}次)" for name, count in active if name))
 
     lines.append("")
-    lines.append("仓位建议：这不是自动买卖信号。用小仓试错，先设止损，再考虑入场。")
+    lines.append("仓位建议：这不是自动买卖信号。只适合小仓观察，先设止损，再考虑入场。")
     return "\n".join(lines)
 
 
@@ -168,7 +181,6 @@ def call_ai_analysis(payload: dict, fallback: str) -> tuple[str, str]:
         "summary": payload.get("summary", {}),
         "rows": (payload.get("rows") or [])[:12],
         "events": (payload.get("events") or [])[:25],
-        "signals": (payload.get("signals") or [])[:20],
     }
     messages = [
         {
@@ -442,19 +454,6 @@ HTML = r"""
       white-space: nowrap;
     }
     .ai-btn:disabled { opacity: .55; cursor: wait; }
-    .review-grid {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 12px;
-      margin-top: 12px;
-    }
-    .review-meta {
-      color: var(--muted);
-      font-size: 12px;
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
     .warn {
       margin-top: 12px;
       border: 1px solid #efd897;
@@ -499,9 +498,9 @@ HTML = r"""
     </div>
 
     <section class="stats">
-      <div class="stat"><div class="label">监控交易对</div><div class="value" id="statSymbols">--</div><div class="sub">浏览器直连 Binance</div></div>
-      <div class="stat"><div class="label">强做多压力</div><div class="value up" id="statLong">--</div><div class="sub">评分不低于 60</div></div>
-      <div class="stat"><div class="label">强做空压力</div><div class="value down" id="statShort">--</div><div class="sub">评分不低于 60</div></div>
+      <div class="stat"><div class="label">扫描交易对</div><div class="value" id="statSymbols">--</div><div class="sub" id="scopeSub">自动扩展范围</div></div>
+      <div class="stat"><div class="label">可跟多头候选</div><div class="value up" id="statLong">--</div><div class="sub">资金与价格同向</div></div>
+      <div class="stat"><div class="label">可跟空头候选</div><div class="value down" id="statShort">--</div><div class="sub">资金与价格同向</div></div>
       <div class="stat"><div class="label">60 秒大单流</div><div class="value" id="statFlow">--</div><div class="sub">WebSocket 实时累计</div></div>
       <div class="stat"><div class="label">5 分钟爆仓</div><div class="value" id="statLiq">--</div><div class="sub">强平订单流</div></div>
     </section>
@@ -509,20 +508,20 @@ HTML = r"""
     <section class="ai-panel">
       <div class="panel-head">
         <div>
-          <div class="panel-title">AI 资金流分析</div>
-          <div class="panel-note">基于当前表格快照，不读取账户，不自动下单</div>
+          <div class="panel-title">AI 跟单分析</div>
+          <div class="panel-note">分析哪里有大资金、是否值得跟，不读取账户，不自动下单</div>
         </div>
         <button class="ai-btn" id="aiBtn">分析当前行情</button>
       </div>
-      <div class="ai-body" id="aiOutput">等待行情累计后点击分析。没有配置 AI Key 时会使用内置规则分析。</div>
+      <div class="ai-body" id="aiOutput">等待行情累计 1-2 分钟后点击分析。没有配置 AI Key 时会使用内置规则分析。</div>
     </section>
 
     <section class="layout">
       <div class="panel">
         <div class="panel-head">
           <div>
-            <div class="panel-title">资金压力雷达</div>
-            <div class="panel-note">大额主动成交、价格短线变化、爆仓流组合评分</div>
+            <div class="panel-title">大资金流动雷达</div>
+            <div class="panel-note" id="radarNote">自动扫描高成交额 USDT 永续，寻找可跟单资金流</div>
           </div>
           <div class="panel-note" id="errorNote"></div>
         </div>
@@ -562,53 +561,20 @@ HTML = r"""
       </aside>
     </section>
 
-    <section class="panel review-grid">
-      <div class="panel-head">
-        <div>
-          <div class="panel-title">信号复盘</div>
-          <div class="panel-note">自动记录评分不低于 60 的信号，跟踪 1/3/5/15 分钟后结果</div>
-        </div>
-        <div class="review-meta" id="signalStats">等待强信号</div>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>时间</th>
-              <th>交易对</th>
-              <th>方向</th>
-              <th>分数</th>
-              <th>入场价</th>
-              <th>1m</th>
-              <th>3m</th>
-              <th>5m</th>
-              <th>15m</th>
-            </tr>
-          </thead>
-          <tbody id="signalBody">
-            <tr><td colspan="9">暂无强信号记录。</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
     <div class="warn">
-      Render 服务器访问 Binance 会被地区限制，所以这版改为浏览器直连 Binance WebSocket。若你的浏览器也无法连接 Binance，页面会显示连接错误。此工具只用于缩小观察范围，不构成投资建议；高分信号也可能是诱多、诱空或出货。
+      Render 服务器访问 Binance 会被地区限制，所以这版改为浏览器直连 Binance。系统只用于发现大资金流动和缩小观察范围，不构成投资建议；“可跟”也只是盯盘候选，不代表可以无脑追单。
     </div>
   </main>
 
   <script>
     const WATCH_SYMBOLS = __WATCH_SYMBOLS__;
+    const MAX_STREAM_SYMBOLS = __MAX_STREAM_SYMBOLS__;
+    const TRADE_STREAM_CHUNK_SIZE = __TRADE_STREAM_CHUNK_SIZE__;
     const LARGE_TRADE_USD = __LARGE_TRADE_USD__;
     const BINANCE_WS_BASES = __BINANCE_WS_BASES__;
     const BINANCE_REST_BASES = __BINANCE_REST_BASES__;
     const PRICE_STREAMS = ["!markPrice@arr@1s", "!ticker@arr"];
-    const SIGNAL_HORIZONS = [
-      {key: "m1", label: "1m", ms: 60 * 1000},
-      {key: "m3", label: "3m", ms: 3 * 60 * 1000},
-      {key: "m5", label: "5m", ms: 5 * 60 * 1000},
-      {key: "m15", label: "15m", ms: 15 * 60 * 1000},
-    ];
+    const STABLE_SYMBOLS = new Set(["USDCUSDT", "BUSDUSDT", "FDUSDUSDT", "TUSDUSDT", "USDPUSDT", "DAIUSDT"]);
     const MAJORS = new Set(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]);
 
     const state = {
@@ -617,9 +583,9 @@ HTML = r"""
       prices: new Map(),
       priceHistory: new Map(),
       derivatives: new Map(),
+      marketMeta: new Map(),
+      activeSymbols: [...WATCH_SYMBOLS],
       events: [],
-      signalLog: [],
-      signalCooldown: new Map(),
       sockets: [],
       priceConnected: false,
       tradeConnected: false,
@@ -633,10 +599,17 @@ HTML = r"""
       derivativesUpdatedAt: 0,
       derivativesError: "",
       derivativesTimer: null,
+      marketTimer: null,
       runId: 0,
       activeFilter: "all",
     };
 
+    function activeSymbols() {
+      return state.activeSymbols.length ? state.activeSymbols : WATCH_SYMBOLS;
+    }
+    function activeSymbolSet() {
+      return new Set(activeSymbols());
+    }
     function base(symbol) { return symbol.replace("USDT", ""); }
     function now() { return Date.now(); }
     function cutoffRows(rows, ms) {
@@ -722,6 +695,38 @@ HTML = r"""
       }
       throw lastError || new Error("Binance REST unavailable");
     }
+    async function refreshMarketUniverse() {
+      try {
+        const data = await fetchJsonFromBinance("/fapi/v1/ticker/24hr");
+        if (!Array.isArray(data)) return;
+        const rows = data
+          .filter(item => item.symbol && item.symbol.endsWith("USDT") && !STABLE_SYMBOLS.has(item.symbol))
+          .map(item => ({
+            symbol: item.symbol,
+            quoteVolume: Number(item.quoteVolume || 0),
+            changePct: Number(item.priceChangePercent || 0),
+            count: Number(item.count || 0),
+            lastPrice: Number(item.lastPrice || 0),
+          }))
+          .filter(item => item.quoteVolume > 0)
+          .sort((a, b) => b.quoteVolume - a.quoteVolume);
+        const selected = [];
+        for (const symbol of WATCH_SYMBOLS) {
+          if (!selected.includes(symbol) && rows.some(item => item.symbol === symbol)) selected.push(symbol);
+        }
+        for (const item of rows) {
+          if (!selected.includes(item.symbol)) selected.push(item.symbol);
+          state.marketMeta.set(item.symbol, item);
+          if (item.lastPrice > 0) rememberPrice(item.symbol, item.lastPrice, Date.now());
+          if (selected.length >= MAX_STREAM_SYMBOLS) break;
+        }
+        state.activeSymbols = selected;
+        document.getElementById("scopeSub").textContent = `Top ${selected.length} USDT 永续`;
+        document.getElementById("radarNote").textContent = `自动扫描成交额靠前的 ${selected.length} 个 USDT 永续，按大资金流动排序`;
+      } catch (error) {
+        document.getElementById("scopeSub").textContent = "全市场列表受限，使用默认池";
+      }
+    }
     async function fetchDerivativeSymbol(symbol) {
       const current = derivative(symbol);
       const next = {...current, updatedAt: Date.now()};
@@ -757,7 +762,7 @@ HTML = r"""
           const ts = Date.now();
           for (const item of premium) {
             const symbol = item.symbol;
-            if (!WATCH_SYMBOLS.includes(symbol)) continue;
+            if (!activeSymbolSet().has(symbol)) continue;
             const next = {...derivative(symbol), updatedAt: ts};
             next.fundingRate = Number(item.lastFundingRate || 0) * 100;
             const markPrice = Number(item.markPrice || 0);
@@ -766,7 +771,8 @@ HTML = r"""
           }
         }
         const ranked = rows().slice(0, 14).map(row => row.symbol);
-        const targets = Array.from(new Set([...ranked, "BTCUSDT", "ETHUSDT", "SOLUSDT"].filter(symbol => WATCH_SYMBOLS.includes(symbol))));
+        const symbolSet = activeSymbolSet();
+        const targets = Array.from(new Set([...ranked, "BTCUSDT", "ETHUSDT", "SOLUSDT"].filter(symbol => symbolSet.has(symbol))));
         for (let i = 0; i < targets.length; i += 4) {
           await Promise.all(targets.slice(i, i + 4).map(fetchDerivativeSymbol));
         }
@@ -851,7 +857,7 @@ HTML = r"""
       return {symbol, base: base(symbol), price: state.prices.get(symbol) || 0, p5, f60, f5, l5, d, signal, score, reasons};
     }
     function rows() {
-      return WATCH_SYMBOLS.map(scoreRow).sort((a, b) => {
+      return activeSymbols().map(scoreRow).sort((a, b) => {
         return b.score - a.score || Math.abs(b.f60.net) - Math.abs(a.f60.net) || Math.abs(b.f5.net) - Math.abs(a.f5.net);
       });
     }
@@ -867,11 +873,11 @@ HTML = r"""
       });
     }
     function renderStats(allRows) {
-      const strongLong = allRows.filter(row => row.signal === "LONG" && row.score >= 60).length;
-      const strongShort = allRows.filter(row => row.signal === "SHORT" && row.score >= 60).length;
+      const strongLong = allRows.filter(isFollowLong).length;
+      const strongShort = allRows.filter(isFollowShort).length;
       const totalFlow = allRows.reduce((sum, row) => sum + row.f60.total, 0);
       const totalLiq = allRows.reduce((sum, row) => sum + row.l5.total, 0);
-      document.getElementById("statSymbols").textContent = WATCH_SYMBOLS.length;
+      document.getElementById("statSymbols").textContent = activeSymbols().length;
       document.getElementById("statLong").textContent = strongLong;
       document.getElementById("statShort").textContent = strongShort;
       document.getElementById("statFlow").textContent = money(totalFlow);
@@ -889,9 +895,6 @@ HTML = r"""
       const all = rows();
       const visible = filteredRows();
       renderStats(all);
-      maybeRecordSignals(all);
-      updateSignalOutcomes();
-      renderSignalReview();
       const body = document.getElementById("radarBody");
       if (!visible.length) {
         body.innerHTML = '<tr><td colspan="12">当前筛选条件下暂无信号。</td></tr>';
@@ -934,99 +937,6 @@ HTML = r"""
         </div>`;
       }).join("");
     }
-    function loadSignalLog() {
-      try {
-        const raw = localStorage.getItem("flowRadarSignalLogV1");
-        state.signalLog = raw ? JSON.parse(raw) : [];
-      } catch (_) {
-        state.signalLog = [];
-      }
-    }
-    function saveSignalLog() {
-      try {
-        localStorage.setItem("flowRadarSignalLogV1", JSON.stringify(state.signalLog.slice(0, 120)));
-      } catch (_) {}
-    }
-    function signalDirection(signal) {
-      return signal === "LONG" ? 1 : signal === "SHORT" ? -1 : 0;
-    }
-    function maybeRecordSignals(allRows) {
-      const ts = Date.now();
-      let changed = false;
-      for (const row of allRows) {
-        if (row.score < 60 || !row.price || !["LONG", "SHORT"].includes(row.signal)) continue;
-        const key = `${row.symbol}|${row.signal}`;
-        const last = state.signalCooldown.get(key) || 0;
-        if (ts - last < 3 * 60 * 1000) continue;
-        state.signalCooldown.set(key, ts);
-        state.signalLog.unshift({
-          id: `${ts}-${row.symbol}-${row.signal}`,
-          ts,
-          symbol: row.symbol,
-          base: row.base,
-          signal: row.signal,
-          score: row.score,
-          entryPrice: row.price,
-          reasons: row.reasons,
-          checks: {m1: null, m3: null, m5: null, m15: null},
-        });
-        changed = true;
-      }
-      if (state.signalLog.length > 120) {
-        state.signalLog = state.signalLog.slice(0, 120);
-        changed = true;
-      }
-      if (changed) saveSignalLog();
-    }
-    function updateSignalOutcomes() {
-      let changed = false;
-      const ts = Date.now();
-      for (const item of state.signalLog) {
-        const current = state.prices.get(item.symbol);
-        if (!current || !item.entryPrice) continue;
-        for (const horizon of SIGNAL_HORIZONS) {
-          if (item.checks[horizon.key] !== null) continue;
-          if (ts - item.ts < horizon.ms) continue;
-          const rawPct = (current - item.entryPrice) / item.entryPrice * 100;
-          const resultPct = rawPct * signalDirection(item.signal);
-          item.checks[horizon.key] = Number(resultPct.toFixed(3));
-          changed = true;
-        }
-      }
-      if (changed) saveSignalLog();
-    }
-    function renderSignalReview() {
-      const body = document.getElementById("signalBody");
-      const stats = document.getElementById("signalStats");
-      if (!state.signalLog.length) {
-        body.innerHTML = '<tr><td colspan="9">暂无强信号记录。</td></tr>';
-        stats.textContent = "等待强信号";
-        return;
-      }
-      const completed5m = state.signalLog.filter(item => item.checks.m5 !== null);
-      const wins5m = completed5m.filter(item => item.checks.m5 > 0).length;
-      const avg5m = completed5m.length
-        ? completed5m.reduce((sum, item) => sum + item.checks.m5, 0) / completed5m.length
-        : 0;
-      stats.textContent = completed5m.length
-        ? `5m样本 ${completed5m.length} · 胜率 ${(wins5m / completed5m.length * 100).toFixed(0)}% · 平均 ${plainSignedPct(avg5m)}`
-        : `已记录 ${state.signalLog.length} 个信号，等待复盘`;
-      body.innerHTML = state.signalLog.slice(0, 18).map(item => {
-        const signalText = item.signal === "LONG" ? "做多" : "做空";
-        const cls = item.signal === "LONG" ? "up" : "down";
-        return `<tr>
-          <td class="small">${new Date(item.ts).toLocaleTimeString()}</td>
-          <td><div class="symbol">${item.base}</div><div class="small">${item.symbol}</div></td>
-          <td class="${cls}">${signalText}</td>
-          <td><span class="score">${item.score}</span></td>
-          <td class="num">${price(item.entryPrice)}</td>
-          <td class="num">${resultCell(item.checks.m1)}</td>
-          <td class="num">${resultCell(item.checks.m3)}</td>
-          <td class="num">${resultCell(item.checks.m5)}</td>
-          <td class="num">${resultCell(item.checks.m15)}</td>
-        </tr>`;
-      }).join("");
-    }
     function compactRowsForAi() {
       return rows().slice(0, 15).map(row => ({
         symbol: row.symbol,
@@ -1045,20 +955,6 @@ HTML = r"""
         taker_ratio: row.d.takerRatio,
         funding_rate_pct: row.d.fundingRate,
         reasons: row.reasons,
-      }));
-    }
-    function compactSignalsForAi() {
-      return state.signalLog.slice(0, 20).map(item => ({
-        symbol: item.symbol,
-        base: item.base,
-        signal: item.signal,
-        score: item.score,
-        entry_price: item.entryPrice,
-        time: new Date(item.ts).toLocaleTimeString(),
-        result_1m_pct: item.checks.m1,
-        result_3m_pct: item.checks.m3,
-        result_5m_pct: item.checks.m5,
-        result_15m_pct: item.checks.m15,
       }));
     }
     function compactEventsForAi() {
@@ -1080,12 +976,12 @@ HTML = r"""
       const allRows = rows();
       const payload = {
         summary: {
-          watch_symbols: WATCH_SYMBOLS.length,
+          scanned_symbols: activeSymbols().length,
           price_messages: state.priceMessages,
           trade_messages: state.tradeMessages,
           liquidation_messages: state.liqMessages,
-          strong_long: allRows.filter(row => row.signal === "LONG" && row.score >= 60).length,
-          strong_short: allRows.filter(row => row.signal === "SHORT" && row.score >= 60).length,
+          follow_long_candidates: allRows.filter(isFollowLong).length,
+          follow_short_candidates: allRows.filter(isFollowShort).length,
           large_trade_threshold_usd: LARGE_TRADE_USD,
           derivatives_updated_at: state.derivativesUpdatedAt ? new Date(state.derivativesUpdatedAt).toLocaleTimeString() : null,
           derivatives_error: state.derivativesError,
@@ -1093,7 +989,6 @@ HTML = r"""
         },
         rows: compactRowsForAi(),
         events: compactEventsForAi(),
-        signals: compactSignalsForAi(),
       };
       try {
         const res = await fetch("/api/ai/analyze", {
