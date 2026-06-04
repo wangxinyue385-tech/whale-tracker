@@ -84,12 +84,15 @@ TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "10"))
 TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "300"))
 PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "100"))
 EXIT_MIN_HOLD_SECONDS = int(os.environ.get("EXIT_MIN_HOLD_SECONDS", "15"))
-EXIT_TAKE_PROFIT_PCT = float(os.environ.get("EXIT_TAKE_PROFIT_PCT", "1.2"))
-EXIT_PROFIT_ARM_PCT = float(os.environ.get("EXIT_PROFIT_ARM_PCT", "1.0"))
-EXIT_TRAIL_KEEP_RATIO = float(os.environ.get("EXIT_TRAIL_KEEP_RATIO", "0.55"))
-EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-1.5"))
-EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "75"))
-EXIT_STALL_MIN_PEAK_PCT = float(os.environ.get("EXIT_STALL_MIN_PEAK_PCT", "0.4"))
+EXIT_TAKE_PROFIT_PCT = float(os.environ.get("EXIT_TAKE_PROFIT_PCT", "0.85"))
+EXIT_PROFIT_ARM_PCT = float(os.environ.get("EXIT_PROFIT_ARM_PCT", "0.35"))
+EXIT_TRAIL_KEEP_RATIO = float(os.environ.get("EXIT_TRAIL_KEEP_RATIO", "0.45"))
+EXIT_BREAKEVEN_ARM_PCT = float(os.environ.get("EXIT_BREAKEVEN_ARM_PCT", "0.25"))
+EXIT_BREAKEVEN_FLOOR_PCT = float(os.environ.get("EXIT_BREAKEVEN_FLOOR_PCT", "-0.05"))
+EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-0.85"))
+EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "90"))
+EXIT_STALL_MIN_PEAK_PCT = float(os.environ.get("EXIT_STALL_MIN_PEAK_PCT", "0.25"))
+EXIT_MAX_HOLD_SECONDS = int(os.environ.get("EXIT_MAX_HOLD_SECONDS", "180"))
 EXIT_REVERSE_SCORE = float(os.environ.get("EXIT_REVERSE_SCORE", "70"))
 EXIT_HOLD_MIN_SCORE = float(os.environ.get("EXIT_HOLD_MIN_SCORE", "65"))
 EXIT_INVALID_SNAPSHOTS = int(os.environ.get("EXIT_INVALID_SNAPSHOTS", "3"))
@@ -509,11 +512,17 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     if peak_pct >= EXIT_PROFIT_ARM_PCT and pnl_pct <= max(0.0, peak_pct * EXIT_TRAIL_KEEP_RATIO):
         return f"移动止盈平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
+    if peak_pct >= EXIT_BREAKEVEN_ARM_PCT and pnl_pct <= EXIT_BREAKEVEN_FLOOR_PCT:
+        return f"浮盈回吐保护平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
+
     if snap_fresh and invalid_count >= EXIT_INVALID_SNAPSHOTS:
         return f"当前策略连续 {invalid_count} 次不支持持仓，平仓"
 
     if age_ms >= EXIT_STALL_SECONDS * 1000 and peak_pct < EXIT_STALL_MIN_PEAK_PCT:
         return f"走势未延续平仓，最高浮盈 {peak_pct:.2f}%"
+
+    if age_ms >= EXIT_MAX_HOLD_SECONDS * 1000:
+        return f"短线到时平仓，持仓 {int(age_ms / 1000)} 秒"
 
     close_ms = float(_testnet_config["auto_close_minutes"]) * 60 * 1000
     if not snap_fresh and age_ms >= close_ms:
@@ -1016,10 +1025,9 @@ HTML = r"""
     const STABLE_SYMBOLS = new Set(["USDCUSDT","BUSDUSDT","FDUSDUSDT","TUSDUSDT","USDPUSDT","DAIUSDT"]);
     const MAJORS = new Set(["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]);
     const ALPHA = {
-      minScore:82, minProb:62, minEdgePct:0.25,
-      minFlow5x:2.2, minTotal5x:4.0, minLargestX:1.15,
+      minScore:78, minProb:58, minEdgePct:0,
+      minTotal5x:4.0,
       majorMaxP1:0.45, altMaxP1:0.75, majorMaxP5:1.20, altMaxP5:2.00,
-      minFlowImbalance60:0.28, minFlowImbalance5:0.12,
     };
 
     const state = {
@@ -1238,49 +1246,29 @@ HTML = r"""
       const cost=costModel(d,forecast.side);
       forecast.netEdgePct=Math.abs(forecast.expected5Pct)-cost.requiredPct;
       forecast.cost=cost;
-      const isMajor=MAJORS.has(symbol);
-      const maxP1=isMajor?ALPHA.majorMaxP1:ALPHA.altMaxP1;
-      const maxP5=isMajor?ALPHA.majorMaxP5:ALPHA.altMaxP5;
       const repeatLong=f60.buyCount>=2||f60.lastSide==="BUY"&&f60.streak>=2, repeatShort=f60.sellCount>=2||f60.lastSide==="SELL"&&f60.streak>=2;
-      const volumeOk=isNum(cm.volSpike)?cm.volSpike>=1.35:f5.total>=threshold*ALPHA.minTotal5x;
-      const marketOkLong=isMajor||mb.bias>=0||(mb.btc>-0.08&&mb.eth>-0.10), marketOkShort=isMajor||mb.bias<=0||(mb.btc<0.08&&mb.eth<0.10);
+      const volumeOk=isNum(cm.volSpike)?cm.volSpike>=1.2:f5.total>=threshold*ALPHA.minTotal5x;
+      const marketOkLong=MAJORS.has(symbol)||mb.bias>=-1, marketOkShort=MAJORS.has(symbol)||mb.bias<=1;
       const oiFallingHard=isNum(d.oi15Pct)&&d.oi15Pct<-2.5;
-      const flowSizeOk=Math.abs(f5.net)>=threshold*ALPHA.minFlow5x&&f5.total>=threshold*ALPHA.minTotal5x&&f60.largest>=threshold*ALPHA.minLargestX;
-      const flowLong=f60.net>0&&f5.net>0&&f60.imbalance>=ALPHA.minFlowImbalance60&&f5.imbalance>=ALPHA.minFlowImbalance5&&flowSizeOk;
-      const flowShort=f60.net<0&&f5.net<0&&f60.imbalance<=-ALPHA.minFlowImbalance60&&f5.imbalance<=-ALPHA.minFlowImbalance5&&flowSizeOk;
-      const lateLong=p1>maxP1||p5>maxP5, lateShort=p1<-maxP1||p5<-maxP5;
-      const priceLong=p1>=-0.03&&p3>=0.03&&p5>=0.06&&!lateLong;
-      const priceShort=p1<=0.03&&p3<=-0.03&&p5<=-0.06&&!lateShort;
-      const candleRejectLong=(isNum(cm.closeLocation)&&cm.closeLocation<0.40)||(isNum(cm.upperWickPct)&&cm.upperWickPct>Math.max(0.45,Math.abs(cm.bodyPct)*1.8));
-      const candleRejectShort=(isNum(cm.closeLocation)&&cm.closeLocation>0.60)||(isNum(cm.lowerWickPct)&&cm.lowerWickPct>Math.max(0.45,Math.abs(cm.bodyPct)*1.8));
-      const candleOkLong=!candleRejectLong&&(!isNum(cm.closeLocation)||cm.closeLocation>=0.50);
-      const candleOkShort=!candleRejectShort&&(!isNum(cm.closeLocation)||cm.closeLocation<=0.50);
-      const derivativeLong=((isNum(d.oi15Pct)&&d.oi15Pct>=0.6)||(isNum(d.takerRatio)&&d.takerRatio>=1.06)||(!isNum(d.oi15Pct)&&!isNum(d.takerRatio)))&&(!isNum(d.takerRatio)||d.takerRatio>=0.98);
-      const derivativeShort=((isNum(d.oi15Pct)&&d.oi15Pct>=0.6)||(isNum(d.takerRatio)&&d.takerRatio<=0.94)||(!isNum(d.oi15Pct)&&!isNum(d.takerRatio)))&&(!isNum(d.takerRatio)||d.takerRatio<=1.04);
-      const liqOkLong=l5.longLiq<=Math.max(threshold*2,l5.shortLiq*1.4), liqOkShort=l5.shortLiq<=Math.max(threshold*2,l5.longLiq*1.4);
-      const profitOk=forecast.side!=="NEUTRAL"&&forecast.netEdgePct>=ALPHA.minEdgePct;
+      const flowLong=f60.net>0&&f5.net>0, flowShort=f60.net<0&&f5.net<0;
+      const priceLong=p1>=-0.04&&p3>=0.04&&p5>=0.08, priceShort=p1<=0.04&&p3<=-0.04&&p5<=-0.08;
+      const profitOk=forecast.side!=="NEUTRAL"&&forecast.netEdgePct>ALPHA.minEdgePct;
       const forecastLong=forecast.side==="LONG"&&forecast.prob5>=ALPHA.minProb&&forecast.expected5Pct>0;
       const forecastShort=forecast.side==="SHORT"&&forecast.prob5>=ALPHA.minProb&&forecast.expected5Pct<0;
-      const alignedLong=signal==="LONG"&&score>=ALPHA.minScore&&forecastLong&&profitOk&&flowLong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&!oiFallingHard&&derivativeLong&&candleOkLong&&liqOkLong;
-      const alignedShort=signal==="SHORT"&&score>=ALPHA.minScore&&forecastShort&&profitOk&&flowShort&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&!oiFallingHard&&derivativeShort&&candleOkShort&&liqOkShort;
+      const alignedLong=signal==="LONG"&&score>=ALPHA.minScore&&forecastLong&&profitOk&&flowLong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&!oiFallingHard&&f60.largest>=threshold;
+      const alignedShort=signal==="SHORT"&&score>=ALPHA.minScore&&forecastShort&&profitOk&&flowShort&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&!oiFallingHard&&f60.largest>=threshold;
       const risks=[];
       if(signal!=="WATCH"&&!profitOk)risks.push("成本不过");
       if(cost.fundingPct>0)risks.push("资金费成本");
       if(signal==="LONG"&&!priceLong)risks.push("价格未确认"); if(signal==="SHORT"&&!priceShort)risks.push("价格未确认");
-      if(signal==="LONG"&&lateLong)risks.push("追涨过热"); if(signal==="SHORT"&&lateShort)risks.push("追空过热");
       if(signal==="LONG"&&!flowLong)risks.push("净流不连续"); if(signal==="SHORT"&&!flowShort)risks.push("净流不连续");
       if(signal==="LONG"&&!repeatLong)risks.push("孤立大单"); if(signal==="SHORT"&&!repeatShort)risks.push("孤立大单");
-      if(signal!=="WATCH"&&!flowSizeOk)risks.push("资金强度不足");
       if(!volumeOk)risks.push("量能不足");
       if(signal==="LONG"&&!marketOkLong)risks.push("大盘反向"); if(signal==="SHORT"&&!marketOkShort)risks.push("大盘反向");
       if(oiFallingHard)risks.push("OI下降");
-      if(signal==="LONG"&&!derivativeLong)risks.push("衍生品未确认"); if(signal==="SHORT"&&!derivativeShort)risks.push("衍生品未确认");
-      if(signal==="LONG"&&!candleOkLong)risks.push("K线收弱"); if(signal==="SHORT"&&!candleOkShort)risks.push("K线收强");
-      if(signal==="LONG"&&!liqOkLong)risks.push("爆仓反向"); if(signal==="SHORT"&&!liqOkShort)risks.push("爆仓反向");
       const reasons=[];
       if(alignedLong||alignedShort)reasons.push("Alpha过滤通过");
       if(Math.abs(f60.net)>=threshold)reasons.push((f60.net>0?"主动买净流 ":"主动卖净流 ")+money(Math.abs(f60.net)));
-      if(flowSizeOk)reasons.push("5m资金强度 "+(Math.abs(f5.net)/Math.max(threshold,1)).toFixed(1)+"x");
       if(f60.largest>=threshold)reasons.push("最大单 "+money(f60.largest));
       if(isNum(cm.volSpike))reasons.push("量能 "+cm.volSpike.toFixed(1)+"x");
       if(Math.abs(p5)>=0.25)reasons.push("5m价格 "+(p5>0?"+":"")+p5.toFixed(2)+"%");
