@@ -83,13 +83,17 @@ TESTNET_LEVERAGE = int(os.environ.get("TESTNET_LEVERAGE", "4"))
 TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "10"))
 TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "300"))
 PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "100"))
-EXIT_MIN_HOLD_SECONDS = int(os.environ.get("EXIT_MIN_HOLD_SECONDS", "15"))
-EXIT_PROFIT_ARM_PCT = float(os.environ.get("EXIT_PROFIT_ARM_PCT", "2.0"))
-EXIT_TRAIL_KEEP_RATIO = float(os.environ.get("EXIT_TRAIL_KEEP_RATIO", "0.50"))
-EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-4.0"))
-EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "75"))
-EXIT_STALL_MIN_PEAK_PCT = float(os.environ.get("EXIT_STALL_MIN_PEAK_PCT", "1.0"))
+EXIT_MIN_HOLD_SECONDS = int(os.environ.get("EXIT_MIN_HOLD_SECONDS", "5"))
+EXIT_TAKE_PROFIT_PCT = float(os.environ.get("EXIT_TAKE_PROFIT_PCT", "1.0"))
+EXIT_PROFIT_ARM_PCT = float(os.environ.get("EXIT_PROFIT_ARM_PCT", "1.0"))
+EXIT_TRAIL_KEEP_RATIO = float(os.environ.get("EXIT_TRAIL_KEEP_RATIO", "0.45"))
+EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-1.2"))
+EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "45"))
+EXIT_STALL_MIN_PEAK_PCT = float(os.environ.get("EXIT_STALL_MIN_PEAK_PCT", "0.8"))
+EXIT_SMALL_PROFIT_PEAK_PCT = float(os.environ.get("EXIT_SMALL_PROFIT_PEAK_PCT", "0.6"))
+EXIT_SMALL_PROFIT_FLOOR_PCT = float(os.environ.get("EXIT_SMALL_PROFIT_FLOOR_PCT", "0.1"))
 EXIT_REVERSE_SCORE = float(os.environ.get("EXIT_REVERSE_SCORE", "70"))
+EXIT_HOLD_MIN_SCORE = float(os.environ.get("EXIT_HOLD_MIN_SCORE", "65"))
 
 _trade_lock = threading.Lock()
 _testnet_config = {
@@ -262,6 +266,10 @@ def _order_notional_usdt() -> float:
     return _order_margin_usdt() * max(1, int(_testnet_config["leverage"]))
 
 
+def _paper_one_way_cost(notional: float) -> float:
+    return max(0.0, float(notional)) * (TAKER_FEE_BPS + SLIPPAGE_BPS) / 10000
+
+
 def _paper_mark_price(symbol: str, fallback: float = 0) -> float:
     return float(_last_prices.get(symbol) or fallback or 0)
 
@@ -273,16 +281,23 @@ def _paper_account_snapshot() -> dict:
         amount = float(pos.get("amount") or 0)
         entry = float(pos.get("entry_price") or 0)
         mark = _paper_mark_price(symbol, entry)
-        pnl = (mark - entry) * amount
-        unrealized += pnl
+        notional = float(pos.get("notional") or abs(amount) * entry)
+        margin = float(pos.get("margin") or _order_margin_usdt())
+        gross_pnl = (mark - entry) * amount
+        exit_cost = _paper_one_way_cost(abs(amount) * mark)
+        net_pnl = gross_pnl - exit_cost
+        unrealized += net_pnl
         positions.append({
             "symbol": symbol,
             "amount": amount,
             "entry_price": entry,
             "mark_price": mark,
-            "margin": float(pos.get("margin") or _order_margin_usdt()),
-            "notional": float(pos.get("notional") or abs(amount) * entry),
-            "unrealized": pnl,
+            "margin": margin,
+            "notional": notional,
+            "entry_cost": float(pos.get("entry_cost") or 0),
+            "exit_cost": exit_cost,
+            "gross_unrealized": gross_pnl,
+            "unrealized": net_pnl,
         })
     equity = _paper_cash + unrealized
     point = {"ts": int(time.time() * 1000), "wallet": _paper_cash, "unrealized": unrealized, "equity": equity}
@@ -292,6 +307,7 @@ def _paper_account_snapshot() -> dict:
 
 
 def _paper_place_market_order(symbol: str, follow: str, price: float) -> dict:
+    global _paper_cash
     if price <= 0:
         price = _paper_mark_price(symbol)
     if price <= 0:
@@ -301,17 +317,20 @@ def _paper_place_market_order(symbol: str, follow: str, price: float) -> dict:
     qty = notional / price
     amount = qty if follow == "FOLLOW_LONG" else -qty
     order_id = uuid.uuid4().hex[:12]
+    entry_cost = _paper_one_way_cost(notional)
+    _paper_cash -= entry_cost
     _paper_positions[symbol] = {
         "symbol": symbol,
         "amount": amount,
         "entry_price": price,
         "margin": margin,
         "notional": notional,
+        "entry_cost": entry_cost,
         "opened_at": int(time.time() * 1000),
         "order_id": order_id,
         "follow": follow,
     }
-    return {"orderId": order_id, "symbol": symbol, "status": "FILLED", "avgPrice": price, "executedQty": qty, "paper": True}
+    return {"orderId": order_id, "symbol": symbol, "status": "FILLED", "avgPrice": price, "executedQty": qty, "entryCost": entry_cost, "paper": True}
 
 
 def _paper_close_position(symbol: str, amount: float) -> dict:
@@ -321,10 +340,22 @@ def _paper_close_position(symbol: str, amount: float) -> dict:
         raise RuntimeError(f"{symbol} 没有本地模拟持仓")
     entry = float(pos.get("entry_price") or 0)
     mark = _paper_mark_price(symbol, entry)
-    pnl = (mark - entry) * float(pos.get("amount") or amount)
-    _paper_cash += pnl
+    gross_pnl = (mark - entry) * float(pos.get("amount") or amount)
+    exit_cost = _paper_one_way_cost(abs(float(pos.get("amount") or amount)) * mark)
+    entry_cost = float(pos.get("entry_cost") or 0)
+    net_pnl = gross_pnl - entry_cost - exit_cost
+    _paper_cash += gross_pnl - exit_cost
     _paper_positions.pop(symbol, None)
-    return {"orderId": uuid.uuid4().hex[:12], "symbol": symbol, "realizedPnl": pnl, "avgPrice": mark, "paper": True}
+    return {
+        "orderId": uuid.uuid4().hex[:12],
+        "symbol": symbol,
+        "realizedPnl": net_pnl,
+        "grossPnl": gross_pnl,
+        "entryCost": entry_cost,
+        "exitCost": exit_cost,
+        "avgPrice": mark,
+        "paper": True,
+    }
 
 
 def _set_leverage(symbol: str) -> None:
@@ -370,6 +401,7 @@ def _position_margin(symbol: str, pos: dict, meta: dict) -> float:
 
 def _position_pnl_pct(symbol: str, pos: dict, meta: dict) -> tuple[float, float]:
     pnl = _safe_float(pos.get("unrealized"))
+    pnl -= _safe_float(pos.get("entry_cost"))
     margin = _position_margin(symbol, pos, meta)
     return pnl, pnl / margin * 100
 
@@ -394,14 +426,32 @@ def _is_reverse_snapshot(side: str, snap: dict) -> bool:
     return follow == "FOLLOW_LONG" or (signal == "LONG" and score >= EXIT_REVERSE_SCORE) or (net_5m > 0 and score >= EXIT_REVERSE_SCORE)
 
 
-def _same_direction_still_valid(side: str, snap: dict) -> bool:
+def _snapshot_direction(snap: dict) -> str:
     follow = snap.get("follow")
     signal = snap.get("signal")
+    if follow in {"FOLLOW_LONG", "WATCH_LONG"} or signal == "LONG":
+        return "LONG"
+    if follow in {"FOLLOW_SHORT", "WATCH_SHORT"} or signal == "SHORT":
+        return "SHORT"
+    return "NEUTRAL"
+
+
+def _same_direction_still_valid(side: str, snap: dict) -> bool:
+    direction = _snapshot_direction(snap)
+    if direction != side:
+        return False
+    follow = snap.get("follow")
+    score = _safe_float(snap.get("score"))
     net_5m = _safe_float(snap.get("net_5m_usd"))
     risks = set(snap.get("risks") or [])
+    if follow == ("FOLLOW_LONG" if side == "LONG" else "FOLLOW_SHORT"):
+        return True
+    if score < EXIT_HOLD_MIN_SCORE:
+        return False
+    fatal = {"价格未确认", "净流不连续", "大盘反向", "爆仓反向", "OI下降"}
     if side == "LONG":
-        return follow == "FOLLOW_LONG" or (signal == "LONG" and net_5m > 0 and "净流不连续" not in risks)
-    return follow == "FOLLOW_SHORT" or (signal == "SHORT" and net_5m < 0 and "净流不连续" not in risks)
+        return net_5m >= 0 and not (fatal | {"K线收弱"}).intersection(risks)
+    return net_5m <= 0 and not (fatal | {"K线收强"}).intersection(risks)
 
 
 def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
@@ -419,26 +469,31 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     if pnl_pct <= EXIT_HARD_STOP_PCT:
         return f"止损平仓 {pnl_pct:.2f}%"
 
+    if pnl_pct >= EXIT_TAKE_PROFIT_PCT:
+        return f"净止盈平仓 {pnl_pct:.2f}%"
+
+    snap = _market_snapshots.get(symbol) or {}
+    side = _position_side(pos, meta)
+    snap_fresh = bool(snap and now_ms - int(snap.get("ts") or 0) <= 15 * 1000)
+
+    if snap_fresh and _is_reverse_snapshot(side, snap):
+        return "反向资金/信号平仓"
+
     if age_ms < EXIT_MIN_HOLD_SECONDS * 1000:
         return None
 
     if peak_pct >= EXIT_PROFIT_ARM_PCT and pnl_pct <= max(0.0, peak_pct * EXIT_TRAIL_KEEP_RATIO):
         return f"移动止盈平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
-    snap = _market_snapshots.get(symbol) or {}
-    side = _position_side(pos, meta)
-    if snap and _is_reverse_snapshot(side, snap):
-        return "反向资金/信号平仓"
+    if snap_fresh and not _same_direction_still_valid(side, snap):
+        return "当前策略不再支持持仓，平仓"
 
     if age_ms >= EXIT_STALL_SECONDS * 1000 and peak_pct < EXIT_STALL_MIN_PEAK_PCT:
         return f"走势未延续平仓，最高浮盈 {peak_pct:.2f}%"
 
-    if age_ms >= EXIT_STALL_SECONDS * 1000 and snap and not _same_direction_still_valid(side, snap) and pnl_pct <= 0:
-        return "信号走弱且未盈利平仓"
-
     close_ms = float(_testnet_config["auto_close_minutes"]) * 60 * 1000
-    if age_ms >= close_ms:
-        return "到时自动平仓"
+    if not snap_fresh and age_ms >= close_ms:
+        return "缺少新策略快照，到时自动平仓"
 
     return None
 
@@ -516,6 +571,7 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                     "entry_price": price,
                     "margin": _order_margin_usdt(),
                     "notional": _order_notional_usdt(),
+                    "entry_cost": _safe_float(order.get("entryCost")) if isinstance(order, dict) else 0.0,
                     "peak_pnl": 0.0,
                     "peak_pnl_pct": 0.0,
                     "last_favorable_pct": 0.0,
