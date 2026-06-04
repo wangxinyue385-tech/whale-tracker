@@ -29,6 +29,10 @@ MAX_STREAM_SYMBOLS = int(os.environ.get("MAX_STREAM_SYMBOLS", "180"))
 TRADE_STREAM_CHUNK_SIZE = int(os.environ.get("TRADE_STREAM_CHUNK_SIZE", "60"))
 LARGE_TRADE_USD = float(os.environ.get("LARGE_TRADE_USD", "50000"))
 MIN_DYNAMIC_TRADE_USD = float(os.environ.get("MIN_DYNAMIC_TRADE_USD", "10000"))
+TAKER_FEE_BPS = float(os.environ.get("TAKER_FEE_BPS", "5"))
+SLIPPAGE_BPS = float(os.environ.get("SLIPPAGE_BPS", "3"))
+SAFETY_EDGE_BPS = float(os.environ.get("SAFETY_EDGE_BPS", "8"))
+HOLD_MINUTES = float(os.environ.get("HOLD_MINUTES", "15"))
 
 BINANCE_WS = os.environ.get("BINANCE_WS", "wss://fstream.binance.com/market").rstrip("/")
 if BINANCE_WS in {"wss://fstream.binance.com", "wss://fstream.binancefuture.com"}:
@@ -76,6 +80,7 @@ def rule_analysis(payload: dict) -> str:
     if follow:
         names = "、".join(f"{row.get('base')}({row.get('label')}/{row.get('score')})" for row in follow[:5])
         lines.append(f"- 可重点盯盘候选：{names}。")
+        lines.append("- 这些候选已通过成本门槛：预测空间需要大于往返手续费、滑点、资金费风险和安全垫。")
         lines.append("- 这不是立刻追单，必须等事件流继续同向、价格不反抽/不反砸。")
     elif watch:
         names = "、".join(f"{row.get('base')}({row.get('label')}/{row.get('score')})" for row in watch[:5])
@@ -105,6 +110,7 @@ def rule_analysis(payload: dict) -> str:
     lines.append("- 价格 5m 方向和资金方向一致。")
     lines.append("- 同币种事件流连续出现，不是孤立一笔。")
     lines.append("- BTC/ETH 没有明显反向压制。")
+    lines.append("- 预测净边际为正：未来 5m 预期空间 > 成本线。")
     lines.append("")
     lines.append("放弃条件：")
     lines.append("- 分数高但价格不动，容易是对倒或诱单。")
@@ -126,7 +132,7 @@ def call_ai(payload: dict, fallback: str) -> tuple[str, str]:
             "role": "system",
             "content": (
                 "你是加密货币合约资金流分析助手。只分析公开行情快照，"
-                "输出：哪里有大资金、是否适合跟单、跟单前确认、放弃条件。"
+                "输出：哪里有大资金、预测方向和概率、成本线是否通过、是否适合跟单、跟单前确认、放弃条件。"
                 "不要承诺收益，不要直接喊无脑买卖。"
             ),
         },
@@ -246,7 +252,7 @@ HTML = r"""
       <div class="stat"><div class="label">扫描交易对</div><div class="value" id="statSymbols">--</div><div class="sub" id="scopeSub">自动扩展范围</div></div>
       <div class="stat"><div class="label">策略多头候选</div><div class="value up" id="statLong">--</div><div class="sub">多因子确认</div></div>
       <div class="stat"><div class="label">策略空头候选</div><div class="value down" id="statShort">--</div><div class="sub">多因子确认</div></div>
-      <div class="stat"><div class="label">60 秒大单流</div><div class="value" id="statFlow">--</div><div class="sub">动态阈值累计</div></div>
+      <div class="stat"><div class="label">成本门槛</div><div class="value" id="statCost">--</div><div class="sub">费率+滑点+安全垫</div></div>
       <div class="stat"><div class="label">5 分钟爆仓</div><div class="value" id="statLiq">--</div><div class="sub">强平订单流</div></div>
     </section>
     <section class="ai-panel">
@@ -272,11 +278,11 @@ HTML = r"""
           <table>
             <thead>
               <tr>
-                <th>交易对</th><th>判断</th><th>分数</th><th>价格</th><th>1m/5m</th><th>24h成交</th>
+                <th>交易对</th><th>判断</th><th>分数</th><th>5m预测</th><th>净边际</th><th>成本线</th><th>价格</th><th>1m/5m</th><th>24h成交</th>
                 <th>量能</th><th>60s净流</th><th>5m净流</th><th>连续</th><th>OI15m</th><th>Taker</th><th>风险</th><th>依据</th>
               </tr>
             </thead>
-            <tbody id="radarBody"><tr><td colspan="14">正在连接 Binance...</td></tr></tbody>
+            <tbody id="radarBody"><tr><td colspan="17">正在连接 Binance...</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -291,7 +297,7 @@ HTML = r"""
       </aside>
     </section>
     <div class="warn">
-      这个工具用于发现大资金流动和缩小观察范围，不构成投资建议。“策略信号”只是多因子盯盘候选，不代表可以无脑追单；必须结合止损、盘口和 BTC/ETH 大盘方向。
+      这个工具用于发现大资金流动和缩小观察范围，不构成投资建议。“策略信号”只有在预测空间大于手续费、滑点、资金费风险和安全垫时才会出现；它仍然只是盯盘候选，不代表可以无脑追单。
     </div>
   </main>
   <script>
@@ -300,6 +306,10 @@ HTML = r"""
     const TRADE_STREAM_CHUNK_SIZE = __TRADE_STREAM_CHUNK_SIZE__;
     const LARGE_TRADE_USD = __LARGE_TRADE_USD__;
     const MIN_DYNAMIC_TRADE_USD = __MIN_DYNAMIC_TRADE_USD__;
+    const TAKER_FEE_BPS = __TAKER_FEE_BPS__;
+    const SLIPPAGE_BPS = __SLIPPAGE_BPS__;
+    const SAFETY_EDGE_BPS = __SAFETY_EDGE_BPS__;
+    const HOLD_MINUTES = __HOLD_MINUTES__;
     const BINANCE_WS_BASES = __BINANCE_WS_BASES__;
     const BINANCE_REST_BASES = __BINANCE_REST_BASES__;
     const STABLE_SYMBOLS = new Set(["USDCUSDT","BUSDUSDT","FDUSDUSDT","TUSDUSDT","USDPUSDT","DAIUSDT"]);
@@ -336,6 +346,22 @@ HTML = r"""
     function isNum(value){ return typeof value==="number" && Number.isFinite(value); }
     function pctOrDash(value){ return isNum(value) ? signedPct(value) : '<span class="small">--</span>'; }
     function ratioOrDash(value){ return isNum(value) ? value.toFixed(2) : '<span class="small">--</span>'; }
+    function clamp(value,min,max){ return Math.max(min,Math.min(max,value)); }
+    function signedPlain(value,digits=2){ value=Number(value||0); return (value>0?"+":"")+value.toFixed(digits)+"%"; }
+    function baseCostPct(){ return (TAKER_FEE_BPS*2 + SLIPPAGE_BPS*2 + SAFETY_EDGE_BPS) / 100; }
+    function fundingCostPct(d, side){
+      if(!isNum(d.fundingRate)||side==="NEUTRAL")return 0;
+      const next=Number(d.nextFundingTime||0);
+      const crossesFunding=next>now() && next-now()<=HOLD_MINUTES*60*1000;
+      if(!crossesFunding)return 0;
+      if(side==="LONG")return Math.max(0,d.fundingRate);
+      if(side==="SHORT")return Math.max(0,-d.fundingRate);
+      return 0;
+    }
+    function costModel(d, side){
+      const feePct=TAKER_FEE_BPS*2/100, slippagePct=SLIPPAGE_BPS*2/100, safetyPct=SAFETY_EDGE_BPS/100, fundingPct=fundingCostPct(d,side);
+      return {feePct,slippagePct,safetyPct,fundingPct,requiredPct:feePct+slippagePct+safetyPct+fundingPct};
+    }
     function tradeThreshold(symbol){ const meta=state.marketMeta.get(symbol)||{}; const vol=Number(meta.quoteVolume||0); if(!vol)return LARGE_TRADE_USD; return Math.max(MIN_DYNAMIC_TRADE_USD, Math.min(LARGE_TRADE_USD, vol * 0.00008)); }
     function rememberPrice(symbol, value, ts){ state.prices.set(symbol, value); const rows=ensureList(state.priceHistory, symbol); rows.push({ts, value}); while(rows.length>600 || (rows.length && rows[0].ts<now()-6*60*1000)) rows.shift(); }
     function price5m(symbol){ const rows=state.priceHistory.get(symbol)||[]; if(rows.length<2)return 0; const recent=rows[rows.length-1].value; const old=(rows.find(row=>row.ts>=now()-5*60*1000)||rows[0]).value; return old ? (recent-old)/old*100 : 0; }
@@ -364,6 +390,22 @@ HTML = r"""
       if(btc>0.18)bias++; if(btc<-0.18)bias--;
       if(eth>0.22)bias++; if(eth<-0.22)bias--;
       return {bias, btc, eth};
+    }
+    function forecastModel(symbol,longScore,shortScore,p1,p3,p5,f60,f5,cm,d,mb){
+      const edge=longScore-shortScore;
+      let probUp=50 + edge*0.32 + p1*5 + p3*2 + p5*1.2 + f60.imbalance*5 + mb.bias*2;
+      if(isNum(cm.ret15))probUp += cm.ret15*0.35;
+      if(isNum(d.oi15Pct)&&d.oi15Pct<-2.5)probUp += p5>=0 ? -3 : 3;
+      probUp=clamp(probUp,8,92);
+      const side=probUp>=56?"LONG":probUp<=44?"SHORT":"NEUTRAL";
+      const prob5=side==="LONG"?probUp:(side==="SHORT"?100-probUp:Math.max(probUp,100-probUp));
+      const volBase=Math.max(0.08,isNum(cm.rangePct)?cm.rangePct:0.12,Math.abs(p5)*0.45,Math.abs(p1)*0.8);
+      const strength=clamp(Math.abs(edge)/85 + Math.abs(f60.imbalance)*0.25,0,1);
+      const flowBoost=Math.min(0.55,f5.total/Math.max(tradeThreshold(symbol),1)*0.025);
+      const expectedAbs=clamp(volBase*(0.72+strength)+flowBoost,0.03,4.5);
+      const expected5Pct=side==="LONG"?expectedAbs:(side==="SHORT"?-expectedAbs:0);
+      const expected15Pct=expected5Pct*(isNum(cm.ret15)&&Math.sign(cm.ret15)===Math.sign(expected5Pct)?1.45:1.15);
+      return {side,probUp,probDown:100-probUp,prob5,expected5Pct,expected15Pct};
     }
     async function fetchJson(path){ let last; for(const host of BINANCE_REST_BASES){ try{ const res=await fetch(host+path,{cache:"no-store"}); if(!res.ok)throw new Error(`${res.status} ${res.statusText}`); return await res.json(); }catch(err){ last=err; } } throw last || new Error("Binance REST unavailable"); }
 
@@ -403,7 +445,7 @@ HTML = r"""
             const prev=state.derivatives.get(item.symbol)||{};
             const mark=Number(item.markPrice||0);
             if(mark>0) rememberPrice(item.symbol,mark,ts);
-            state.derivatives.set(item.symbol,{...prev, fundingRate:Number(item.lastFundingRate||0)*100, updatedAt:ts});
+            state.derivatives.set(item.symbol,{...prev, fundingRate:Number(item.lastFundingRate||0)*100, nextFundingTime:Number(item.nextFundingTime||0), updatedAt:ts});
           }
         }
         const targets=[...new Set([...rows().slice(0,18).map(r=>r.symbol),"BTCUSDT","ETHUSDT","SOLUSDT"].filter(s=>activeSet().has(s)))];
@@ -445,7 +487,7 @@ HTML = r"""
 
     function flow(symbol, ms){ const rows=cutoff(state.trades.get(symbol)||[],ms); let buy=0,sell=0,largest=0,buyCount=0,sellCount=0,lastSide="",streak=0; for(const row of rows){ if(row.side==="BUY"){buy+=row.notional; buyCount++;} else {sell+=row.notional; sellCount++;} largest=Math.max(largest,row.notional); } for(let i=rows.length-1;i>=0;i--){ if(!lastSide)lastSide=rows[i].side; if(rows[i].side!==lastSide)break; streak++; } return {buy,sell,net:buy-sell,total:buy+sell,largest,buyCount,sellCount,count:rows.length,lastSide,streak,imbalance:buy+sell?(buy-sell)/(buy+sell):0}; }
     function liq(symbol, ms){ const rows=cutoff(state.liquidations.get(symbol)||[],ms); let longLiq=0,shortLiq=0; for(const row of rows){ if(row.side==="SELL")longLiq+=row.notional; else shortLiq+=row.notional; } return {longLiq,shortLiq,total:longLiq+shortLiq}; }
-    function derivative(symbol){ return {oi15Pct:null,oi5Pct:null,takerRatio:null,fundingRate:null,...(state.derivatives.get(symbol)||{})}; }
+    function derivative(symbol){ return {oi15Pct:null,oi5Pct:null,takerRatio:null,fundingRate:null,nextFundingTime:0,...(state.derivatives.get(symbol)||{})}; }
     function meta(symbol){ return state.marketMeta.get(symbol)||{}; }
 
     function scoreRow(symbol){
@@ -469,15 +511,24 @@ HTML = r"""
       if(!MAJORS.has(symbol)){ if(mb.bias<=-1)long-=8; if(mb.bias<=-2)long-=8; if(mb.bias>=1)short-=8; if(mb.bias>=2)short-=8; }
       long=Math.max(0,Math.min(100,long)); short=Math.max(0,Math.min(100,short));
       const signal=long>=short&&long>=35?"LONG":short>long&&short>=35?"SHORT":"WATCH"; const score=Math.round(Math.max(long,short));
+      const forecast=forecastModel(symbol,long,short,p1,p3,p5,f60,f5,cm,d,mb);
+      const cost=costModel(d,forecast.side);
+      forecast.netEdgePct=Math.abs(forecast.expected5Pct)-cost.requiredPct;
+      forecast.cost=cost;
       const repeatLong=f60.buyCount>=2||f60.lastSide==="BUY"&&f60.streak>=2, repeatShort=f60.sellCount>=2||f60.lastSide==="SELL"&&f60.streak>=2;
       const volumeOk=isNum(cm.volSpike)?cm.volSpike>=1.2:f5.total>=threshold*4;
       const marketOkLong=MAJORS.has(symbol)||mb.bias>=-1, marketOkShort=MAJORS.has(symbol)||mb.bias<=1;
       const oiFallingHard=isNum(d.oi15Pct)&&d.oi15Pct<-2.5;
       const flowLong=f60.net>0&&f5.net>0, flowShort=f60.net<0&&f5.net<0;
       const priceLong=p1>=-0.04&&p3>=0.04&&p5>=0.08, priceShort=p1<=0.04&&p3<=-0.04&&p5<=-0.08;
-      const alignedLong=signal==="LONG"&&score>=78&&flowLong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&!oiFallingHard&&f60.largest>=threshold;
-      const alignedShort=signal==="SHORT"&&score>=78&&flowShort&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&!oiFallingHard&&f60.largest>=threshold;
+      const profitOk=forecast.side!=="NEUTRAL"&&forecast.netEdgePct>0;
+      const forecastLong=forecast.side==="LONG"&&forecast.prob5>=58&&forecast.expected5Pct>0;
+      const forecastShort=forecast.side==="SHORT"&&forecast.prob5>=58&&forecast.expected5Pct<0;
+      const alignedLong=signal==="LONG"&&score>=78&&forecastLong&&profitOk&&flowLong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&!oiFallingHard&&f60.largest>=threshold;
+      const alignedShort=signal==="SHORT"&&score>=78&&forecastShort&&profitOk&&flowShort&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&!oiFallingHard&&f60.largest>=threshold;
       const risks=[];
+      if(signal!=="WATCH"&&!profitOk)risks.push("成本不过");
+      if(cost.fundingPct>0)risks.push("资金费成本");
       if(signal==="LONG"&&!priceLong)risks.push("价格未确认"); if(signal==="SHORT"&&!priceShort)risks.push("价格未确认");
       if(signal==="LONG"&&!flowLong)risks.push("净流不连续"); if(signal==="SHORT"&&!flowShort)risks.push("净流不连续");
       if(signal==="LONG"&&!repeatLong)risks.push("孤立大单"); if(signal==="SHORT"&&!repeatShort)risks.push("孤立大单");
@@ -494,7 +545,7 @@ HTML = r"""
       if(!reasons.length)reasons.push("等待大额资金流");
       const follow=alignedLong?"FOLLOW_LONG":alignedShort?"FOLLOW_SHORT":signal==="LONG"?"WATCH_LONG":signal==="SHORT"?"WATCH_SHORT":"WAIT";
       const label=follow==="FOLLOW_LONG"?"策略多":follow==="FOLLOW_SHORT"?"策略空":follow==="WATCH_LONG"?"多头异动":follow==="WATCH_SHORT"?"空头异动":"观察";
-      return {symbol,base:base(symbol),price:state.prices.get(symbol)||0,p1,p3,p5,f60,f5,l5,d,m:meta(symbol),cm,mb,threshold,signal,score,follow,label,risks,reasons};
+      return {symbol,base:base(symbol),price:state.prices.get(symbol)||0,p1,p3,p5,f60,f5,l5,d,m:meta(symbol),cm,mb,threshold,signal,score,follow,label,forecast,cost,risks,reasons};
     }
     function rows(){ return activeSymbols().map(scoreRow).sort((a,b)=>b.score-a.score||Math.abs(b.f60.net)-Math.abs(a.f60.net)||Number(b.m.quoteVolume||0)-Number(a.m.quoteVolume||0)); }
     function filteredRows(){ const q=document.getElementById("search").value.trim().toUpperCase(); return rows().filter(r=>{ if(q&&!r.symbol.includes(q)&&!r.base.includes(q))return false; if(state.activeFilter==="follow")return r.follow==="FOLLOW_LONG"||r.follow==="FOLLOW_SHORT"; if(state.activeFilter==="long")return r.signal==="LONG"; if(state.activeFilter==="short")return r.signal==="SHORT"; if(state.activeFilter==="alts")return !MAJORS.has(r.symbol); return true; }); }
@@ -502,12 +553,12 @@ HTML = r"""
     function setDot(id,ok,err){ const el=document.getElementById(id); el.classList.toggle("ok",ok); el.classList.toggle("bad",!!err); }
     function addEvent(ev){ state.events.unshift(ev); state.events=state.events.slice(0,220); }
 
-    function renderStats(all){ document.getElementById("statSymbols").textContent=activeSymbols().length; document.getElementById("statLong").textContent=all.filter(r=>r.follow==="FOLLOW_LONG").length; document.getElementById("statShort").textContent=all.filter(r=>r.follow==="FOLLOW_SHORT").length; document.getElementById("statFlow").textContent=money(all.reduce((s,r)=>s+r.f60.total,0)); document.getElementById("statLiq").textContent=money(all.reduce((s,r)=>s+r.l5.total,0)); setDot("priceDot",state.priceConnected,state.priceError); setDot("tradeDot",state.tradeConnected,state.tradeError); setDot("liqDot",state.liqConnected,state.liqError); const err=[state.priceError,state.tradeError,state.liqError,state.restError].filter(Boolean); document.getElementById("connText").textContent=err.length?"连接错误":`实时连接中 · 价格${state.priceMessages} 大单${state.tradeMessages} 范围${activeSymbols().length}`; document.getElementById("errorNote").textContent=err[0]||""; }
-    function render(){ const all=rows(), visible=filteredRows(); renderStats(all); const body=document.getElementById("radarBody"); if(!visible.length){ body.innerHTML='<tr><td colspan="14">当前筛选条件下暂无大资金流。</td></tr>'; return; } body.innerHTML=visible.slice(0,90).map(row=>{ const n60=row.f60.net>=0?"up":"down", n5=row.f5.net>=0?"up":"down"; const reasons=row.reasons.map(x=>`<span class="chip">${x}</span>`).join(""); const risks=(row.risks.length?row.risks:["--"]).map(x=>`<span class="chip">${x}</span>`).join(""); const streak=row.f60.lastSide?(row.f60.lastSide==="BUY"?"买":"卖")+row.f60.streak:"--"; const pText=`${signedPct(row.p1)} / ${signedPct(row.p5)}`; const vText=isNum(row.cm.volSpike)?row.cm.volSpike.toFixed(1)+"x":"--"; return `<tr><td><div class="symbol">${row.base}</div><div class="small">${row.symbol}</div></td><td>${badge(row)}</td><td><span class="score">${row.score}</span></td><td class="num">${price(row.price)}</td><td class="num">${pText}</td><td class="num">${money(row.m.quoteVolume||0)}</td><td class="num">${vText}</td><td class="num ${n60}">${row.f60.net>=0?"+":"-"}${money(Math.abs(row.f60.net))}</td><td class="num ${n5}">${row.f5.net>=0?"+":"-"}${money(Math.abs(row.f5.net))}</td><td class="num">${streak}</td><td class="num">${pctOrDash(row.d.oi15Pct)}</td><td class="num">${ratioOrDash(row.d.takerRatio)}</td><td><div class="reason">${risks}</div></td><td><div class="reason">${reasons}</div></td></tr>`; }).join(""); }
+    function renderStats(all){ document.getElementById("statSymbols").textContent=activeSymbols().length; document.getElementById("statLong").textContent=all.filter(r=>r.follow==="FOLLOW_LONG").length; document.getElementById("statShort").textContent=all.filter(r=>r.follow==="FOLLOW_SHORT").length; document.getElementById("statCost").textContent=baseCostPct().toFixed(2)+"%"; document.getElementById("statLiq").textContent=money(all.reduce((s,r)=>s+r.l5.total,0)); setDot("priceDot",state.priceConnected,state.priceError); setDot("tradeDot",state.tradeConnected,state.tradeError); setDot("liqDot",state.liqConnected,state.liqError); const err=[state.priceError,state.tradeError,state.liqError,state.restError].filter(Boolean); document.getElementById("connText").textContent=err.length?"连接错误":`实时连接中 · 价格${state.priceMessages} 大单${state.tradeMessages} 范围${activeSymbols().length}`; document.getElementById("errorNote").textContent=err[0]||""; }
+    function render(){ const all=rows(), visible=filteredRows(); renderStats(all); const body=document.getElementById("radarBody"); if(!visible.length){ body.innerHTML='<tr><td colspan="17">当前筛选条件下暂无大资金流。</td></tr>'; return; } body.innerHTML=visible.slice(0,90).map(row=>{ const n60=row.f60.net>=0?"up":"down", n5=row.f5.net>=0?"up":"down", edgeCls=row.forecast.netEdgePct>=0?"up":"down"; const reasons=row.reasons.map(x=>`<span class="chip">${x}</span>`).join(""); const risks=(row.risks.length?row.risks:["--"]).map(x=>`<span class="chip">${x}</span>`).join(""); const streak=row.f60.lastSide?(row.f60.lastSide==="BUY"?"买":"卖")+row.f60.streak:"--"; const pText=`${signedPct(row.p1)} / ${signedPct(row.p5)}`; const vText=isNum(row.cm.volSpike)?row.cm.volSpike.toFixed(1)+"x":"--"; const sideText=row.forecast.side==="LONG"?"多":(row.forecast.side==="SHORT"?"空":"震荡"); const expected=signedPlain(row.forecast.expected5Pct,2); const predText=`${sideText} ${row.forecast.prob5.toFixed(0)}% ${expected}`; return `<tr><td><div class="symbol">${row.base}</div><div class="small">${row.symbol}</div></td><td>${badge(row)}</td><td><span class="score">${row.score}</span></td><td class="num">${predText}</td><td class="num ${edgeCls}">${signedPlain(row.forecast.netEdgePct,2)}</td><td class="num">${row.cost.requiredPct.toFixed(2)}%</td><td class="num">${price(row.price)}</td><td class="num">${pText}</td><td class="num">${money(row.m.quoteVolume||0)}</td><td class="num">${vText}</td><td class="num ${n60}">${row.f60.net>=0?"+":"-"}${money(Math.abs(row.f60.net))}</td><td class="num ${n5}">${row.f5.net>=0?"+":"-"}${money(Math.abs(row.f5.net))}</td><td class="num">${streak}</td><td class="num">${pctOrDash(row.d.oi15Pct)}</td><td class="num">${ratioOrDash(row.d.takerRatio)}</td><td><div class="reason">${risks}</div></td><td><div class="reason">${reasons}</div></td></tr>`; }).join(""); }
     function renderEvents(){ const list=document.getElementById("eventList"); if(!state.events.length){ list.innerHTML='<div class="event"><div></div><div><div class="event-title">等待大额事件</div><div class="event-meta">达到阈值后会显示在这里</div></div></div>'; return; } list.innerHTML=state.events.slice(0,120).map(ev=>{ const side=ev.side==="BUY"?"buy":"sell"; return `<div class="event"><div class="event-side ${side}">${ev.label}</div><div><div class="event-title"><span>${base(ev.symbol)}</span><span>${money(ev.notional)}</span></div><div class="event-meta">${price(ev.price)} · ${new Date(ev.ts).toLocaleTimeString()} · 阈值${money(ev.threshold)}</div></div></div>`; }).join(""); }
-    function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,price:r.price,price_1m_pct:Number(r.p1.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,risks:r.risks,reasons:r.reasons})); }
+    function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,price:r.price,forecast_side:r.forecast.side,forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),forecast_5m_expected_pct:Number(r.forecast.expected5Pct.toFixed(3)),required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),price_1m_pct:Number(r.p1.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,risks:r.risks,reasons:r.reasons})); }
     function compactEvents(){ return state.events.slice(0,40).map(e=>({symbol:e.symbol,base:base(e.symbol),label:e.label,side:e.side,price:e.price,notional:Math.round(e.notional),time:new Date(e.ts).toLocaleTimeString()})); }
-    async function runAi(){ const btn=document.getElementById("aiBtn"), out=document.getElementById("aiOutput"); btn.disabled=true; out.textContent="正在分析当前大资金流..."; try{ const all=rows(); const payload={summary:{scanned_symbols:activeSymbols().length,follow_long:all.filter(r=>r.follow==="FOLLOW_LONG").length,follow_short:all.filter(r=>r.follow==="FOLLOW_SHORT").length,large_trade_threshold_usd:LARGE_TRADE_USD,generated_at:new Date().toLocaleString()},rows:compactRows(),events:compactEvents()}; const res=await fetch("/api/ai/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); const data=await res.json(); out.textContent=(data.mode==="ai"?"AI 分析\n\n":"规则分析\n\n")+data.analysis; }catch(err){ out.textContent="分析失败："+err; }finally{ btn.disabled=false; } }
+    async function runAi(){ const btn=document.getElementById("aiBtn"), out=document.getElementById("aiOutput"); btn.disabled=true; out.textContent="正在分析当前大资金流..."; try{ const all=rows(); const payload={summary:{scanned_symbols:activeSymbols().length,follow_long:all.filter(r=>r.follow==="FOLLOW_LONG").length,follow_short:all.filter(r=>r.follow==="FOLLOW_SHORT").length,large_trade_threshold_usd:LARGE_TRADE_USD,taker_fee_bps:TAKER_FEE_BPS,slippage_bps:SLIPPAGE_BPS,safety_edge_bps:SAFETY_EDGE_BPS,base_required_cost_pct:Number(baseCostPct().toFixed(3)),hold_minutes:HOLD_MINUTES,generated_at:new Date().toLocaleString()},rows:compactRows(),events:compactEvents()}; const res=await fetch("/api/ai/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); const data=await res.json(); out.textContent=(data.mode==="ai"?"AI 分析\n\n":"规则分析\n\n")+data.analysis; }catch(err){ out.textContent="分析失败："+err; }finally{ btn.disabled=false; } }
     function trimOld(){ const cut=now()-6*60*1000; for(const map of [state.trades,state.liquidations]){ for(const [sym,list] of map){ while(list.length&&list[0].ts<cut)list.shift(); if(!list.length)map.delete(sym); } } }
 
     function closeSockets(){ for(const ws of state.sockets){ try{ws.close();}catch(_){}} state.sockets=[]; state.priceConnected=false; state.tradeConnected=false; state.liqConnected=false; state.priceError=""; state.tradeError=""; state.liqError=""; state.priceMessages=0; state.tradeMessages=0; state.liqMessages=0; }
@@ -536,6 +587,10 @@ def index() -> str:
     html = html.replace("__TRADE_STREAM_CHUNK_SIZE__", json.dumps(TRADE_STREAM_CHUNK_SIZE))
     html = html.replace("__LARGE_TRADE_USD__", json.dumps(LARGE_TRADE_USD))
     html = html.replace("__MIN_DYNAMIC_TRADE_USD__", json.dumps(MIN_DYNAMIC_TRADE_USD))
+    html = html.replace("__TAKER_FEE_BPS__", json.dumps(TAKER_FEE_BPS))
+    html = html.replace("__SLIPPAGE_BPS__", json.dumps(SLIPPAGE_BPS))
+    html = html.replace("__SAFETY_EDGE_BPS__", json.dumps(SAFETY_EDGE_BPS))
+    html = html.replace("__HOLD_MINUTES__", json.dumps(HOLD_MINUTES))
     html = html.replace("__BINANCE_WS_BASES__", json.dumps(BINANCE_WS_BASES))
     html = html.replace("__BINANCE_REST_BASES__", json.dumps(BINANCE_REST_BASES))
     return render_template_string(html)
@@ -551,6 +606,10 @@ def health():
         "trade_stream_chunk_size": TRADE_STREAM_CHUNK_SIZE,
         "large_trade_usd": LARGE_TRADE_USD,
         "min_dynamic_trade_usd": MIN_DYNAMIC_TRADE_USD,
+        "taker_fee_bps": TAKER_FEE_BPS,
+        "slippage_bps": SLIPPAGE_BPS,
+        "safety_edge_bps": SAFETY_EDGE_BPS,
+        "hold_minutes": HOLD_MINUTES,
         "binance_ws_bases": BINANCE_WS_BASES,
         "binance_rest_bases": BINANCE_REST_BASES,
     })
