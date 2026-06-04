@@ -292,6 +292,8 @@ def _public_testnet_status() -> dict:
     base = {
         "rest": BINANCE_TESTNET_REST,
         "configured": bool(cfg.get("api_key") and cfg.get("api_secret")),
+        "has_api_key": bool(cfg.get("api_key")),
+        "has_api_secret": bool(cfg.get("api_secret")),
         "auto_trade": bool(cfg.get("auto_trade")),
         "order_usdt": cfg.get("order_usdt"),
         "leverage": cfg.get("leverage"),
@@ -301,6 +303,10 @@ def _public_testnet_status() -> dict:
         "events": _trade_events[:20],
         "equity_curve": _equity_curve[-120:],
     }
+    if cfg.get("api_key") and not cfg.get("api_secret"):
+        return {**base, "account_ok": False, "message": "第一次连接还需要填写 Secret"}
+    if cfg.get("api_secret") and not cfg.get("api_key"):
+        return {**base, "account_ok": False, "message": "第一次连接还需要填写 API Key"}
     if not base["configured"]:
         return {**base, "account_ok": False, "message": "未配置模拟盘 API"}
     try:
@@ -582,9 +588,9 @@ HTML = r"""
             <button class="ai-btn" id="saveTradeCfg">保存</button>
           </div>
           <div class="trade-form">
-            <label class="wide">模拟盘 API Key<input id="testnetKey" autocomplete="off" placeholder="从 demo.binance.com 创建后粘贴"></label>
+            <label class="wide">模拟盘 API Key<input id="testnetKey" autocomplete="off" type="password" placeholder="第一次必填；保存后不会显示"></label>
             <label class="wide">模拟盘 Secret<input id="testnetSecret" autocomplete="off" type="password" placeholder="第一次必填；以后不改可留空"></label>
-            <div class="api-help">只填 Binance Futures Testnet / Demo Trading 的 Key，不要填实盘 Key。</div>
+            <div class="api-help">第一次连接必须同时填 API Key 和 Secret。只填 Binance Futures Testnet / Demo Trading，不要填实盘 Key。</div>
             <label>每笔 USDT<input id="orderUsdt" type="number" min="1" step="1" value="100"></label>
             <label>杠杆<input id="tradeLeverage" type="number" min="1" max="20" step="1" value="3"></label>
             <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="3"></label>
@@ -1044,8 +1050,11 @@ HTML = r"""
     }
     function renderTestnetStatus(data){
       state.testnet=data;
-      document.getElementById("tradeConnNote").textContent=data.configured?(data.account_ok?"模拟盘已连接":"模拟盘连接异常"):"未配置模拟盘 API";
+      const note=document.getElementById("tradeConnNote");
+      note.textContent=data.account_ok?"模拟盘已连接":(data.message||"未配置模拟盘 API");
       document.getElementById("autoTradeToggle").checked=!!data.auto_trade;
+      document.getElementById("testnetKey").placeholder=data.has_api_key?"已保存；留空不修改":"第一次必填；保存后不会显示";
+      document.getElementById("testnetSecret").placeholder=data.has_api_secret?"已保存；留空不修改":"第一次必填；以后不改可留空";
       document.getElementById("orderUsdt").value=data.order_usdt||100;
       document.getElementById("tradeLeverage").value=data.leverage||3;
       document.getElementById("maxPositions").value=data.max_positions||3;
@@ -1080,6 +1089,7 @@ HTML = r"""
       try{
         const res=await fetch("/api/testnet/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
         renderTestnetStatus(await res.json());
+        document.getElementById("testnetKey").value="";
         document.getElementById("testnetSecret").value="";
       }catch(err){ document.getElementById("tradeConnNote").textContent="保存失败："+err; }
       finally{ btn.disabled=false; btn.textContent="保存连接"; }
@@ -1222,7 +1232,10 @@ def testnet_config():
                     _testnet_config[key] = max(1, cast(payload.get(key)))
                 except (TypeError, ValueError):
                     _testnet_config[key] = default
-        _event("模拟盘配置已更新", "info")
+        if _testnet_config.get("api_key") and _testnet_config.get("api_secret"):
+            _event("模拟盘配置已更新", "info")
+        else:
+            _event("模拟盘配置未完整：第一次连接需要 API Key 和 Secret", "warn")
     return jsonify(_public_testnet_status())
 
 
