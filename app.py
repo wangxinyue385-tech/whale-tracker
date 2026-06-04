@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import os
+import threading
+import time
 import urllib.error
 import urllib.request
+from decimal import Decimal, ROUND_DOWN
+from urllib.parse import urlencode
 
 from flask import Flask, jsonify, render_template_string, request
 from signal_logger import fill_prices, get_recent, get_stats, init_db, log_signal
@@ -68,6 +74,242 @@ AI_API_BASE = os.environ.get("AI_API_BASE") or (
     "https://api.deepseek.com" if os.environ.get("DEEPSEEK_API_KEY") else "https://api.openai.com/v1"
 )
 AI_MODEL = os.environ.get("AI_MODEL") or ("deepseek-chat" if os.environ.get("DEEPSEEK_API_KEY") else "gpt-4o-mini")
+
+BINANCE_TESTNET_REST = os.environ.get("BINANCE_TESTNET_REST", "https://demo-fapi.binance.com").rstrip("/")
+TESTNET_AUTO_CLOSE_MINUTES = float(os.environ.get("TESTNET_AUTO_CLOSE_MINUTES", "5"))
+TESTNET_ORDER_USDT = float(os.environ.get("TESTNET_ORDER_USDT", "100"))
+TESTNET_LEVERAGE = int(os.environ.get("TESTNET_LEVERAGE", "3"))
+TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "3"))
+TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "300"))
+
+_trade_lock = threading.Lock()
+_testnet_config = {
+    "api_key": os.environ.get("BINANCE_TESTNET_API_KEY", ""),
+    "api_secret": os.environ.get("BINANCE_TESTNET_API_SECRET", ""),
+    "auto_trade": os.environ.get("TESTNET_AUTO_TRADE", "0") == "1",
+    "order_usdt": TESTNET_ORDER_USDT,
+    "leverage": TESTNET_LEVERAGE,
+    "max_positions": TESTNET_MAX_POSITIONS,
+    "cooldown_seconds": TESTNET_COOLDOWN_SECONDS,
+    "auto_close_minutes": TESTNET_AUTO_CLOSE_MINUTES,
+}
+_trade_cooldown: dict[str, int] = {}
+_auto_positions: dict[str, dict] = {}
+_trade_events: list[dict] = []
+_equity_curve: list[dict] = []
+_exchange_cache = {"ts": 0.0, "symbols": {}}
+
+
+def _public_testnet_get(path: str, params: dict | None = None) -> dict:
+    query = f"?{urlencode(params or {})}" if params else ""
+    req = urllib.request.Request(BINANCE_TESTNET_REST + path + query, method="GET")
+    with urllib.request.urlopen(req, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _signed_testnet_request(method: str, path: str, params: dict | None = None) -> dict:
+    cfg = _testnet_config
+    if not cfg.get("api_key") or not cfg.get("api_secret"):
+        raise RuntimeError("模拟盘 API Key/Secret 未配置")
+    payload = dict(params or {})
+    payload["timestamp"] = int(time.time() * 1000)
+    payload["recvWindow"] = 5000
+    query = urlencode(payload)
+    signature = hmac.new(cfg["api_secret"].encode(), query.encode(), hashlib.sha256).hexdigest()
+    body = (query + "&signature=" + signature).encode()
+    headers = {
+        "X-MBX-APIKEY": cfg["api_key"],
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    if method == "GET":
+        req = urllib.request.Request(BINANCE_TESTNET_REST + path + "?" + body.decode(), headers=headers, method="GET")
+    else:
+        req = urllib.request.Request(BINANCE_TESTNET_REST + path, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=25) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Binance testnet {exc.code}: {detail}") from exc
+
+
+def _event(message: str, level: str = "info", **extra) -> None:
+    item = {"ts": int(time.time() * 1000), "message": message, "level": level, **extra}
+    _trade_events.insert(0, item)
+    del _trade_events[80:]
+
+
+def _exchange_filters(symbol: str) -> dict:
+    now_ts = time.time()
+    if now_ts - float(_exchange_cache["ts"]) > 3600 or not _exchange_cache["symbols"]:
+        data = _public_testnet_get("/fapi/v1/exchangeInfo")
+        symbols = {}
+        for item in data.get("symbols", []):
+            filters = {flt.get("filterType"): flt for flt in item.get("filters", [])}
+            lot = filters.get("MARKET_LOT_SIZE") or filters.get("LOT_SIZE") or {}
+            symbols[item["symbol"]] = {
+                "step_size": lot.get("stepSize", "0.001"),
+                "min_qty": lot.get("minQty", "0"),
+            }
+        _exchange_cache["symbols"] = symbols
+        _exchange_cache["ts"] = now_ts
+    return _exchange_cache["symbols"].get(symbol, {"step_size": "0.001", "min_qty": "0"})
+
+
+def _round_qty(symbol: str, qty: float) -> str:
+    filters = _exchange_filters(symbol)
+    step = Decimal(str(filters["step_size"]))
+    min_qty = Decimal(str(filters["min_qty"]))
+    value = Decimal(str(qty))
+    rounded = (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+    if rounded <= 0 or rounded < min_qty:
+        raise RuntimeError(f"{symbol} 数量过小，最小数量 {min_qty}")
+    return format(rounded.normalize(), "f")
+
+
+def _account_snapshot() -> dict:
+    data = _signed_testnet_request("GET", "/fapi/v3/account")
+    wallet = float(data.get("totalWalletBalance") or 0)
+    unrealized = float(data.get("totalUnrealizedProfit") or 0)
+    equity = float(data.get("totalMarginBalance") or wallet + unrealized)
+    positions = []
+    for pos in data.get("positions", []):
+        amount = float(pos.get("positionAmt") or 0)
+        if abs(amount) <= 0:
+            continue
+        positions.append({
+            "symbol": pos.get("symbol"),
+            "amount": amount,
+            "entry_price": float(pos.get("entryPrice") or 0),
+            "unrealized": float(pos.get("unrealizedProfit") or 0),
+        })
+    point = {"ts": int(time.time() * 1000), "wallet": wallet, "unrealized": unrealized, "equity": equity}
+    _equity_curve.append(point)
+    del _equity_curve[:-240]
+    return {"wallet": wallet, "unrealized": unrealized, "equity": equity, "positions": positions}
+
+
+def _position_map(account: dict) -> dict[str, dict]:
+    return {pos["symbol"]: pos for pos in account.get("positions", [])}
+
+
+def _set_leverage(symbol: str) -> None:
+    try:
+        _signed_testnet_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(_testnet_config["leverage"])})
+    except Exception as exc:  # noqa: BLE001
+        _event(f"{symbol} 设置杠杆失败：{exc}", "warn", symbol=symbol)
+
+
+def _place_market_order(symbol: str, follow: str, price: float) -> dict:
+    side = "BUY" if follow == "FOLLOW_LONG" else "SELL"
+    if price <= 0:
+        ticker = _public_testnet_get("/fapi/v1/ticker/price", {"symbol": symbol})
+        price = float(ticker.get("price") or 0)
+    if price <= 0:
+        raise RuntimeError(f"{symbol} 没有可用价格")
+    qty = _round_qty(symbol, float(_testnet_config["order_usdt"]) / price)
+    params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": qty}
+    return _signed_testnet_request("POST", "/fapi/v1/order", params)
+
+
+def _close_position(symbol: str, amount: float) -> dict:
+    side = "SELL" if amount > 0 else "BUY"
+    qty = _round_qty(symbol, abs(amount))
+    return _signed_testnet_request("POST", "/fapi/v1/order", {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "quantity": qty,
+        "reduceOnly": "true",
+    })
+
+
+def _close_due_positions(account: dict | None = None) -> None:
+    if not _testnet_config.get("api_key") or not _testnet_config.get("api_secret"):
+        return
+    account = account or _account_snapshot()
+    positions = _position_map(account)
+    now_ms = int(time.time() * 1000)
+    close_ms = float(_testnet_config["auto_close_minutes"]) * 60 * 1000
+    for symbol, meta in list(_auto_positions.items()):
+        if now_ms - int(meta.get("opened_at", now_ms)) < close_ms:
+            continue
+        pos = positions.get(symbol)
+        if not pos:
+            _auto_positions.pop(symbol, None)
+            continue
+        try:
+            _close_position(symbol, float(pos["amount"]))
+            _event(f"{symbol} 到时自动平仓", "info", symbol=symbol)
+            _auto_positions.pop(symbol, None)
+        except Exception as exc:  # noqa: BLE001
+            _event(f"{symbol} 自动平仓失败：{exc}", "error", symbol=symbol)
+
+
+def _auto_trade_signals(rows: list[dict], prices: dict[str, float]) -> None:
+    if not _testnet_config.get("auto_trade"):
+        return
+    rows = [row for row in rows if row.get("follow") in {"FOLLOW_LONG", "FOLLOW_SHORT"}]
+    if not rows:
+        return
+    if not _testnet_config.get("api_key") or not _testnet_config.get("api_secret"):
+        _event("自动下单已开启，但模拟盘 API 未配置", "warn")
+        return
+    with _trade_lock:
+        account = _account_snapshot()
+        _close_due_positions(account)
+        positions = _position_map(_account_snapshot())
+        open_count = len(positions)
+        now_ms = int(time.time() * 1000)
+        for row in rows:
+            symbol = str(row.get("symbol") or "")
+            follow = row.get("follow")
+            if follow not in {"FOLLOW_LONG", "FOLLOW_SHORT"} or not symbol:
+                continue
+            if open_count >= int(_testnet_config["max_positions"]):
+                _event(f"{symbol} 跳过：持仓数量已达上限", "warn", symbol=symbol)
+                continue
+            cooldown_key = f"{symbol}|{follow}"
+            if now_ms - _trade_cooldown.get(cooldown_key, 0) < int(_testnet_config["cooldown_seconds"]) * 1000:
+                continue
+            if symbol in positions:
+                _event(f"{symbol} 跳过：已有模拟盘持仓", "warn", symbol=symbol)
+                continue
+            try:
+                _set_leverage(symbol)
+                price = float(row.get("price") or prices.get(symbol) or 0)
+                order = _place_market_order(symbol, follow, price)
+                _trade_cooldown[cooldown_key] = now_ms
+                _auto_positions[symbol] = {"follow": follow, "opened_at": now_ms, "order_id": order.get("orderId")}
+                open_count += 1
+                _event(f"{symbol} {('做多' if follow == 'FOLLOW_LONG' else '做空')} 模拟盘自动下单", "info", symbol=symbol, order=order)
+            except Exception as exc:  # noqa: BLE001
+                _event(f"{symbol} 自动下单失败：{exc}", "error", symbol=symbol)
+
+
+def _public_testnet_status() -> dict:
+    cfg = _testnet_config
+    base = {
+        "rest": BINANCE_TESTNET_REST,
+        "configured": bool(cfg.get("api_key") and cfg.get("api_secret")),
+        "auto_trade": bool(cfg.get("auto_trade")),
+        "order_usdt": cfg.get("order_usdt"),
+        "leverage": cfg.get("leverage"),
+        "max_positions": cfg.get("max_positions"),
+        "cooldown_seconds": cfg.get("cooldown_seconds"),
+        "auto_close_minutes": cfg.get("auto_close_minutes"),
+        "events": _trade_events[:20],
+        "equity_curve": _equity_curve[-120:],
+    }
+    if not base["configured"]:
+        return {**base, "account_ok": False, "message": "未配置模拟盘 API"}
+    try:
+        with _trade_lock:
+            account = _account_snapshot()
+            _close_due_positions(account)
+        return {**base, "account_ok": True, **account, "events": _trade_events[:20], "equity_curve": _equity_curve[-120:]}
+    except Exception as exc:  # noqa: BLE001
+        return {**base, "account_ok": False, "message": str(exc)}
 
 
 def rule_analysis(payload: dict) -> str:
@@ -195,7 +437,8 @@ HTML = r"""
     .sub { color:var(--muted); font-size:12px; margin-top:4px; }
     .up { color:var(--green); font-weight:850; }
     .down { color:var(--red); font-weight:850; }
-    .layout { display:grid; grid-template-columns:minmax(0,1fr) 360px; gap:12px; align-items:start; }
+    .layout { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:12px; align-items:start; }
+    .trade-grid { display:grid; grid-template-columns:420px minmax(0,1fr); gap:12px; margin-bottom:12px; align-items:stretch; }
     .panel,.ai-panel { background:var(--surface); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
     .ai-panel { margin-bottom:12px; }
     .panel-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border-bottom:1px solid var(--line); background:var(--surface2); }
@@ -203,6 +446,7 @@ HTML = r"""
     .panel-note { color:var(--muted); font-size:12px; }
     .ai-body { padding:12px 14px; font-size:13px; line-height:1.65; white-space:pre-wrap; min-height:92px; }
     .table-wrap { overflow-x:auto; }
+    .table-wrap.compact { overflow-x:visible; }
     table { width:100%; border-collapse:collapse; font-size:12.5px; }
     th { color:var(--muted); text-align:left; font-weight:750; padding:9px 10px; border-bottom:1px solid var(--line); background:#fbfcfe; white-space:nowrap; }
     td { padding:10px; border-bottom:1px solid #edf1f5; vertical-align:middle; white-space:nowrap; }
@@ -217,6 +461,12 @@ HTML = r"""
     .score { width:52px; height:28px; border-radius:6px; display:inline-grid; place-items:center; color:#fff; background:var(--ink); font-weight:900; }
     .reason { display:flex; gap:5px; flex-wrap:wrap; min-width:230px; white-space:normal; }
     .chip { border:1px solid var(--line); background:var(--surface2); color:var(--text); border-radius:6px; padding:3px 6px; font-size:11px; }
+    .detail-btn { border:1px solid var(--line); background:var(--surface2); color:var(--ink); border-radius:6px; padding:5px 8px; cursor:pointer; font-size:12px; }
+    .detail-row td { background:#fbfcfe; white-space:normal; padding:0; }
+    .detail-box { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; padding:12px 14px; border-bottom:1px solid #edf1f5; }
+    .detail-item { min-width:0; }
+    .detail-label { color:var(--muted); font-size:11px; margin-bottom:4px; font-weight:750; }
+    .detail-value { color:var(--ink); font-size:12px; line-height:1.45; overflow-wrap:anywhere; }
     .event-list { max-height:760px; overflow:auto; }
     .event { display:grid; grid-template-columns:58px 1fr; gap:8px; padding:10px 12px; border-bottom:1px solid #edf1f5; }
     .event-side { font-size:11px; font-weight:900; }
@@ -229,7 +479,24 @@ HTML = r"""
     .signal-stats strong { color:var(--ink); }
     .win { color:var(--green); font-weight:850; }
     .lose { color:var(--red); font-weight:850; }
-    @media (max-width:1100px) { .layout{grid-template-columns:1fr;} .stats{grid-template-columns:repeat(2,minmax(0,1fr));} .controls{grid-template-columns:1fr;} .segmented{overflow-x:auto;} .statusbar{display:none;} }
+    .trade-form { display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:12px 14px; }
+    .trade-form label { color:var(--muted); font-size:11px; font-weight:750; display:grid; gap:5px; }
+    .trade-form input { width:100%; border:1px solid var(--line); background:var(--surface); border-radius:6px; padding:8px 9px; color:var(--text); min-width:0; }
+    .trade-form .wide { grid-column:1/-1; }
+    .trade-actions { display:flex; align-items:center; gap:10px; padding:0 14px 12px; flex-wrap:wrap; }
+    .toggle { display:inline-flex; align-items:center; gap:7px; color:var(--text); font-size:12px; font-weight:800; }
+    .toggle input { width:16px; height:16px; }
+    .trade-status { padding:0 14px 14px; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+    .mini-stat { border:1px solid var(--line); background:var(--surface2); border-radius:6px; padding:8px; min-height:58px; }
+    .mini-stat .label { margin-bottom:4px; font-size:11px; }
+    .mini-stat .value { font-size:16px; }
+    .trade-log { border-top:1px solid var(--line); max-height:116px; overflow:auto; padding:8px 14px; color:var(--muted); font-size:12px; line-height:1.55; }
+    .trade-log div { border-bottom:1px solid #edf1f5; padding:4px 0; }
+    .chart-wrap { padding:12px 14px 14px; height:278px; }
+    #pnlChart { width:100%; height:220px; display:block; border:1px solid var(--line); border-radius:8px; background:#fff; }
+    .chart-meta { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; margin-top:8px; }
+    @media (max-width:1200px) { .trade-grid{grid-template-columns:1fr;} .layout{grid-template-columns:1fr;} .detail-box{grid-template-columns:repeat(2,minmax(0,1fr));} }
+    @media (max-width:720px) { .stats{grid-template-columns:repeat(2,minmax(0,1fr));} .controls{grid-template-columns:1fr;} .segmented{overflow-x:auto;} .statusbar{display:none;} .trade-form,.trade-status,.detail-box{grid-template-columns:1fr;} th.optional,td.optional{display:none;} }
   </style>
 </head>
 <body>
@@ -261,6 +528,47 @@ HTML = r"""
       <div class="stat"><div class="label">成本门槛</div><div class="value" id="statCost">--</div><div class="sub">费率+滑点+安全垫</div></div>
       <div class="stat"><div class="label">5 分钟爆仓</div><div class="value" id="statLiq">--</div><div class="sub">强平订单流</div></div>
     </section>
+    <section class="trade-grid">
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">币安模拟盘自动下单</div>
+            <div class="panel-note" id="tradeConnNote">未连接模拟盘</div>
+          </div>
+          <button class="ai-btn" id="saveTradeCfg">保存连接</button>
+        </div>
+        <div class="trade-form">
+          <label class="wide">API Key<input id="testnetKey" autocomplete="off" placeholder="Binance Futures Testnet API Key"></label>
+          <label class="wide">API Secret<input id="testnetSecret" autocomplete="off" type="password" placeholder="留空则不修改 Secret"></label>
+          <label>每笔名义 USDT<input id="orderUsdt" type="number" min="1" step="1" value="100"></label>
+          <label>杠杆<input id="tradeLeverage" type="number" min="1" max="20" step="1" value="3"></label>
+          <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="3"></label>
+          <label>自动平仓分钟<input id="autoCloseMinutes" type="number" min="1" step="1" value="5"></label>
+        </div>
+        <div class="trade-actions">
+          <label class="toggle"><input id="autoTradeToggle" type="checkbox">FOLLOW 信号自动下单</label>
+          <span class="panel-note">只发往 Binance Futures Testnet</span>
+        </div>
+        <div class="trade-status">
+          <div class="mini-stat"><div class="label">权益</div><div class="value" id="tradeEquity">--</div></div>
+          <div class="mini-stat"><div class="label">未实现盈亏</div><div class="value" id="tradePnl">--</div></div>
+          <div class="mini-stat"><div class="label">持仓</div><div class="value" id="tradePositions">--</div></div>
+        </div>
+        <div class="trade-log" id="tradeLog"><div>等待模拟盘连接。</div></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">实时收益折线图</div>
+            <div class="panel-note">读取模拟盘账户权益和未实现盈亏</div>
+          </div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="pnlChart"></canvas>
+          <div class="chart-meta"><span id="chartLeft">等待数据</span><span id="chartRight">--</span></div>
+        </div>
+      </div>
+    </section>
     <section class="ai-panel">
       <div class="panel-head">
         <div>
@@ -280,15 +588,14 @@ HTML = r"""
           </div>
           <div class="panel-note" id="errorNote"></div>
         </div>
-        <div class="table-wrap">
+        <div class="table-wrap compact">
           <table>
             <thead>
               <tr>
-                <th>交易对</th><th>判断</th><th>分数</th><th>5m预测</th><th>净边际</th><th>成本线</th><th>价格</th><th>1m/5m</th><th>24h成交</th>
-                <th>量能</th><th>60s净流</th><th>5m净流</th><th>连续</th><th>OI15m</th><th>Taker</th><th>风险</th><th>依据</th>
+                <th>交易对</th><th>判断</th><th>分数</th><th>5m预测</th><th>净边际</th><th>价格</th><th>1m/5m</th><th>5m净流</th><th>风险</th><th>详情</th>
               </tr>
             </thead>
-            <tbody id="radarBody"><tr><td colspan="17">正在连接 Binance...</td></tr></tbody>
+            <tbody id="radarBody"><tr><td colspan="10">正在连接 Binance...</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -332,6 +639,7 @@ HTML = r"""
       activeSymbols:[...SEED_SYMBOLS], marketMeta:new Map(), derivatives:new Map(), candles:new Map(),
       prices:new Map(), priceHistory:new Map(), trades:new Map(), liquidations:new Map(), events:[],
       sockets:[], runId:0, activeFilter:"all",
+      expanded:new Set(), testnet:null,
       priceConnected:false, tradeConnected:false, liqConnected:false,
       priceError:"", tradeError:"", liqError:"", restError:"",
       priceMessages:0, tradeMessages:0, liqMessages:0, derivativesUpdatedAt:0,
@@ -603,7 +911,35 @@ HTML = r"""
     function addEvent(ev){ state.events.unshift(ev); state.events=state.events.slice(0,220); }
 
     function renderStats(all){ document.getElementById("statSymbols").textContent=activeSymbols().length; document.getElementById("statLong").textContent=all.filter(r=>r.follow==="FOLLOW_LONG").length; document.getElementById("statShort").textContent=all.filter(r=>r.follow==="FOLLOW_SHORT").length; document.getElementById("statCost").textContent=baseCostPct().toFixed(2)+"%"; document.getElementById("statLiq").textContent=money(all.reduce((s,r)=>s+r.l5.total,0)); setDot("priceDot",state.priceConnected,state.priceError); setDot("tradeDot",state.tradeConnected,state.tradeError); setDot("liqDot",state.liqConnected,state.liqError); const err=[state.priceError,state.tradeError,state.liqError,state.restError].filter(Boolean); document.getElementById("connText").textContent=err.length?"连接错误":`实时连接中 · 价格${state.priceMessages} 大单${state.tradeMessages} 范围${activeSymbols().length}`; document.getElementById("errorNote").textContent=err[0]||""; }
-    function render(){ const all=rows(), visible=filteredRows(); renderStats(all); const body=document.getElementById("radarBody"); if(!visible.length){ body.innerHTML='<tr><td colspan="17">当前筛选条件下暂无大资金流。</td></tr>'; return; } body.innerHTML=visible.slice(0,90).map(row=>{ const n60=row.f60.net>=0?"up":"down", n5=row.f5.net>=0?"up":"down", edgeCls=row.forecast.netEdgePct>=0?"up":"down"; const reasons=row.reasons.map(x=>`<span class="chip">${x}</span>`).join(""); const risks=(row.risks.length?row.risks:["--"]).map(x=>`<span class="chip">${x}</span>`).join(""); const streak=row.f60.lastSide?(row.f60.lastSide==="BUY"?"买":"卖")+row.f60.streak:"--"; const pText=`${signedPct(row.p1)} / ${signedPct(row.p5)}`; const vText=isNum(row.cm.volSpike)?row.cm.volSpike.toFixed(1)+"x":"--"; const sideText=row.forecast.side==="LONG"?"多":(row.forecast.side==="SHORT"?"空":"震荡"); const expected=signedPlain(row.forecast.expected5Pct,2); const predText=`${sideText} ${row.forecast.prob5.toFixed(0)}% ${expected}`; return `<tr><td><div class="symbol">${row.base}</div><div class="small">${row.symbol}</div></td><td>${badge(row)}</td><td><span class="score">${row.score}</span></td><td class="num">${predText}</td><td class="num ${edgeCls}">${signedPlain(row.forecast.netEdgePct,2)}</td><td class="num">${row.cost.requiredPct.toFixed(2)}%</td><td class="num">${price(row.price)}</td><td class="num">${pText}</td><td class="num">${money(row.m.quoteVolume||0)}</td><td class="num">${vText}</td><td class="num ${n60}">${row.f60.net>=0?"+":"-"}${money(Math.abs(row.f60.net))}</td><td class="num ${n5}">${row.f5.net>=0?"+":"-"}${money(Math.abs(row.f5.net))}</td><td class="num">${streak}</td><td class="num">${pctOrDash(row.d.oi15Pct)}</td><td class="num">${ratioOrDash(row.d.takerRatio)}</td><td><div class="reason">${risks}</div></td><td><div class="reason">${reasons}</div></td></tr>`; }).join(""); }
+    function detailItem(label,value){ return `<div class="detail-item"><div class="detail-label">${label}</div><div class="detail-value">${value}</div></div>`; }
+    function renderDetail(row){
+      const reasons=row.reasons.map(x=>`<span class="chip">${x}</span>`).join("");
+      const risks=(row.risks.length?row.risks:["--"]).map(x=>`<span class="chip">${x}</span>`).join("");
+      const streak=row.f60.lastSide?(row.f60.lastSide==="BUY"?"买":"卖")+row.f60.streak:"--";
+      const closeLoc=isNum(row.cm.closeLocation)?Math.round(row.cm.closeLocation*100)+"%":"--";
+      const flowText=`60s ${money(row.f60.net)} / 5m ${money(row.f5.net)} / 最大 ${money(row.f60.largest||row.f5.largest)}`;
+      const marketText=`BTC ${signedPlain(row.mb.btc,2)} / ETH ${signedPlain(row.mb.eth,2)} / bias ${row.mb.bias}`;
+      return `<tr class="detail-row"><td colspan="10"><div class="detail-box">
+        ${detailItem("依据",`<div class="reason">${reasons}</div>`)}
+        ${detailItem("风险",`<div class="reason">${risks}</div>`)}
+        ${detailItem("资金流",flowText)}
+        ${detailItem("连续",streak)}
+        ${detailItem("OI / Taker",`${pctOrDash(row.d.oi15Pct)} / ${ratioOrDash(row.d.takerRatio)}`)}
+        ${detailItem("量能 / 收盘位置",`${isNum(row.cm.volSpike)?row.cm.volSpike.toFixed(1)+"x":"--"} / ${closeLoc}`)}
+        ${detailItem("爆仓",`多爆 ${money(row.l5.longLiq)} / 空爆 ${money(row.l5.shortLiq)}`)}
+        ${detailItem("大盘",marketText)}
+      </div></td></tr>`;
+    }
+    function renderRow(row){
+      const n5=row.f5.net>=0?"up":"down", edgeCls=row.forecast.netEdgePct>=0?"up":"down";
+      const riskText=(row.risks.length?row.risks.slice(0,2):["--"]).map(x=>`<span class="chip">${x}</span>`).join("");
+      const sideText=row.forecast.side==="LONG"?"多":(row.forecast.side==="SHORT"?"空":"震荡");
+      const predText=`${sideText} ${row.forecast.prob5.toFixed(0)}% ${signedPlain(row.forecast.expected5Pct,2)}`;
+      const expanded=state.expanded.has(row.symbol);
+      const main=`<tr><td><div class="symbol">${row.base}</div><div class="small">${row.symbol}</div></td><td>${badge(row)}</td><td><span class="score">${row.score}</span></td><td class="num">${predText}</td><td class="num ${edgeCls}">${signedPlain(row.forecast.netEdgePct,2)}</td><td class="num">${price(row.price)}</td><td class="num">${signedPct(row.p1)} / ${signedPct(row.p5)}</td><td class="num ${n5}">${row.f5.net>=0?"+":"-"}${money(Math.abs(row.f5.net))}</td><td><div class="reason">${riskText}</div></td><td><button class="detail-btn" data-symbol="${row.symbol}">${expanded?"收起":"详情"}</button></td></tr>`;
+      return expanded ? main + renderDetail(row) : main;
+    }
+    function render(){ const all=rows(), visible=filteredRows(); renderStats(all); const body=document.getElementById("radarBody"); if(!visible.length){ body.innerHTML='<tr><td colspan="10">当前筛选条件下暂无大资金流。</td></tr>'; return; } body.innerHTML=visible.slice(0,90).map(renderRow).join(""); }
     function renderEvents(){ const list=document.getElementById("eventList"); if(!state.events.length){ list.innerHTML='<div class="event"><div></div><div><div class="event-title">等待大额事件</div><div class="event-meta">达到阈值后会显示在这里</div></div></div>'; return; } list.innerHTML=state.events.slice(0,120).map(ev=>{ const side=ev.side==="BUY"?"buy":"sell"; return `<div class="event"><div class="event-side ${side}">${ev.label}</div><div><div class="event-title"><span>${base(ev.symbol)}</span><span>${money(ev.notional)}</span></div><div class="event-meta">${price(ev.price)} · ${new Date(ev.ts).toLocaleTimeString()} · 阈值${money(ev.threshold)}</div></div></div>`; }).join(""); }
     function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,price:r.price,forecast_side:r.forecast.side,forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),forecast_5m_expected_pct:Number(r.forecast.expected5Pct.toFixed(3)),required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),price_1m_pct:Number(r.p1.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,risks:r.risks,reasons:r.reasons})); }
     function compactEvents(){ return state.events.slice(0,40).map(e=>({symbol:e.symbol,base:base(e.symbol),label:e.label,side:e.side,price:e.price,notional:Math.round(e.notional),time:new Date(e.ts).toLocaleTimeString()})); }
@@ -654,6 +990,80 @@ HTML = r"""
       fetch("/api/signal/log",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({rows:payload,prices})}).catch(()=>{});
     }
 
+    function esc(value){ return String(value??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m])); }
+    function usdt(value){ return "$"+Number(value||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
+    function drawPnlChart(points){
+      const canvas=document.getElementById("pnlChart");
+      const left=document.getElementById("chartLeft"), right=document.getElementById("chartRight");
+      if(!canvas)return;
+      const rect=canvas.getBoundingClientRect(), ratio=window.devicePixelRatio||1;
+      canvas.width=Math.max(1,Math.floor(rect.width*ratio)); canvas.height=Math.max(1,Math.floor(rect.height*ratio));
+      const ctx=canvas.getContext("2d"); ctx.setTransform(ratio,0,0,ratio,0,0);
+      const w=rect.width, h=rect.height, pad=26;
+      ctx.clearRect(0,0,w,h); ctx.fillStyle="#fff"; ctx.fillRect(0,0,w,h);
+      ctx.strokeStyle="#edf1f5"; ctx.lineWidth=1;
+      for(let i=0;i<4;i++){ const y=pad+(h-pad*2)*i/3; ctx.beginPath(); ctx.moveTo(pad,y); ctx.lineTo(w-pad,y); ctx.stroke(); }
+      if(!points||points.length<2){
+        ctx.fillStyle="#68758a"; ctx.font="12px Inter, sans-serif"; ctx.fillText("连接模拟盘后显示收益曲线",pad,Math.floor(h/2));
+        if(left)left.textContent="等待数据"; if(right){ right.textContent="--"; right.className=""; }
+        return;
+      }
+      const vals=points.map(p=>Number(p.equity||0)).filter(Number.isFinite);
+      const min=Math.min(...vals), max=Math.max(...vals), span=Math.max(max-min,Math.max(max,1)*0.001);
+      const first=vals[0], last=vals[vals.length-1];
+      const x=i=>pad+(w-pad*2)*i/Math.max(1,points.length-1);
+      const y=v=>pad+(max-v)/span*(h-pad*2);
+      ctx.strokeStyle=last>=first?"#087f5b":"#c92a2a"; ctx.lineWidth=2.5; ctx.beginPath();
+      points.forEach((p,i)=>{ const xx=x(i), yy=y(Number(p.equity||0)); if(i)ctx.lineTo(xx,yy); else ctx.moveTo(xx,yy); });
+      ctx.stroke();
+      ctx.fillStyle="#162033"; ctx.font="12px Inter, sans-serif"; ctx.fillText(usdt(max),8,18); ctx.fillText(usdt(min),8,h-10);
+      const pnl=last-first;
+      if(left)left.textContent=`起始 ${usdt(first)} · 当前 ${usdt(last)}`;
+      if(right){ right.textContent=`收益 ${pnl>=0?"+":""}${usdt(pnl)}`; right.className=pnl>=0?"up":"down"; }
+    }
+    function renderTestnetStatus(data){
+      state.testnet=data;
+      document.getElementById("tradeConnNote").textContent=data.configured?(data.account_ok?"模拟盘已连接":"模拟盘连接异常"):"未配置模拟盘 API";
+      document.getElementById("autoTradeToggle").checked=!!data.auto_trade;
+      document.getElementById("orderUsdt").value=data.order_usdt||100;
+      document.getElementById("tradeLeverage").value=data.leverage||3;
+      document.getElementById("maxPositions").value=data.max_positions||3;
+      document.getElementById("autoCloseMinutes").value=data.auto_close_minutes||5;
+      document.getElementById("tradeEquity").textContent=data.account_ok?usdt(data.equity):"--";
+      document.getElementById("tradePnl").textContent=data.account_ok?usdt(data.unrealized):"--";
+      document.getElementById("tradePnl").className="value "+(Number(data.unrealized||0)>=0?"up":"down");
+      document.getElementById("tradePositions").textContent=data.account_ok?(data.positions||[]).length:"--";
+      const log=document.getElementById("tradeLog");
+      const events=(data.events||[]).slice(0,8);
+      log.innerHTML=events.length?events.map(e=>`<div class="${e.level==="error"?"down":e.level==="warn"?"":"up"}">${new Date(e.ts).toLocaleTimeString()} · ${esc(e.message)}</div>`).join(""):`<div>${esc(data.message||"等待模拟盘连接。")}</div>`;
+      drawPnlChart(data.equity_curve||[]);
+    }
+    async function loadTestnetStatus(){
+      try{ const res=await fetch("/api/testnet/status"); renderTestnetStatus(await res.json()); }
+      catch(err){ document.getElementById("tradeConnNote").textContent="模拟盘状态读取失败"; drawPnlChart([]); }
+    }
+    async function saveTestnetConfig(){
+      const payload={
+        auto_trade:document.getElementById("autoTradeToggle").checked,
+        order_usdt:Number(document.getElementById("orderUsdt").value||100),
+        leverage:Number(document.getElementById("tradeLeverage").value||3),
+        max_positions:Number(document.getElementById("maxPositions").value||3),
+        auto_close_minutes:Number(document.getElementById("autoCloseMinutes").value||5),
+      };
+      const key=document.getElementById("testnetKey").value.trim();
+      const secret=document.getElementById("testnetSecret").value.trim();
+      if(key)payload.api_key=key;
+      if(secret)payload.api_secret=secret;
+      const btn=document.getElementById("saveTradeCfg");
+      btn.disabled=true; btn.textContent="保存中";
+      try{
+        const res=await fetch("/api/testnet/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+        renderTestnetStatus(await res.json());
+        document.getElementById("testnetSecret").value="";
+      }catch(err){ document.getElementById("tradeConnNote").textContent="保存失败："+err; }
+      finally{ btn.disabled=false; btn.textContent="保存连接"; }
+    }
+
     function loadSignalStats(){
       fetch("/api/signal/stats").then(r=>r.json()).then(data=>{
         const el=document.getElementById("statsPanel");
@@ -682,11 +1092,22 @@ HTML = r"""
     async function start(){ state.runId++; const runId=state.runId; closeSockets(); await refreshMarketUniverse(); connectPrice(runId); connectTrades(runId); connectLiquidations(runId); fetchKlines(); fetchDerivatives(); if(!state.marketTimer)state.marketTimer=setInterval(refreshMarketUniverse,60*1000); if(!state.derivativesTimer)state.derivativesTimer=setInterval(fetchDerivatives,45*1000); if(!state.klineTimer)state.klineTimer=setInterval(fetchKlines,60*1000); render(); renderEvents(); }
     document.getElementById("refresh").addEventListener("click",start);
     document.getElementById("aiBtn").addEventListener("click",runAi);
+    document.getElementById("saveTradeCfg").addEventListener("click",saveTestnetConfig);
+    document.getElementById("radarBody").addEventListener("click",e=>{
+      const btn=e.target.closest(".detail-btn");
+      if(!btn)return;
+      const symbol=btn.dataset.symbol;
+      if(state.expanded.has(symbol))state.expanded.delete(symbol); else state.expanded.add(symbol);
+      render();
+    });
     document.getElementById("search").addEventListener("input",render);
     document.getElementById("filters").addEventListener("click",e=>{ if(!e.target.dataset.filter)return; state.activeFilter=e.target.dataset.filter; document.querySelectorAll("#filters button").forEach(btn=>btn.classList.toggle("active",btn.dataset.filter===state.activeFilter)); render(); });
     setInterval(()=>{ trimOld(); render(); renderEvents(); logSignals(); },1000);
     setInterval(loadSignalStats,2*60*1000);
+    setInterval(loadTestnetStatus,5000);
     setTimeout(loadSignalStats,5000);
+    setTimeout(loadTestnetStatus,1000);
+    window.addEventListener("resize",()=>drawPnlChart((state.testnet&&state.testnet.equity_curve)||[]));
     start();
   </script>
 </body>
@@ -726,6 +1147,7 @@ def health():
         "hold_minutes": HOLD_MINUTES,
         "binance_ws_bases": BINANCE_WS_BASES,
         "binance_rest_bases": BINANCE_REST_BASES,
+        "binance_testnet_rest": BINANCE_TESTNET_REST,
     })
 
 
@@ -737,6 +1159,7 @@ def signal_log():
     for row in rows:
         log_signal(row)
     fill_prices(prices)
+    _auto_trade_signals(rows, prices)
     return jsonify({"ok": True, "logged": len(rows)})
 
 
@@ -749,6 +1172,37 @@ def signal_stats():
 def signal_recent():
     limit = min(int(request.args.get("limit", 50)), 200)
     return jsonify(get_recent(limit))
+
+
+@app.get("/api/testnet/status")
+def testnet_status():
+    return jsonify(_public_testnet_status())
+
+
+@app.post("/api/testnet/config")
+def testnet_config():
+    payload = request.get_json(silent=True) or {}
+    with _trade_lock:
+        if "api_key" in payload:
+            _testnet_config["api_key"] = str(payload.get("api_key") or "").strip()
+        if payload.get("api_secret"):
+            _testnet_config["api_secret"] = str(payload.get("api_secret") or "").strip()
+        if "auto_trade" in payload:
+            _testnet_config["auto_trade"] = bool(payload.get("auto_trade"))
+        for key, cast, default in [
+            ("order_usdt", float, TESTNET_ORDER_USDT),
+            ("leverage", int, TESTNET_LEVERAGE),
+            ("max_positions", int, TESTNET_MAX_POSITIONS),
+            ("cooldown_seconds", int, TESTNET_COOLDOWN_SECONDS),
+            ("auto_close_minutes", float, TESTNET_AUTO_CLOSE_MINUTES),
+        ]:
+            if key in payload:
+                try:
+                    _testnet_config[key] = max(1, cast(payload.get(key)))
+                except (TypeError, ValueError):
+                    _testnet_config[key] = default
+        _event("模拟盘配置已更新", "info")
+    return jsonify(_public_testnet_status())
 
 
 @app.post("/api/ai/analyze")
