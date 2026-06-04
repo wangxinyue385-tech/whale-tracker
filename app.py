@@ -78,18 +78,18 @@ AI_MODEL = os.environ.get("AI_MODEL") or ("deepseek-chat" if os.environ.get("DEE
 
 BINANCE_TESTNET_REST = os.environ.get("BINANCE_TESTNET_REST", "https://demo-fapi.binance.com").rstrip("/")
 TESTNET_AUTO_CLOSE_MINUTES = float(os.environ.get("TESTNET_AUTO_CLOSE_MINUTES", "5"))
-TESTNET_ORDER_USDT = float(os.environ.get("TESTNET_ORDER_USDT", "100"))
-TESTNET_LEVERAGE = int(os.environ.get("TESTNET_LEVERAGE", "3"))
-TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "3"))
+TESTNET_ORDER_USDT = float(os.environ.get("TESTNET_ORDER_USDT", "10"))
+TESTNET_LEVERAGE = int(os.environ.get("TESTNET_LEVERAGE", "4"))
+TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "10"))
 TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "300"))
-PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "10000"))
+PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "100"))
 
 _trade_lock = threading.Lock()
 _testnet_config = {
     "execution_mode": os.environ.get("EXECUTION_MODE", "paper"),
     "api_key": os.environ.get("BINANCE_TESTNET_API_KEY", ""),
     "api_secret": os.environ.get("BINANCE_TESTNET_API_SECRET", ""),
-    "auto_trade": os.environ.get("TESTNET_AUTO_TRADE", "0") == "1",
+    "auto_trade": os.environ.get("TESTNET_AUTO_TRADE", "1") == "1",
     "order_usdt": TESTNET_ORDER_USDT,
     "leverage": TESTNET_LEVERAGE,
     "max_positions": TESTNET_MAX_POSITIONS,
@@ -213,6 +213,14 @@ def _remember_prices(prices: dict[str, float] | None) -> None:
             _last_prices[str(symbol)] = price
 
 
+def _order_margin_usdt() -> float:
+    return max(1.0, float(_testnet_config["order_usdt"]))
+
+
+def _order_notional_usdt() -> float:
+    return _order_margin_usdt() * max(1, int(_testnet_config["leverage"]))
+
+
 def _paper_mark_price(symbol: str, fallback: float = 0) -> float:
     return float(_last_prices.get(symbol) or fallback or 0)
 
@@ -245,7 +253,8 @@ def _paper_place_market_order(symbol: str, follow: str, price: float) -> dict:
         price = _paper_mark_price(symbol)
     if price <= 0:
         raise RuntimeError(f"{symbol} 没有可用价格")
-    notional = float(_testnet_config["order_usdt"])
+    margin = _order_margin_usdt()
+    notional = _order_notional_usdt()
     qty = notional / price
     amount = qty if follow == "FOLLOW_LONG" else -qty
     order_id = uuid.uuid4().hex[:12]
@@ -253,6 +262,8 @@ def _paper_place_market_order(symbol: str, follow: str, price: float) -> dict:
         "symbol": symbol,
         "amount": amount,
         "entry_price": price,
+        "margin": margin,
+        "notional": notional,
         "opened_at": int(time.time() * 1000),
         "order_id": order_id,
         "follow": follow,
@@ -287,7 +298,7 @@ def _place_market_order(symbol: str, follow: str, price: float) -> dict:
         price = float(ticker.get("price") or 0)
     if price <= 0:
         raise RuntimeError(f"{symbol} 没有可用价格")
-    qty = _round_qty(symbol, float(_testnet_config["order_usdt"]) / price)
+    qty = _round_qty(symbol, _order_notional_usdt() / price)
     params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": qty}
     return _signed_testnet_request("POST", "/fapi/v1/order", params)
 
@@ -710,21 +721,21 @@ HTML = r"""
               <div class="panel-title">模拟盘自动下单</div>
               <div class="panel-note" id="tradeConnNote">未连接模拟盘</div>
             </div>
-            <button class="ai-btn" id="saveTradeCfg">保存</button>
+            <button class="ai-btn" id="saveTradeCfg">保存连接</button>
           </div>
           <div class="trade-form">
             <label class="wide">执行模式<select id="executionMode"><option value="paper">本地模拟盘（不用 API）</option><option value="binance_testnet">Binance Futures Testnet</option></select></label>
             <label class="wide">模拟盘 API Key<input id="testnetKey" autocomplete="off" type="password" placeholder="第一次必填；保存后不会显示"></label>
             <label class="wide">模拟盘 Secret<input id="testnetSecret" autocomplete="off" type="password" placeholder="第一次必填；以后不改可留空"></label>
             <div class="api-help" id="apiHelp">本地模拟盘不需要 API Key。切到 Binance Futures Testnet 时，第一次连接必须同时填 API Key 和 Secret，不要填实盘 Key。</div>
-            <label>每笔 USDT<input id="orderUsdt" type="number" min="1" step="1" value="100"></label>
-            <label>杠杆<input id="tradeLeverage" type="number" min="1" max="20" step="1" value="3"></label>
-            <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="3"></label>
+            <label>每仓保证金 USDT<input id="orderUsdt" type="number" min="1" step="1" value="10"></label>
+            <label>杠杆<input id="tradeLeverage" type="number" min="1" max="20" step="1" value="4"></label>
+            <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="10"></label>
             <label>平仓分钟<input id="autoCloseMinutes" type="number" min="1" step="1" value="5"></label>
           </div>
           <div class="trade-actions">
             <label class="toggle"><input id="autoTradeToggle" type="checkbox">FOLLOW 自动下单</label>
-            <span class="panel-note">仅 Testnet</span>
+            <span class="panel-note" id="tradeModeNote">本地模拟盘 / Testnet</span>
           </div>
           <div class="trade-status">
             <div class="mini-stat"><div class="label">权益</div><div class="value" id="tradeEquity">--</div></div>
@@ -793,6 +804,7 @@ HTML = r"""
       prices:new Map(), priceHistory:new Map(), trades:new Map(), liquidations:new Map(), events:[],
       sockets:[], runId:0, activeFilter:"all",
       expanded:new Set(), testnet:null,
+      tradeFormDirty:false, savingTradeConfig:false,
       priceConnected:false, tradeConnected:false, liqConnected:false,
       priceError:"", tradeError:"", liqError:"", restError:"",
       priceMessages:0, tradeMessages:0, liqMessages:0, derivativesUpdatedAt:0,
@@ -1228,22 +1240,36 @@ HTML = r"""
       if(left)left.textContent=`起始 ${usdt(first)} · 当前 ${usdt(last)}`;
       if(right){ right.textContent=`收益 ${pnl>=0?"+":""}${usdt(pnl)}`; right.className=pnl>=0?"up":"down"; }
     }
-    function renderTestnetStatus(data){
+    function updateExecutionModeUi(mode){
+      const isPaper=(mode||"paper")==="paper";
+      document.getElementById("apiHelp").textContent=isPaper
+        ?"本地模拟盘不需要 API Key。打开 FOLLOW 自动下单后，策略信号会在本机模拟成交。默认本金 $100，每仓保证金 $10，4x，最多 10 仓。"
+        :"Binance Testnet 需要 Futures Testnet / Demo Trading 的 API Key 和 Secret，不要填实盘 Key。";
+      document.getElementById("tradeModeNote").textContent=isPaper?"本地模拟盘收益测试":"Binance Futures Testnet";
+      document.getElementById("testnetKey").disabled=false;
+      document.getElementById("testnetSecret").disabled=false;
+    }
+    function syncTradeForm(data, force=false){
+      const active=document.activeElement;
+      const editing=!!(active&&active.closest&&active.closest(".trade-form,.trade-actions"));
+      if(!force&&(state.tradeFormDirty||state.savingTradeConfig||editing))return;
+      const mode=(data.execution_mode||"paper")==="paper"?"paper":"binance_testnet";
+      document.getElementById("executionMode").value=mode;
+      document.getElementById("autoTradeToggle").checked=!!data.auto_trade;
+      document.getElementById("testnetKey").placeholder=data.has_api_key?"已保存；留空不修改":"第一次必填；保存后不会显示";
+      document.getElementById("testnetSecret").placeholder=data.has_api_secret?"已保存；留空不修改":"第一次必填；以后不改可留空";
+      document.getElementById("orderUsdt").value=data.order_usdt||10;
+      document.getElementById("tradeLeverage").value=data.leverage||4;
+      document.getElementById("maxPositions").value=data.max_positions||10;
+      document.getElementById("autoCloseMinutes").value=data.auto_close_minutes||5;
+      updateExecutionModeUi(mode);
+    }
+    function renderTestnetStatus(data, forceForm=false){
       state.testnet=data;
       const note=document.getElementById("tradeConnNote");
       const isPaper=(data.execution_mode||"paper")==="paper";
       note.textContent=data.account_ok?(isPaper?"本地模拟盘已连接":"Binance Testnet 已连接"):(data.message||"未配置模拟盘 API");
-      document.getElementById("executionMode").value=isPaper?"paper":"binance_testnet";
-      document.getElementById("apiHelp").textContent=isPaper?"本地模拟盘不需要 API Key。打开 FOLLOW 自动下单后，策略信号会在本机模拟成交。":"Binance Testnet 需要 Futures Testnet / Demo Trading 的 API Key 和 Secret，不要填实盘 Key。";
-      document.getElementById("autoTradeToggle").checked=!!data.auto_trade;
-      document.getElementById("testnetKey").placeholder=data.has_api_key?"已保存；留空不修改":"第一次必填；保存后不会显示";
-      document.getElementById("testnetSecret").placeholder=data.has_api_secret?"已保存；留空不修改":"第一次必填；以后不改可留空";
-      document.getElementById("testnetKey").disabled=isPaper;
-      document.getElementById("testnetSecret").disabled=isPaper;
-      document.getElementById("orderUsdt").value=data.order_usdt||100;
-      document.getElementById("tradeLeverage").value=data.leverage||3;
-      document.getElementById("maxPositions").value=data.max_positions||3;
-      document.getElementById("autoCloseMinutes").value=data.auto_close_minutes||5;
+      syncTradeForm(data, forceForm);
       document.getElementById("tradeEquity").textContent=data.account_ok?usdt(data.equity):"--";
       document.getElementById("tradePnl").textContent=data.account_ok?usdt(data.unrealized):"--";
       document.getElementById("tradePnl").className="value "+(Number(data.unrealized||0)>=0?"up":"down");
@@ -1261,9 +1287,9 @@ HTML = r"""
       const payload={
         execution_mode:document.getElementById("executionMode").value,
         auto_trade:document.getElementById("autoTradeToggle").checked,
-        order_usdt:Number(document.getElementById("orderUsdt").value||100),
-        leverage:Number(document.getElementById("tradeLeverage").value||3),
-        max_positions:Number(document.getElementById("maxPositions").value||3),
+        order_usdt:Number(document.getElementById("orderUsdt").value||10),
+        leverage:Number(document.getElementById("tradeLeverage").value||4),
+        max_positions:Number(document.getElementById("maxPositions").value||10),
         auto_close_minutes:Number(document.getElementById("autoCloseMinutes").value||5),
       };
       const key=document.getElementById("testnetKey").value.trim();
@@ -1271,14 +1297,24 @@ HTML = r"""
       if(key)payload.api_key=key;
       if(secret)payload.api_secret=secret;
       const btn=document.getElementById("saveTradeCfg");
+      state.savingTradeConfig=true;
       btn.disabled=true; btn.textContent="保存中";
       try{
         const res=await fetch("/api/testnet/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-        renderTestnetStatus(await res.json());
+        const data=await res.json();
+        state.tradeFormDirty=false;
+        renderTestnetStatus(data,true);
         document.getElementById("testnetKey").value="";
         document.getElementById("testnetSecret").value="";
       }catch(err){ document.getElementById("tradeConnNote").textContent="保存失败："+err; }
-      finally{ btn.disabled=false; btn.textContent="保存连接"; }
+      finally{ state.savingTradeConfig=false; btn.disabled=false; btn.textContent="保存连接"; }
+    }
+    function markTradeFormDirty(){
+      state.tradeFormDirty=true;
+    }
+    function handleExecutionModeChange(){
+      markTradeFormDirty();
+      updateExecutionModeUi(document.getElementById("executionMode").value);
     }
 
     function loadSignalStats(){
@@ -1310,6 +1346,11 @@ HTML = r"""
     document.getElementById("refresh").addEventListener("click",start);
     document.getElementById("aiBtn").addEventListener("click",runAi);
     document.getElementById("saveTradeCfg").addEventListener("click",saveTestnetConfig);
+    document.getElementById("executionMode").addEventListener("change",handleExecutionModeChange);
+    document.getElementById("autoTradeToggle").addEventListener("change",()=>{ markTradeFormDirty(); saveTestnetConfig(); });
+    for(const id of ["testnetKey","testnetSecret","orderUsdt","tradeLeverage","maxPositions","autoCloseMinutes"]){
+      document.getElementById(id).addEventListener("input",markTradeFormDirty);
+    }
     const oldRadarBody=document.getElementById("radarBody");
     if(oldRadarBody)oldRadarBody.addEventListener("click",e=>{
       const btn=e.target.closest(".detail-btn");
