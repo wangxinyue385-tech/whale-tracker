@@ -83,6 +83,13 @@ TESTNET_LEVERAGE = int(os.environ.get("TESTNET_LEVERAGE", "4"))
 TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "10"))
 TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "300"))
 PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "100"))
+EXIT_MIN_HOLD_SECONDS = int(os.environ.get("EXIT_MIN_HOLD_SECONDS", "15"))
+EXIT_PROFIT_ARM_PCT = float(os.environ.get("EXIT_PROFIT_ARM_PCT", "2.0"))
+EXIT_TRAIL_KEEP_RATIO = float(os.environ.get("EXIT_TRAIL_KEEP_RATIO", "0.50"))
+EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-4.0"))
+EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "75"))
+EXIT_STALL_MIN_PEAK_PCT = float(os.environ.get("EXIT_STALL_MIN_PEAK_PCT", "1.0"))
+EXIT_REVERSE_SCORE = float(os.environ.get("EXIT_REVERSE_SCORE", "70"))
 
 _trade_lock = threading.Lock()
 _testnet_config = {
@@ -102,6 +109,7 @@ _trade_events: list[dict] = []
 _equity_curve: list[dict] = []
 _exchange_cache = {"ts": 0.0, "symbols": {}}
 _last_prices: dict[str, float] = {}
+_market_snapshots: dict[str, dict] = {}
 _paper_cash = PAPER_STARTING_BALANCE
 _paper_positions: dict[str, dict] = {}
 
@@ -213,6 +221,39 @@ def _remember_prices(prices: dict[str, float] | None) -> None:
             _last_prices[str(symbol)] = price
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number == number else default
+
+
+def _update_market_snapshots(rows: list[dict] | None) -> None:
+    now_ms = int(time.time() * 1000)
+    for row in rows or []:
+        symbol = str(row.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        _market_snapshots[symbol] = {
+            "ts": now_ms,
+            "symbol": symbol,
+            "follow": row.get("follow"),
+            "signal": row.get("signal"),
+            "score": _safe_float(row.get("score")),
+            "price": _safe_float(row.get("price")),
+            "price_1m_pct": _safe_float(row.get("price_1m_pct")),
+            "price_5m_pct": _safe_float(row.get("price_5m_pct")),
+            "net_60s_usd": _safe_float(row.get("net_60s_usd")),
+            "net_5m_usd": _safe_float(row.get("net_5m_usd")),
+            "risks": row.get("risks") or [],
+        }
+    cutoff = now_ms - 10 * 60 * 1000
+    for symbol, row in list(_market_snapshots.items()):
+        if int(row.get("ts") or 0) < cutoff:
+            _market_snapshots.pop(symbol, None)
+
+
 def _order_margin_usdt() -> float:
     return max(1.0, float(_testnet_config["order_usdt"]))
 
@@ -239,6 +280,8 @@ def _paper_account_snapshot() -> dict:
             "amount": amount,
             "entry_price": entry,
             "mark_price": mark,
+            "margin": float(pos.get("margin") or _order_margin_usdt()),
+            "notional": float(pos.get("notional") or abs(amount) * entry),
             "unrealized": pnl,
         })
     equity = _paper_cash + unrealized
@@ -315,37 +358,122 @@ def _close_position(symbol: str, amount: float) -> dict:
     })
 
 
+def _position_margin(symbol: str, pos: dict, meta: dict) -> float:
+    margin = _safe_float(pos.get("margin")) or _safe_float(meta.get("margin"))
+    if margin > 0:
+        return margin
+    entry = _safe_float(pos.get("entry_price")) or _safe_float(meta.get("entry_price"))
+    amount = abs(_safe_float(pos.get("amount")))
+    leverage = max(1, int(_testnet_config["leverage"]))
+    return max(1.0, amount * entry / leverage)
+
+
+def _position_pnl_pct(symbol: str, pos: dict, meta: dict) -> tuple[float, float]:
+    pnl = _safe_float(pos.get("unrealized"))
+    margin = _position_margin(symbol, pos, meta)
+    return pnl, pnl / margin * 100
+
+
+def _position_side(pos: dict, meta: dict) -> str:
+    amount = _safe_float(pos.get("amount"))
+    if amount > 0:
+        return "LONG"
+    if amount < 0:
+        return "SHORT"
+    follow = str(meta.get("follow") or "")
+    return "LONG" if follow == "FOLLOW_LONG" else "SHORT"
+
+
+def _is_reverse_snapshot(side: str, snap: dict) -> bool:
+    follow = snap.get("follow")
+    signal = snap.get("signal")
+    score = _safe_float(snap.get("score"))
+    net_5m = _safe_float(snap.get("net_5m_usd"))
+    if side == "LONG":
+        return follow == "FOLLOW_SHORT" or (signal == "SHORT" and score >= EXIT_REVERSE_SCORE) or (net_5m < 0 and score >= EXIT_REVERSE_SCORE)
+    return follow == "FOLLOW_LONG" or (signal == "LONG" and score >= EXIT_REVERSE_SCORE) or (net_5m > 0 and score >= EXIT_REVERSE_SCORE)
+
+
+def _same_direction_still_valid(side: str, snap: dict) -> bool:
+    follow = snap.get("follow")
+    signal = snap.get("signal")
+    net_5m = _safe_float(snap.get("net_5m_usd"))
+    risks = set(snap.get("risks") or [])
+    if side == "LONG":
+        return follow == "FOLLOW_LONG" or (signal == "LONG" and net_5m > 0 and "净流不连续" not in risks)
+    return follow == "FOLLOW_SHORT" or (signal == "SHORT" and net_5m < 0 and "净流不连续" not in risks)
+
+
+def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
+    opened_at = int(meta.get("opened_at", now_ms))
+    age_ms = now_ms - opened_at
+    pnl, pnl_pct = _position_pnl_pct(symbol, pos, meta)
+    peak_pct = max(_safe_float(meta.get("peak_pnl_pct"), pnl_pct), pnl_pct)
+    peak_pnl = max(_safe_float(meta.get("peak_pnl"), pnl), pnl)
+    meta["peak_pnl_pct"] = peak_pct
+    meta["peak_pnl"] = peak_pnl
+    if pnl_pct >= _safe_float(meta.get("last_favorable_pct"), -999):
+        meta["last_favorable_pct"] = pnl_pct
+        meta["last_favorable_at"] = now_ms
+
+    if pnl_pct <= EXIT_HARD_STOP_PCT:
+        return f"止损平仓 {pnl_pct:.2f}%"
+
+    if age_ms < EXIT_MIN_HOLD_SECONDS * 1000:
+        return None
+
+    if peak_pct >= EXIT_PROFIT_ARM_PCT and pnl_pct <= max(0.0, peak_pct * EXIT_TRAIL_KEEP_RATIO):
+        return f"移动止盈平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
+
+    snap = _market_snapshots.get(symbol) or {}
+    side = _position_side(pos, meta)
+    if snap and _is_reverse_snapshot(side, snap):
+        return "反向资金/信号平仓"
+
+    if age_ms >= EXIT_STALL_SECONDS * 1000 and peak_pct < EXIT_STALL_MIN_PEAK_PCT:
+        return f"走势未延续平仓，最高浮盈 {peak_pct:.2f}%"
+
+    if age_ms >= EXIT_STALL_SECONDS * 1000 and snap and not _same_direction_still_valid(side, snap) and pnl_pct <= 0:
+        return "信号走弱且未盈利平仓"
+
+    close_ms = float(_testnet_config["auto_close_minutes"]) * 60 * 1000
+    if age_ms >= close_ms:
+        return "到时自动平仓"
+
+    return None
+
+
 def _close_due_positions(account: dict | None = None) -> None:
     if not _is_paper_mode() and (not _testnet_config.get("api_key") or not _testnet_config.get("api_secret")):
         return
     account = account or (_paper_account_snapshot() if _is_paper_mode() else _account_snapshot())
     positions = _position_map(account)
     now_ms = int(time.time() * 1000)
-    close_ms = float(_testnet_config["auto_close_minutes"]) * 60 * 1000
     for symbol, meta in list(_auto_positions.items()):
-        if now_ms - int(meta.get("opened_at", now_ms)) < close_ms:
-            continue
         pos = positions.get(symbol)
         if not pos:
             _auto_positions.pop(symbol, None)
             continue
+        reason = _exit_reason(symbol, pos, meta, now_ms)
+        if not reason:
+            continue
         try:
             if _is_paper_mode():
-                _paper_close_position(symbol, float(pos["amount"]))
+                order = _paper_close_position(symbol, float(pos["amount"]))
             else:
-                _close_position(symbol, float(pos["amount"]))
-            _event(f"{symbol} 到时自动平仓", "info", symbol=symbol)
+                order = _close_position(symbol, float(pos["amount"]))
+            realized = _safe_float(order.get("realizedPnl")) if isinstance(order, dict) else 0.0
+            extra = f" · 已实现 {realized:+.2f} USDT" if realized else ""
+            _event(f"{symbol} {reason}{extra}", "info", symbol=symbol, order=order)
             _auto_positions.pop(symbol, None)
         except Exception as exc:  # noqa: BLE001
             _event(f"{symbol} 自动平仓失败：{exc}", "error", symbol=symbol)
 
 
-def _auto_trade_signals(rows: list[dict], prices: dict[str, float]) -> None:
-    if not _testnet_config.get("auto_trade"):
-        return
+def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows: list[dict] | None = None) -> None:
     _remember_prices(prices)
-    rows = [row for row in rows if row.get("follow") in {"FOLLOW_LONG", "FOLLOW_SHORT"}]
-    if not rows:
+    _update_market_snapshots(market_rows)
+    if not _testnet_config.get("auto_trade"):
         return
     if not _is_paper_mode() and (not _testnet_config.get("api_key") or not _testnet_config.get("api_secret")):
         _event("自动下单已开启，但模拟盘 API 未配置", "warn")
@@ -356,6 +484,9 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float]) -> None:
         positions = _position_map(_paper_account_snapshot() if _is_paper_mode() else _account_snapshot())
         open_count = len(positions)
         now_ms = int(time.time() * 1000)
+        rows = [row for row in rows if row.get("follow") in {"FOLLOW_LONG", "FOLLOW_SHORT"}]
+        if not rows:
+            return
         for row in rows:
             symbol = str(row.get("symbol") or "")
             follow = row.get("follow")
@@ -378,7 +509,18 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float]) -> None:
                     _set_leverage(symbol)
                     order = _place_market_order(symbol, follow, price)
                 _trade_cooldown[cooldown_key] = now_ms
-                _auto_positions[symbol] = {"follow": follow, "opened_at": now_ms, "order_id": order.get("orderId")}
+                _auto_positions[symbol] = {
+                    "follow": follow,
+                    "opened_at": now_ms,
+                    "order_id": order.get("orderId"),
+                    "entry_price": price,
+                    "margin": _order_margin_usdt(),
+                    "notional": _order_notional_usdt(),
+                    "peak_pnl": 0.0,
+                    "peak_pnl_pct": 0.0,
+                    "last_favorable_pct": 0.0,
+                    "last_favorable_at": now_ms,
+                }
                 open_count += 1
                 mode = "本地模拟盘" if _is_paper_mode() else "Binance Testnet"
                 _event(f"{symbol} {('做多' if follow == 'FOLLOW_LONG' else '做空')} {mode}自动下单", "info", symbol=symbol, order=order)
@@ -1179,6 +1321,13 @@ HTML = r"""
         return true;
       });
       if(!toLog.length&&Object.keys(prices).length<1)return;
+      const positionSymbols=new Set(((state.testnet&&state.testnet.positions)||[]).map(p=>p.symbol));
+      const marketRows=all.filter((r,i)=>i<90||positionSymbols.has(r.symbol)||r.follow==="FOLLOW_LONG"||r.follow==="FOLLOW_SHORT").map(r=>({
+        symbol:r.symbol, follow:r.follow, signal:r.signal, score:r.score, price:r.price,
+        price_1m_pct:r.p1, price_5m_pct:r.p5,
+        net_60s_usd:Math.round(r.f60.net), net_5m_usd:Math.round(r.f5.net),
+        risks:r.risks,
+      }));
       const payload=toLog.map(r=>({
         symbol:r.symbol, follow:r.follow, score:r.score, price:r.price,
         price_1m_pct:r.p1, price_5m_pct:r.p5,
@@ -1206,7 +1355,7 @@ HTML = r"""
         funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),
         risks:r.risks, reasons:r.reasons,
       }));
-      fetch("/api/signal/log",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({rows:payload,prices})}).catch(()=>{});
+      fetch("/api/signal/log",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({rows:payload,prices,market_rows:marketRows})}).catch(()=>{});
     }
 
     function esc(value){ return String(value??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m])); }
@@ -1415,10 +1564,11 @@ def signal_log():
     payload = request.get_json(silent=True) or {}
     rows = payload.get("rows") or []
     prices = payload.get("prices") or {}
+    market_rows = payload.get("market_rows") or []
     for row in rows:
         log_signal(row)
     fill_prices(prices)
-    _auto_trade_signals(rows, prices)
+    _auto_trade_signals(rows, prices, market_rows)
     return jsonify({"ok": True, "logged": len(rows)})
 
 
