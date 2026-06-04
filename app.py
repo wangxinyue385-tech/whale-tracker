@@ -421,7 +421,7 @@ HTML = r"""
     .dot { width:8px; height:8px; border-radius:50%; background:#a8b2c1; }
     .dot.ok { background:var(--green); box-shadow:0 0 0 3px rgba(8,127,91,.12); }
     .dot.bad { background:var(--red); box-shadow:0 0 0 3px rgba(201,42,42,.12); }
-    .page { max-width:1560px; margin:0 auto; padding:16px 20px 24px; }
+    .page { max-width:1840px; margin:0 auto; padding:12px 20px 22px; }
     .controls { display:grid; grid-template-columns:1fr auto auto; gap:10px; align-items:center; margin-bottom:12px; }
     .search { width:100%; border:1px solid var(--line); background:var(--surface); border-radius:8px; padding:10px 12px; color:var(--text); outline:none; }
     .segmented { display:flex; background:var(--surface); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
@@ -430,24 +430,41 @@ HTML = r"""
     .segmented button.active { color:#fff; background:var(--ink); }
     .refresh,.ai-btn { border:1px solid var(--ink); background:var(--ink); color:#fff; border-radius:8px; padding:9px 13px; cursor:pointer; white-space:nowrap; }
     .ai-btn:disabled { opacity:.55; cursor:wait; }
-    .stats { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; margin-bottom:12px; }
-    .stat { background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:12px; min-height:82px; }
+    .stats { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:8px; margin-bottom:10px; }
+    .stat { background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:9px 11px; min-height:62px; }
     .label { color:var(--muted); font-size:12px; font-weight:750; margin-bottom:8px; }
-    .value { color:var(--ink); font-size:22px; font-weight:900; white-space:nowrap; }
+    .value { color:var(--ink); font-size:19px; font-weight:900; white-space:nowrap; }
     .sub { color:var(--muted); font-size:12px; margin-top:4px; }
     .up { color:var(--green); font-weight:850; }
     .down { color:var(--red); font-weight:850; }
-    .layout { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:12px; align-items:start; }
-    .trade-grid { display:grid; grid-template-columns:420px minmax(0,1fr); gap:12px; margin-bottom:12px; align-items:stretch; }
+    .layout { display:grid; grid-template-columns:minmax(760px,1fr) 420px; gap:12px; align-items:start; }
+    .main-stack { display:grid; gap:10px; min-width:0; }
+    .side-stack { display:grid; gap:10px; position:sticky; top:70px; max-height:calc(100vh - 82px); overflow:auto; padding-bottom:2px; }
+    .trade-grid { display:grid; gap:10px; align-items:start; }
     .panel,.ai-panel { background:var(--surface); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
-    .ai-panel { margin-bottom:12px; }
+    .ai-panel { margin-top:0; }
     .panel-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border-bottom:1px solid var(--line); background:var(--surface2); }
     .panel-title { font-weight:850; }
     .panel-note { color:var(--muted); font-size:12px; }
     .ai-body { padding:12px 14px; font-size:13px; line-height:1.65; white-space:pre-wrap; min-height:92px; }
+    .side-stack .ai-body { min-height:64px; max-height:116px; overflow:auto; }
     .table-wrap { overflow-x:auto; }
-    .table-wrap.compact { overflow-x:visible; }
+    .table-wrap.compact { overflow-x:hidden; }
     table { width:100%; border-collapse:collapse; font-size:12.5px; }
+    .compact table { table-layout:fixed; font-size:12px; }
+    .compact th,.compact td { padding:8px 8px; white-space:normal; }
+    .compact th:nth-child(1){width:11%}
+    .compact th:nth-child(2){width:10%}
+    .compact th:nth-child(3){width:7%}
+    .compact th:nth-child(4){width:14%}
+    .compact th:nth-child(5){width:8%}
+    .compact th:nth-child(6){width:10%}
+    .compact th:nth-child(7){width:11%}
+    .compact th:nth-child(8){width:10%}
+    .compact th:nth-child(9){width:12%}
+    .compact th:nth-child(10){width:7%}
+    .compact .num { white-space:nowrap; }
+    .compact .score { width:48px; height:27px; }
     th { color:var(--muted); text-align:left; font-weight:750; padding:9px 10px; border-bottom:1px solid var(--line); background:#fbfcfe; white-space:nowrap; }
     td { padding:10px; border-bottom:1px solid #edf1f5; vertical-align:middle; white-space:nowrap; }
     tbody tr:hover { background:#f9fbfd; }
@@ -461,13 +478,13 @@ HTML = r"""
     .score { width:52px; height:28px; border-radius:6px; display:inline-grid; place-items:center; color:#fff; background:var(--ink); font-weight:900; }
     .reason { display:flex; gap:5px; flex-wrap:wrap; min-width:230px; white-space:normal; }
     .chip { border:1px solid var(--line); background:var(--surface2); color:var(--text); border-radius:6px; padding:3px 6px; font-size:11px; }
-    .detail-btn { border:1px solid var(--line); background:var(--surface2); color:var(--ink); border-radius:6px; padding:5px 8px; cursor:pointer; font-size:12px; }
+    .detail-btn { border:1px solid var(--line); background:var(--surface2); color:var(--ink); border-radius:6px; padding:5px 7px; cursor:pointer; font-size:12px; white-space:nowrap; }
     .detail-row td { background:#fbfcfe; white-space:normal; padding:0; }
     .detail-box { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; padding:12px 14px; border-bottom:1px solid #edf1f5; }
     .detail-item { min-width:0; }
     .detail-label { color:var(--muted); font-size:11px; margin-bottom:4px; font-weight:750; }
     .detail-value { color:var(--ink); font-size:12px; line-height:1.45; overflow-wrap:anywhere; }
-    .event-list { max-height:760px; overflow:auto; }
+    .event-list { max-height:300px; overflow:auto; }
     .event { display:grid; grid-template-columns:58px 1fr; gap:8px; padding:10px 12px; border-bottom:1px solid #edf1f5; }
     .event-side { font-size:11px; font-weight:900; }
     .event-side.buy { color:var(--green); }
@@ -475,27 +492,28 @@ HTML = r"""
     .event-title { display:flex; justify-content:space-between; gap:8px; font-size:12px; font-weight:850; }
     .event-meta { color:var(--muted); font-size:11px; margin-top:3px; }
     .warn { margin-top:12px; border:1px solid #efd897; background:var(--amber-bg); color:#744b00; border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.55; }
-    .signal-stats { margin-top:12px; background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:14px 16px; font-size:13px; line-height:1.8; color:var(--text); }
+    .signal-stats { margin-top:10px; background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:12px 14px; font-size:13px; line-height:1.7; color:var(--text); }
     .signal-stats strong { color:var(--ink); }
     .win { color:var(--green); font-weight:850; }
     .lose { color:var(--red); font-weight:850; }
-    .trade-form { display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:12px 14px; }
+    .trade-form { display:grid; grid-template-columns:1fr 1fr; gap:7px; padding:10px 12px; }
     .trade-form label { color:var(--muted); font-size:11px; font-weight:750; display:grid; gap:5px; }
-    .trade-form input { width:100%; border:1px solid var(--line); background:var(--surface); border-radius:6px; padding:8px 9px; color:var(--text); min-width:0; }
+    .trade-form input { width:100%; border:1px solid var(--line); background:var(--surface); border-radius:6px; padding:7px 8px; color:var(--text); min-width:0; }
     .trade-form .wide { grid-column:1/-1; }
-    .trade-actions { display:flex; align-items:center; gap:10px; padding:0 14px 12px; flex-wrap:wrap; }
+    .trade-actions { display:flex; align-items:center; gap:8px; padding:0 12px 10px; flex-wrap:wrap; }
     .toggle { display:inline-flex; align-items:center; gap:7px; color:var(--text); font-size:12px; font-weight:800; }
     .toggle input { width:16px; height:16px; }
-    .trade-status { padding:0 14px 14px; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
-    .mini-stat { border:1px solid var(--line); background:var(--surface2); border-radius:6px; padding:8px; min-height:58px; }
+    .trade-status { padding:0 12px 10px; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; }
+    .mini-stat { border:1px solid var(--line); background:var(--surface2); border-radius:6px; padding:7px; min-height:50px; }
     .mini-stat .label { margin-bottom:4px; font-size:11px; }
     .mini-stat .value { font-size:16px; }
-    .trade-log { border-top:1px solid var(--line); max-height:116px; overflow:auto; padding:8px 14px; color:var(--muted); font-size:12px; line-height:1.55; }
+    .trade-log { border-top:1px solid var(--line); max-height:78px; overflow:auto; padding:7px 12px; color:var(--muted); font-size:12px; line-height:1.5; }
     .trade-log div { border-bottom:1px solid #edf1f5; padding:4px 0; }
-    .chart-wrap { padding:12px 14px 14px; height:278px; }
-    #pnlChart { width:100%; height:220px; display:block; border:1px solid var(--line); border-radius:8px; background:#fff; }
+    .chart-wrap { padding:10px 12px 12px; height:176px; }
+    #pnlChart { width:100%; height:124px; display:block; border:1px solid var(--line); border-radius:8px; background:#fff; }
     .chart-meta { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; margin-top:8px; }
-    @media (max-width:1200px) { .trade-grid{grid-template-columns:1fr;} .layout{grid-template-columns:1fr;} .detail-box{grid-template-columns:repeat(2,minmax(0,1fr));} }
+    .api-help { grid-column:1/-1; color:var(--muted); font-size:11px; line-height:1.45; margin-top:-2px; }
+    @media (max-width:1200px) { .layout{grid-template-columns:1fr;} .side-stack{position:static; max-height:none; overflow:visible;} .detail-box{grid-template-columns:repeat(2,minmax(0,1fr));} }
     @media (max-width:720px) { .stats{grid-template-columns:repeat(2,minmax(0,1fr));} .controls{grid-template-columns:1fr;} .segmented{overflow-x:auto;} .statusbar{display:none;} .trade-form,.trade-status,.detail-box{grid-template-columns:1fr;} th.optional,td.optional{display:none;} }
   </style>
 </head>
@@ -528,91 +546,94 @@ HTML = r"""
       <div class="stat"><div class="label">成本门槛</div><div class="value" id="statCost">--</div><div class="sub">费率+滑点+安全垫</div></div>
       <div class="stat"><div class="label">5 分钟爆仓</div><div class="value" id="statLiq">--</div><div class="sub">强平订单流</div></div>
     </section>
-    <section class="trade-grid">
-      <div class="panel">
-        <div class="panel-head">
-          <div>
-            <div class="panel-title">币安模拟盘自动下单</div>
-            <div class="panel-note" id="tradeConnNote">未连接模拟盘</div>
-          </div>
-          <button class="ai-btn" id="saveTradeCfg">保存连接</button>
-        </div>
-        <div class="trade-form">
-          <label class="wide">API Key<input id="testnetKey" autocomplete="off" placeholder="Binance Futures Testnet API Key"></label>
-          <label class="wide">API Secret<input id="testnetSecret" autocomplete="off" type="password" placeholder="留空则不修改 Secret"></label>
-          <label>每笔名义 USDT<input id="orderUsdt" type="number" min="1" step="1" value="100"></label>
-          <label>杠杆<input id="tradeLeverage" type="number" min="1" max="20" step="1" value="3"></label>
-          <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="3"></label>
-          <label>自动平仓分钟<input id="autoCloseMinutes" type="number" min="1" step="1" value="5"></label>
-        </div>
-        <div class="trade-actions">
-          <label class="toggle"><input id="autoTradeToggle" type="checkbox">FOLLOW 信号自动下单</label>
-          <span class="panel-note">只发往 Binance Futures Testnet</span>
-        </div>
-        <div class="trade-status">
-          <div class="mini-stat"><div class="label">权益</div><div class="value" id="tradeEquity">--</div></div>
-          <div class="mini-stat"><div class="label">未实现盈亏</div><div class="value" id="tradePnl">--</div></div>
-          <div class="mini-stat"><div class="label">持仓</div><div class="value" id="tradePositions">--</div></div>
-        </div>
-        <div class="trade-log" id="tradeLog"><div>等待模拟盘连接。</div></div>
-      </div>
-      <div class="panel">
-        <div class="panel-head">
-          <div>
-            <div class="panel-title">实时收益折线图</div>
-            <div class="panel-note">读取模拟盘账户权益和未实现盈亏</div>
-          </div>
-        </div>
-        <div class="chart-wrap">
-          <canvas id="pnlChart"></canvas>
-          <div class="chart-meta"><span id="chartLeft">等待数据</span><span id="chartRight">--</span></div>
-        </div>
-      </div>
-    </section>
-    <section class="ai-panel">
-      <div class="panel-head">
-        <div>
-          <div class="panel-title">AI 跟单分析</div>
-          <div class="panel-note">分析哪里有大资金、是否值得跟，不读取账户，不自动下单</div>
-        </div>
-        <button class="ai-btn" id="aiBtn">分析当前资金流</button>
-      </div>
-      <div class="ai-body" id="aiOutput">等待行情累计 1-2 分钟后点击分析。没有配置 AI Key 时会使用内置规则分析。</div>
-    </section>
     <section class="layout">
-      <div class="panel">
-        <div class="panel-head">
-          <div>
-            <div class="panel-title">大资金流动雷达</div>
-            <div class="panel-note" id="radarNote">自动扫描高成交额 USDT 永续，寻找可跟单资金流</div>
+      <div class="main-stack">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">大资金流动雷达</div>
+              <div class="panel-note" id="radarNote">自动扫描高成交额 USDT 永续，寻找可跟单资金流</div>
+            </div>
+            <div class="panel-note" id="errorNote"></div>
           </div>
-          <div class="panel-note" id="errorNote"></div>
+          <div class="table-wrap compact">
+            <table>
+              <thead>
+                <tr>
+                  <th>交易对</th><th>判断</th><th>分数</th><th>5m预测</th><th>净边际</th><th>价格</th><th>1m/5m</th><th>5m净流</th><th>风险</th><th>详情</th>
+                </tr>
+              </thead>
+              <tbody id="radarBody"><tr><td colspan="10">正在连接 Binance...</td></tr></tbody>
+            </table>
+          </div>
         </div>
-        <div class="table-wrap compact">
-          <table>
-            <thead>
-              <tr>
-                <th>交易对</th><th>判断</th><th>分数</th><th>5m预测</th><th>净边际</th><th>价格</th><th>1m/5m</th><th>5m净流</th><th>风险</th><th>详情</th>
-              </tr>
-            </thead>
-            <tbody id="radarBody"><tr><td colspan="10">正在连接 Binance...</td></tr></tbody>
-          </table>
+        <div class="signal-stats" id="statsPanel">信号统计加载中...</div>
+        <div class="warn">
+          这个工具用于发现大资金流动和缩小观察范围，不构成投资建议。“策略信号”只有在预测空间大于手续费、滑点、资金费风险和安全垫时才会出现；它仍然只是盯盘候选，不代表可以无脑追单。
         </div>
       </div>
-      <aside class="panel">
-        <div class="panel-head">
-          <div>
-            <div class="panel-title">实时大单与爆仓</div>
-            <div class="panel-note">达到动态阈值后进入事件流</div>
+      <aside class="side-stack">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">模拟盘自动下单</div>
+              <div class="panel-note" id="tradeConnNote">未连接模拟盘</div>
+            </div>
+            <button class="ai-btn" id="saveTradeCfg">保存</button>
+          </div>
+          <div class="trade-form">
+            <label class="wide">模拟盘 API Key<input id="testnetKey" autocomplete="off" placeholder="从 demo.binance.com 创建后粘贴"></label>
+            <label class="wide">模拟盘 Secret<input id="testnetSecret" autocomplete="off" type="password" placeholder="第一次必填；以后不改可留空"></label>
+            <div class="api-help">只填 Binance Futures Testnet / Demo Trading 的 Key，不要填实盘 Key。</div>
+            <label>每笔 USDT<input id="orderUsdt" type="number" min="1" step="1" value="100"></label>
+            <label>杠杆<input id="tradeLeverage" type="number" min="1" max="20" step="1" value="3"></label>
+            <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="3"></label>
+            <label>平仓分钟<input id="autoCloseMinutes" type="number" min="1" step="1" value="5"></label>
+          </div>
+          <div class="trade-actions">
+            <label class="toggle"><input id="autoTradeToggle" type="checkbox">FOLLOW 自动下单</label>
+            <span class="panel-note">仅 Testnet</span>
+          </div>
+          <div class="trade-status">
+            <div class="mini-stat"><div class="label">权益</div><div class="value" id="tradeEquity">--</div></div>
+            <div class="mini-stat"><div class="label">盈亏</div><div class="value" id="tradePnl">--</div></div>
+            <div class="mini-stat"><div class="label">持仓</div><div class="value" id="tradePositions">--</div></div>
+          </div>
+          <div class="trade-log" id="tradeLog"><div>等待模拟盘连接。</div></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">收益曲线</div>
+              <div class="panel-note">模拟盘账户权益</div>
+            </div>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="pnlChart"></canvas>
+            <div class="chart-meta"><span id="chartLeft">等待数据</span><span id="chartRight">--</span></div>
           </div>
         </div>
-        <div class="event-list" id="eventList"></div>
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">实时大单与爆仓</div>
+              <div class="panel-note">达到动态阈值后进入事件流</div>
+            </div>
+          </div>
+          <div class="event-list" id="eventList"></div>
+        </div>
+        <section class="ai-panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">AI 跟单分析</div>
+              <div class="panel-note">可选辅助分析</div>
+            </div>
+            <button class="ai-btn" id="aiBtn">分析</button>
+          </div>
+          <div class="ai-body" id="aiOutput">等待行情累计后点击分析。没有配置 AI Key 时会使用内置规则分析。</div>
+        </section>
       </aside>
     </section>
-    <div class="warn">
-      这个工具用于发现大资金流动和缩小观察范围，不构成投资建议。“策略信号”只有在预测空间大于手续费、滑点、资金费风险和安全垫时才会出现；它仍然只是盯盘候选，不代表可以无脑追单。
-    </div>
-    <div class="signal-stats" id="statsPanel">信号统计加载中...</div>
   </main>
   <script>
     const SEED_SYMBOLS = __SEED_SYMBOLS__;
