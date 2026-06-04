@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 from flask import Flask, jsonify, render_template_string, request
-from signal_logger import init_db, log_signal, fill_prices, get_stats, get_recent
+from signal_logger import fill_prices, get_recent, get_stats, init_db, log_signal
 
 
 app = Flask(__name__)
@@ -227,8 +227,8 @@ HTML = r"""
     .warn { margin-top:12px; border:1px solid #efd897; background:var(--amber-bg); color:#744b00; border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.55; }
     .signal-stats { margin-top:12px; background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:14px 16px; font-size:13px; line-height:1.8; color:var(--text); }
     .signal-stats strong { color:var(--ink); }
-    .win  { color:var(--green); font-weight:850; }
-    .lose { color:var(--red);   font-weight:850; }
+    .win { color:var(--green); font-weight:850; }
+    .lose { color:var(--red); font-weight:850; }
     @media (max-width:1100px) { .layout{grid-template-columns:1fr;} .stats{grid-template-columns:repeat(2,minmax(0,1fr));} .controls{grid-template-columns:1fr;} .segmented{overflow-x:auto;} .statusbar{display:none;} }
   </style>
 </head>
@@ -302,10 +302,10 @@ HTML = r"""
         <div class="event-list" id="eventList"></div>
       </aside>
     </section>
-    <div class="signal-stats" id="statsPanel">信号统计加载中...</div>
     <div class="warn">
-      这个工具用于发现大资金流动和缩小观察范围，不构成投资建议。"策略信号"只有在预测空间大于手续费、滑点、资金费风险和安全垫时才会出现；它仍然只是盯盘候选，不代表可以无脑追单。
+      这个工具用于发现大资金流动和缩小观察范围，不构成投资建议。“策略信号”只有在预测空间大于手续费、滑点、资金费风险和安全垫时才会出现；它仍然只是盯盘候选，不代表可以无脑追单。
     </div>
+    <div class="signal-stats" id="statsPanel">信号统计加载中...</div>
   </main>
   <script>
     const SEED_SYMBOLS = __SEED_SYMBOLS__;
@@ -321,6 +321,12 @@ HTML = r"""
     const BINANCE_REST_BASES = __BINANCE_REST_BASES__;
     const STABLE_SYMBOLS = new Set(["USDCUSDT","BUSDUSDT","FDUSDUSDT","TUSDUSDT","USDPUSDT","DAIUSDT"]);
     const MAJORS = new Set(["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]);
+    const ALPHA = {
+      minScore:82, minProb:62, minEdgePct:0.25,
+      minFlow5x:2.2, minTotal5x:4.0, minLargestX:1.15,
+      majorMaxP1:0.45, altMaxP1:0.75, majorMaxP5:1.20, altMaxP5:2.00,
+      minFlowImbalance60:0.28, minFlowImbalance5:0.12,
+    };
 
     const state = {
       activeSymbols:[...SEED_SYMBOLS], marketMeta:new Map(), derivatives:new Map(), candles:new Map(),
@@ -383,11 +389,20 @@ HTML = r"""
       const position=(last.close-low)/span;
       const rangePct=prev.reduce((sum,row)=>sum+(row.high-row.low)/Math.max(row.close,1)*100,0)/Math.max(1,prev.length);
       const first=rows[Math.max(0,rows.length-16)];
+      const lastRange=Math.max(last.high-last.low,last.close*0.0001);
+      const closeLocation=(last.close-last.low)/lastRange;
+      const bodyPct=last.open?(last.close-last.open)/last.open*100:0;
+      const upperWickPct=(last.high-Math.max(last.open,last.close))/Math.max(last.close,1)*100;
+      const lowerWickPct=(Math.min(last.open,last.close)-last.low)/Math.max(last.close,1)*100;
       return {
         volSpike: avgVol ? Number(last.quoteVolume||0)/avgVol : null,
         rangePct,
         breakout: last.close>high ? 1 : (last.close<low ? -1 : 0),
         position,
+        closeLocation,
+        bodyPct,
+        upperWickPct,
+        lowerWickPct,
         ret15: first&&first.open ? (last.close-first.open)/first.open*100 : null,
       };
     }
@@ -400,10 +415,15 @@ HTML = r"""
     }
     function forecastModel(symbol,longScore,shortScore,p1,p3,p5,f60,f5,cm,d,mb){
       const edge=longScore-shortScore;
-      let probUp=50 + edge*0.32 + p1*5 + p3*2 + p5*1.2 + f60.imbalance*5 + mb.bias*2;
+      let probUp=50 + edge*0.30 + p1*4.5 + p3*1.8 + p5*1.0 + f60.imbalance*5 + f5.imbalance*3 + mb.bias*2;
       if(isNum(cm.ret15))probUp += cm.ret15*0.35;
+      if(isNum(cm.closeLocation))probUp += (cm.closeLocation-0.5)*4;
       if(isNum(d.oi15Pct)&&d.oi15Pct<-2.5)probUp += p5>=0 ? -3 : 3;
-      probUp=clamp(probUp,8,92);
+      const tooLateLong=p1>ALPHA.altMaxP1&&p5>ALPHA.altMaxP5;
+      const tooLateShort=p1<-ALPHA.altMaxP1&&p5<-ALPHA.altMaxP5;
+      if(tooLateLong)probUp-=5;
+      if(tooLateShort)probUp+=5;
+      probUp=clamp(probUp,10,90);
       const side=probUp>=56?"LONG":probUp<=44?"SHORT":"NEUTRAL";
       const prob5=side==="LONG"?probUp:(side==="SHORT"?100-probUp:Math.max(probUp,100-probUp));
       const volBase=Math.max(0.08,isNum(cm.rangePct)?cm.rangePct:0.12,Math.abs(p5)*0.45,Math.abs(p1)*0.8);
@@ -522,31 +542,53 @@ HTML = r"""
       const cost=costModel(d,forecast.side);
       forecast.netEdgePct=Math.abs(forecast.expected5Pct)-cost.requiredPct;
       forecast.cost=cost;
+      const isMajor=MAJORS.has(symbol);
+      const maxP1=isMajor?ALPHA.majorMaxP1:ALPHA.altMaxP1;
+      const maxP5=isMajor?ALPHA.majorMaxP5:ALPHA.altMaxP5;
       const repeatLong=f60.buyCount>=2||f60.lastSide==="BUY"&&f60.streak>=2, repeatShort=f60.sellCount>=2||f60.lastSide==="SELL"&&f60.streak>=2;
-      const volumeOk=isNum(cm.volSpike)?cm.volSpike>=1.2:f5.total>=threshold*4;
-      const marketOkLong=MAJORS.has(symbol)||mb.bias>=-1, marketOkShort=MAJORS.has(symbol)||mb.bias<=1;
+      const volumeOk=isNum(cm.volSpike)?cm.volSpike>=1.35:f5.total>=threshold*ALPHA.minTotal5x;
+      const marketOkLong=isMajor||mb.bias>=0||(mb.btc>-0.08&&mb.eth>-0.10), marketOkShort=isMajor||mb.bias<=0||(mb.btc<0.08&&mb.eth<0.10);
       const oiFallingHard=isNum(d.oi15Pct)&&d.oi15Pct<-2.5;
-      const flowLong=f60.net>0&&f5.net>0, flowShort=f60.net<0&&f5.net<0;
-      const priceLong=p1>=-0.04&&p3>=0.04&&p5>=0.08, priceShort=p1<=0.04&&p3<=-0.04&&p5<=-0.08;
-      const profitOk=forecast.side!=="NEUTRAL"&&forecast.netEdgePct>0;
-      const forecastLong=forecast.side==="LONG"&&forecast.prob5>=58&&forecast.expected5Pct>0;
-      const forecastShort=forecast.side==="SHORT"&&forecast.prob5>=58&&forecast.expected5Pct<0;
-      const alignedLong=signal==="LONG"&&score>=78&&forecastLong&&profitOk&&flowLong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&!oiFallingHard&&f60.largest>=threshold;
-      const alignedShort=signal==="SHORT"&&score>=78&&forecastShort&&profitOk&&flowShort&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&!oiFallingHard&&f60.largest>=threshold;
+      const flowSizeOk=Math.abs(f5.net)>=threshold*ALPHA.minFlow5x&&f5.total>=threshold*ALPHA.minTotal5x&&f60.largest>=threshold*ALPHA.minLargestX;
+      const flowLong=f60.net>0&&f5.net>0&&f60.imbalance>=ALPHA.minFlowImbalance60&&f5.imbalance>=ALPHA.minFlowImbalance5&&flowSizeOk;
+      const flowShort=f60.net<0&&f5.net<0&&f60.imbalance<=-ALPHA.minFlowImbalance60&&f5.imbalance<=-ALPHA.minFlowImbalance5&&flowSizeOk;
+      const lateLong=p1>maxP1||p5>maxP5, lateShort=p1<-maxP1||p5<-maxP5;
+      const priceLong=p1>=-0.03&&p3>=0.03&&p5>=0.06&&!lateLong;
+      const priceShort=p1<=0.03&&p3<=-0.03&&p5<=-0.06&&!lateShort;
+      const candleRejectLong=(isNum(cm.closeLocation)&&cm.closeLocation<0.40)||(isNum(cm.upperWickPct)&&cm.upperWickPct>Math.max(0.45,Math.abs(cm.bodyPct)*1.8));
+      const candleRejectShort=(isNum(cm.closeLocation)&&cm.closeLocation>0.60)||(isNum(cm.lowerWickPct)&&cm.lowerWickPct>Math.max(0.45,Math.abs(cm.bodyPct)*1.8));
+      const candleOkLong=!candleRejectLong&&(!isNum(cm.closeLocation)||cm.closeLocation>=0.50);
+      const candleOkShort=!candleRejectShort&&(!isNum(cm.closeLocation)||cm.closeLocation<=0.50);
+      const derivativeLong=((isNum(d.oi15Pct)&&d.oi15Pct>=0.6)||(isNum(d.takerRatio)&&d.takerRatio>=1.06)||(!isNum(d.oi15Pct)&&!isNum(d.takerRatio)))&&(!isNum(d.takerRatio)||d.takerRatio>=0.98);
+      const derivativeShort=((isNum(d.oi15Pct)&&d.oi15Pct>=0.6)||(isNum(d.takerRatio)&&d.takerRatio<=0.94)||(!isNum(d.oi15Pct)&&!isNum(d.takerRatio)))&&(!isNum(d.takerRatio)||d.takerRatio<=1.04);
+      const liqOkLong=l5.longLiq<=Math.max(threshold*2,l5.shortLiq*1.4), liqOkShort=l5.shortLiq<=Math.max(threshold*2,l5.longLiq*1.4);
+      const profitOk=forecast.side!=="NEUTRAL"&&forecast.netEdgePct>=ALPHA.minEdgePct;
+      const forecastLong=forecast.side==="LONG"&&forecast.prob5>=ALPHA.minProb&&forecast.expected5Pct>0;
+      const forecastShort=forecast.side==="SHORT"&&forecast.prob5>=ALPHA.minProb&&forecast.expected5Pct<0;
+      const alignedLong=signal==="LONG"&&score>=ALPHA.minScore&&forecastLong&&profitOk&&flowLong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&!oiFallingHard&&derivativeLong&&candleOkLong&&liqOkLong;
+      const alignedShort=signal==="SHORT"&&score>=ALPHA.minScore&&forecastShort&&profitOk&&flowShort&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&!oiFallingHard&&derivativeShort&&candleOkShort&&liqOkShort;
       const risks=[];
       if(signal!=="WATCH"&&!profitOk)risks.push("成本不过");
       if(cost.fundingPct>0)risks.push("资金费成本");
       if(signal==="LONG"&&!priceLong)risks.push("价格未确认"); if(signal==="SHORT"&&!priceShort)risks.push("价格未确认");
+      if(signal==="LONG"&&lateLong)risks.push("追涨过热"); if(signal==="SHORT"&&lateShort)risks.push("追空过热");
       if(signal==="LONG"&&!flowLong)risks.push("净流不连续"); if(signal==="SHORT"&&!flowShort)risks.push("净流不连续");
       if(signal==="LONG"&&!repeatLong)risks.push("孤立大单"); if(signal==="SHORT"&&!repeatShort)risks.push("孤立大单");
+      if(signal!=="WATCH"&&!flowSizeOk)risks.push("资金强度不足");
       if(!volumeOk)risks.push("量能不足");
       if(signal==="LONG"&&!marketOkLong)risks.push("大盘反向"); if(signal==="SHORT"&&!marketOkShort)risks.push("大盘反向");
       if(oiFallingHard)risks.push("OI下降");
+      if(signal==="LONG"&&!derivativeLong)risks.push("衍生品未确认"); if(signal==="SHORT"&&!derivativeShort)risks.push("衍生品未确认");
+      if(signal==="LONG"&&!candleOkLong)risks.push("K线收弱"); if(signal==="SHORT"&&!candleOkShort)risks.push("K线收强");
+      if(signal==="LONG"&&!liqOkLong)risks.push("爆仓反向"); if(signal==="SHORT"&&!liqOkShort)risks.push("爆仓反向");
       const reasons=[];
+      if(alignedLong||alignedShort)reasons.push("Alpha过滤通过");
       if(Math.abs(f60.net)>=threshold)reasons.push((f60.net>0?"主动买净流 ":"主动卖净流 ")+money(Math.abs(f60.net)));
+      if(flowSizeOk)reasons.push("5m资金强度 "+(Math.abs(f5.net)/Math.max(threshold,1)).toFixed(1)+"x");
       if(f60.largest>=threshold)reasons.push("最大单 "+money(f60.largest));
       if(isNum(cm.volSpike))reasons.push("量能 "+cm.volSpike.toFixed(1)+"x");
       if(Math.abs(p5)>=0.25)reasons.push("5m价格 "+(p5>0?"+":"")+p5.toFixed(2)+"%");
+      if(isNum(cm.closeLocation))reasons.push("收盘位置 "+Math.round(cm.closeLocation*100)+"%");
       if(isNum(d.oi15Pct)&&Math.abs(d.oi15Pct)>=1.2)reasons.push("OI15m "+(d.oi15Pct>0?"+":"")+d.oi15Pct.toFixed(2)+"%");
       if(isNum(d.takerRatio)&&(d.takerRatio>=1.12||d.takerRatio<=0.9))reasons.push("Taker "+d.takerRatio.toFixed(2));
       if(!reasons.length)reasons.push("等待大额资金流");
@@ -568,115 +610,68 @@ HTML = r"""
     async function runAi(){ const btn=document.getElementById("aiBtn"), out=document.getElementById("aiOutput"); btn.disabled=true; out.textContent="正在分析当前大资金流..."; try{ const all=rows(); const payload={summary:{scanned_symbols:activeSymbols().length,follow_long:all.filter(r=>r.follow==="FOLLOW_LONG").length,follow_short:all.filter(r=>r.follow==="FOLLOW_SHORT").length,large_trade_threshold_usd:LARGE_TRADE_USD,taker_fee_bps:TAKER_FEE_BPS,slippage_bps:SLIPPAGE_BPS,safety_edge_bps:SAFETY_EDGE_BPS,base_required_cost_pct:Number(baseCostPct().toFixed(3)),hold_minutes:HOLD_MINUTES,generated_at:new Date().toLocaleString()},rows:compactRows(),events:compactEvents()}; const res=await fetch("/api/ai/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); const data=await res.json(); out.textContent=(data.mode==="ai"?"AI 分析\n\n":"规则分析\n\n")+data.analysis; }catch(err){ out.textContent="分析失败："+err; }finally{ btn.disabled=false; } }
     function trimOld(){ const cut=now()-6*60*1000; for(const map of [state.trades,state.liquidations]){ for(const [sym,list] of map){ while(list.length&&list[0].ts<cut)list.shift(); if(!list.length)map.delete(sym); } } }
 
-    // ── 信号上报 ──────────────────────────────────────────────
-    var _lastLoggedSignals = new Set();
-
-    function logSignals() {
-      var all = rows();
-      var follow = all.filter(function(r) {
-        return r.follow === "FOLLOW_LONG" || r.follow === "FOLLOW_SHORT";
-      });
-      if (!follow.length) return;
-
-      var prices = {};
-      for (var i = 0; i < all.length; i++) {
-        if (all[i].price) prices[all[i].symbol] = all[i].price;
-      }
-
-      var toLog = follow.filter(function(r) {
-        var key = r.symbol + "|" + r.follow + "|" + Math.floor(Date.now() / 60000);
-        if (_lastLoggedSignals.has(key)) return false;
-        _lastLoggedSignals.add(key);
-        if (_lastLoggedSignals.size > 500) _lastLoggedSignals.clear();
+    const loggedSignalKeys = new Set();
+    function logSignals(){
+      const all=rows();
+      const follow=all.filter(r=>r.follow==="FOLLOW_LONG"||r.follow==="FOLLOW_SHORT");
+      const prices={};
+      for(const row of all){ if(row.price)prices[row.symbol]=row.price; }
+      const toLog=follow.filter(r=>{
+        const key=r.symbol+"|"+r.follow+"|"+Math.floor(Date.now()/60000);
+        if(loggedSignalKeys.has(key))return false;
+        loggedSignalKeys.add(key);
+        if(loggedSignalKeys.size>500)loggedSignalKeys.clear();
         return true;
       });
+      if(!toLog.length&&Object.keys(prices).length<1)return;
+      const payload=toLog.map(r=>({
+        symbol:r.symbol, follow:r.follow, score:r.score, price:r.price,
+        price_1m_pct:r.p1, price_5m_pct:r.p5,
+        net_60s_usd:Math.round(r.f60.net), net_5m_usd:Math.round(r.f5.net),
+        flow_60s_imbalance:Number(r.f60.imbalance.toFixed(4)),
+        flow_5m_imbalance:Number(r.f5.imbalance.toFixed(4)),
+        flow_60s_count:r.f60.count,
+        flow_5m_count:r.f5.count,
+        largest_usd:Math.round(r.f60.largest||r.f5.largest||0),
+        streak_side:r.f60.lastSide, streak_count:r.f60.streak,
+        volume_spike:r.cm.volSpike, volume_24h_usd:Math.round((r.m&&r.m.quoteVolume)||0),
+        candle_close_location:isNum(r.cm.closeLocation)?Number(r.cm.closeLocation.toFixed(4)):null,
+        candle_body_pct:isNum(r.cm.bodyPct)?Number(r.cm.bodyPct.toFixed(4)):null,
+        upper_wick_pct:isNum(r.cm.upperWickPct)?Number(r.cm.upperWickPct.toFixed(4)):null,
+        lower_wick_pct:isNum(r.cm.lowerWickPct)?Number(r.cm.lowerWickPct.toFixed(4)):null,
+        oi_15m_pct:r.d.oi15Pct, taker_ratio:r.d.takerRatio,
+        market_bias:r.mb.bias,
+        btc_5m_pct:Number(r.mb.btc.toFixed(4)),
+        eth_5m_pct:Number(r.mb.eth.toFixed(4)),
+        liq_long_5m_usd:Math.round(r.l5.longLiq||0),
+        liq_short_5m_usd:Math.round(r.l5.shortLiq||0),
+        forecast_side:r.forecast.side, forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),
+        net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),
+        required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),
+        funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),
+        risks:r.risks, reasons:r.reasons,
+      }));
+      fetch("/api/signal/log",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({rows:payload,prices})}).catch(()=>{});
+    }
 
-      if (!toLog.length) return;
-
-      var compact = toLog.map(function(r) {
-        return {
-          symbol:            r.symbol,
-          follow:            r.follow,
-          score:             r.score,
-          price:             r.price,
-          price_1m_pct:      r.p1,
-          price_5m_pct:      r.p5,
-          net_60s_usd:       Math.round(r.f60.net),
-          net_5m_usd:        Math.round(r.f5.net),
-          largest_usd:       Math.round(r.f60.largest || r.f5.largest || 0),
-          streak_side:       r.f60.lastSide,
-          streak_count:      r.f60.streak,
-          volume_spike:      r.cm.volSpike,
-          volume_24h_usd:    Math.round((r.m && r.m.quoteVolume) || 0),
-          oi_15m_pct:        r.d.oi15Pct,
-          taker_ratio:       r.d.takerRatio,
-          forecast_side:     r.forecast.side,
-          forecast_5m_prob:  Number(r.forecast.prob5.toFixed(1)),
-          net_edge_pct:      Number(r.forecast.netEdgePct.toFixed(3)),
-          required_cost_pct: Number(r.cost.requiredPct.toFixed(3)),
-          funding_cost_pct:  Number(r.cost.fundingPct.toFixed(4)),
-          risks:             r.risks,
-          reasons:           r.reasons,
+    function loadSignalStats(){
+      fetch("/api/signal/stats").then(r=>r.json()).then(data=>{
+        const el=document.getElementById("statsPanel");
+        if(!el)return;
+        if(data.message){ el.innerHTML="<strong>信号统计</strong>　"+data.message; return; }
+        const fmt=v=>(v===null||v===undefined)?"--":v;
+        const fmtPct=v=>{
+          if(v===null||v===undefined)return "--";
+          const cls=v>=0?"win":"lose";
+          return '<span class="'+cls+'">'+(v>0?"+":"")+v+"%</span>";
         };
-      });
-
-      fetch("/api/signal/log", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rows: compact, prices: prices })
-      }).catch(function() {});
+        let html="<strong>信号统计</strong>　已回填 "+data.filled+" / "+data.total+" 条信号<br><br>";
+        if(data.long)html+="多头信号 <strong>"+data.long.count+"</strong> 条　5m胜率 <strong>"+fmt(data.long.winrate_5m)+"%</strong>　均收益 "+fmtPct(data.long.avg_ret_5m)+"　期望值 "+fmtPct(data.long.expect_5m)+"<br>";
+        if(data.short)html+="空头信号 <strong>"+data.short.count+"</strong> 条　5m胜率 <strong>"+fmt(data.short.winrate_5m)+"%</strong>　均收益 "+fmtPct(data.short.avg_ret_5m)+"　期望值 "+fmtPct(data.short.expect_5m)+"<br>";
+        if(!data.long&&!data.short)html+="暂无已回填数据，等待信号触发后 5 分钟开始显示统计。";
+        el.innerHTML=html;
+      }).catch(()=>{});
     }
-
-    // ── 统计面板 ──────────────────────────────────────────────
-    function loadStats() {
-      fetch("/api/signal/stats")
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-          var el = document.getElementById("statsPanel");
-          if (!el) return;
-          if (data.message) {
-            el.innerHTML = "<strong>信号统计</strong>　" + data.message;
-            return;
-          }
-          function fmt(v) { return (v === null || v === undefined) ? "--" : v; }
-          function fmtPct(v) {
-            if (v === null || v === undefined) return "--";
-            var cls = v >= 0 ? "win" : "lose";
-            return '<span class="' + cls + '">' + (v > 0 ? "+" : "") + v + "%</span>";
-          }
-          var html = "<strong>信号统计</strong>　已回填 " + data.filled + " / " + data.total + " 条信号<br><br>";
-          if (data.long) {
-            var L = data.long;
-            html += "📈 多头信号 <strong>" + L.count + "</strong> 条　"
-              + "5m胜率 <strong>" + fmt(L.winrate_5m) + "%</strong>　"
-              + "均收益 " + fmtPct(L.avg_ret_5m) + "　"
-              + "期望值 " + fmtPct(L.expect_5m) + "<br>";
-          }
-          if (data.short) {
-            var S = data.short;
-            html += "📉 空头信号 <strong>" + S.count + "</strong> 条　"
-              + "5m胜率 <strong>" + fmt(S.winrate_5m) + "%</strong>　"
-              + "均收益 " + fmtPct(S.avg_ret_5m) + "　"
-              + "期望值 " + fmtPct(S.expect_5m) + "<br>";
-          }
-          if (!data.long && !data.short) {
-            html += "暂无已回填数据，等待信号触发后 15 分钟开始显示统计。";
-          }
-          el.innerHTML = html;
-        })
-        .catch(function() {});
-    }
-
-    // ── 主循环 ────────────────────────────────────────────────
-    setInterval(function() {
-      trimOld();
-      render();
-      renderEvents();
-      logSignals();
-    }, 1000);
-
-    setInterval(loadStats, 2 * 60 * 1000);
-    setTimeout(loadStats, 5000);
 
     function closeSockets(){ for(const ws of state.sockets){ try{ws.close();}catch(_){}} state.sockets=[]; state.priceConnected=false; state.tradeConnected=false; state.liqConnected=false; state.priceError=""; state.tradeError=""; state.liqError=""; state.priceMessages=0; state.tradeMessages=0; state.liqMessages=0; }
     function connectPrice(runId,index=0){ const host=BINANCE_WS_BASES[index%BINANCE_WS_BASES.length]; const ws=new WebSocket(`${host}/ws/!ticker@arr`); state.sockets.push(ws); const next=()=>setTimeout(()=>{ if(runId===state.runId)connectPrice(runId,index+1); },1000); const timeout=setTimeout(()=>{ if(runId!==state.runId)return; if(ws.readyState===WebSocket.CONNECTING){ state.priceError=`价格流超时：${host}`; try{ws.close();}catch(_){} next(); } },8000); ws.onopen=()=>{ if(runId!==state.runId)return; clearTimeout(timeout); state.priceConnected=true; state.priceError=""; render(); }; ws.onclose=()=>{ if(runId!==state.runId)return; clearTimeout(timeout); state.priceConnected=false; setTimeout(()=>{ if(runId===state.runId)connectPrice(runId,index); },3000); }; ws.onerror=()=>{ if(runId!==state.runId)return; state.priceError=`价格流连接失败：${host}`; render(); }; ws.onmessage=e=>{ if(runId!==state.runId)return; state.priceMessages++; const arr=JSON.parse(e.data); const set=activeSet(), ts=Date.now(); for(const item of arr){ if(!set.has(item.s))continue; const p=Number(item.c||0); if(p>0)rememberPrice(item.s,p,ts); const prev=state.marketMeta.get(item.s)||{}; state.marketMeta.set(item.s,{...prev,symbol:item.s,quoteVolume:Number(item.q||prev.quoteVolume||0),changePct:Number(item.P||prev.changePct||0),lastPrice:p}); } }; }
@@ -689,6 +684,9 @@ HTML = r"""
     document.getElementById("aiBtn").addEventListener("click",runAi);
     document.getElementById("search").addEventListener("input",render);
     document.getElementById("filters").addEventListener("click",e=>{ if(!e.target.dataset.filter)return; state.activeFilter=e.target.dataset.filter; document.querySelectorAll("#filters button").forEach(btn=>btn.classList.toggle("active",btn.dataset.filter===state.activeFilter)); render(); });
+    setInterval(()=>{ trimOld(); render(); renderEvents(); logSignals(); },1000);
+    setInterval(loadSignalStats,2*60*1000);
+    setTimeout(loadSignalStats,5000);
     start();
   </script>
 </body>
@@ -734,8 +732,8 @@ def health():
 @app.post("/api/signal/log")
 def signal_log():
     payload = request.get_json(silent=True) or {}
-    rows    = payload.get("rows") or []
-    prices  = payload.get("prices") or {}
+    rows = payload.get("rows") or []
+    prices = payload.get("prices") or {}
     for row in rows:
         log_signal(row)
     fill_prices(prices)
