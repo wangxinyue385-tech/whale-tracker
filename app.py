@@ -83,17 +83,16 @@ TESTNET_LEVERAGE = int(os.environ.get("TESTNET_LEVERAGE", "4"))
 TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "10"))
 TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "300"))
 PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "100"))
-EXIT_MIN_HOLD_SECONDS = int(os.environ.get("EXIT_MIN_HOLD_SECONDS", "5"))
-EXIT_TAKE_PROFIT_PCT = float(os.environ.get("EXIT_TAKE_PROFIT_PCT", "1.0"))
+EXIT_MIN_HOLD_SECONDS = int(os.environ.get("EXIT_MIN_HOLD_SECONDS", "15"))
+EXIT_TAKE_PROFIT_PCT = float(os.environ.get("EXIT_TAKE_PROFIT_PCT", "1.2"))
 EXIT_PROFIT_ARM_PCT = float(os.environ.get("EXIT_PROFIT_ARM_PCT", "1.0"))
-EXIT_TRAIL_KEEP_RATIO = float(os.environ.get("EXIT_TRAIL_KEEP_RATIO", "0.45"))
-EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-1.2"))
-EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "45"))
-EXIT_STALL_MIN_PEAK_PCT = float(os.environ.get("EXIT_STALL_MIN_PEAK_PCT", "0.8"))
-EXIT_SMALL_PROFIT_PEAK_PCT = float(os.environ.get("EXIT_SMALL_PROFIT_PEAK_PCT", "0.6"))
-EXIT_SMALL_PROFIT_FLOOR_PCT = float(os.environ.get("EXIT_SMALL_PROFIT_FLOOR_PCT", "0.1"))
+EXIT_TRAIL_KEEP_RATIO = float(os.environ.get("EXIT_TRAIL_KEEP_RATIO", "0.55"))
+EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-1.5"))
+EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "75"))
+EXIT_STALL_MIN_PEAK_PCT = float(os.environ.get("EXIT_STALL_MIN_PEAK_PCT", "0.4"))
 EXIT_REVERSE_SCORE = float(os.environ.get("EXIT_REVERSE_SCORE", "70"))
 EXIT_HOLD_MIN_SCORE = float(os.environ.get("EXIT_HOLD_MIN_SCORE", "65"))
+EXIT_INVALID_SNAPSHOTS = int(os.environ.get("EXIT_INVALID_SNAPSHOTS", "3"))
 
 _trade_lock = threading.Lock()
 _testnet_config = {
@@ -114,6 +113,7 @@ _equity_curve: list[dict] = []
 _exchange_cache = {"ts": 0.0, "symbols": {}}
 _last_prices: dict[str, float] = {}
 _market_snapshots: dict[str, dict] = {}
+_market_snapshot_version = 0
 _paper_cash = PAPER_STARTING_BALANCE
 _paper_positions: dict[str, dict] = {}
 
@@ -234,6 +234,9 @@ def _safe_float(value, default: float = 0.0) -> float:
 
 
 def _update_market_snapshots(rows: list[dict] | None) -> None:
+    global _market_snapshot_version
+    if rows:
+        _market_snapshot_version += 1
     now_ms = int(time.time() * 1000)
     for row in rows or []:
         symbol = str(row.get("symbol") or "").strip()
@@ -241,6 +244,7 @@ def _update_market_snapshots(rows: list[dict] | None) -> None:
             continue
         _market_snapshots[symbol] = {
             "ts": now_ms,
+            "version": _market_snapshot_version,
             "symbol": symbol,
             "follow": row.get("follow"),
             "signal": row.get("signal"),
@@ -442,16 +446,33 @@ def _same_direction_still_valid(side: str, snap: dict) -> bool:
         return False
     follow = snap.get("follow")
     score = _safe_float(snap.get("score"))
+    net_60s = _safe_float(snap.get("net_60s_usd"))
     net_5m = _safe_float(snap.get("net_5m_usd"))
     risks = set(snap.get("risks") or [])
     if follow == ("FOLLOW_LONG" if side == "LONG" else "FOLLOW_SHORT"):
         return True
     if score < EXIT_HOLD_MIN_SCORE:
         return False
-    fatal = {"价格未确认", "净流不连续", "大盘反向", "爆仓反向", "OI下降"}
+    fatal = {"大盘反向", "爆仓反向", "OI下降"}
     if side == "LONG":
-        return net_5m >= 0 and not (fatal | {"K线收弱"}).intersection(risks)
-    return net_5m <= 0 and not (fatal | {"K线收强"}).intersection(risks)
+        return (net_5m >= 0 or net_60s >= 0) and not fatal.intersection(risks)
+    return (net_5m <= 0 or net_60s <= 0) and not fatal.intersection(risks)
+
+
+def _track_hold_support(meta: dict, supported: bool, reverse: bool, snap_version: int) -> int:
+    if snap_version and int(meta.get("last_hold_snapshot_version") or 0) == snap_version:
+        return int(meta.get("invalid_snapshots") or 0)
+    if snap_version:
+        meta["last_hold_snapshot_version"] = snap_version
+    if supported:
+        meta["invalid_snapshots"] = 0
+        return 0
+    increment = 1
+    if reverse:
+        increment = 2
+    count = int(meta.get("invalid_snapshots") or 0) + increment
+    meta["invalid_snapshots"] = count
+    return count
 
 
 def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
@@ -476,8 +497,11 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     side = _position_side(pos, meta)
     snap_fresh = bool(snap and now_ms - int(snap.get("ts") or 0) <= 15 * 1000)
 
-    if snap_fresh and _is_reverse_snapshot(side, snap):
-        return "反向资金/信号平仓"
+    invalid_count = int(meta.get("invalid_snapshots") or 0)
+    if snap_fresh:
+        reverse = _is_reverse_snapshot(side, snap)
+        supported = _same_direction_still_valid(side, snap)
+        invalid_count = _track_hold_support(meta, supported, reverse, int(snap.get("version") or 0))
 
     if age_ms < EXIT_MIN_HOLD_SECONDS * 1000:
         return None
@@ -485,8 +509,8 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     if peak_pct >= EXIT_PROFIT_ARM_PCT and pnl_pct <= max(0.0, peak_pct * EXIT_TRAIL_KEEP_RATIO):
         return f"移动止盈平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
-    if snap_fresh and not _same_direction_still_valid(side, snap):
-        return "当前策略不再支持持仓，平仓"
+    if snap_fresh and invalid_count >= EXIT_INVALID_SNAPSHOTS:
+        return f"当前策略连续 {invalid_count} 次不支持持仓，平仓"
 
     if age_ms >= EXIT_STALL_SECONDS * 1000 and peak_pct < EXIT_STALL_MIN_PEAK_PCT:
         return f"走势未延续平仓，最高浮盈 {peak_pct:.2f}%"
@@ -576,6 +600,7 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                     "peak_pnl_pct": 0.0,
                     "last_favorable_pct": 0.0,
                     "last_favorable_at": now_ms,
+                    "invalid_snapshots": 0,
                 }
                 open_count += 1
                 mode = "本地模拟盘" if _is_paper_mode() else "Binance Testnet"
