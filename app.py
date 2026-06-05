@@ -90,8 +90,9 @@ BINANCE_TESTNET_REST = os.environ.get("BINANCE_TESTNET_REST", "https://demo-fapi
 TESTNET_AUTO_CLOSE_MINUTES = float(os.environ.get("TESTNET_AUTO_CLOSE_MINUTES", "5"))
 TESTNET_ORDER_USDT = float(os.environ.get("TESTNET_ORDER_USDT", "10"))
 TESTNET_LEVERAGE = int(os.environ.get("TESTNET_LEVERAGE", "4"))
-TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "10"))
-TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "180"))
+TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "12"))
+TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "150"))
+TESTNET_STRATEGY_MODE = os.environ.get("TESTNET_STRATEGY_MODE", "primary")
 PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "100"))
 ENTRY_CONFIRM_SNAPSHOTS = int(os.environ.get("ENTRY_CONFIRM_SNAPSHOTS", "1"))
 ENTRY_CONFIRM_MAX_GAP_SECONDS = int(os.environ.get("ENTRY_CONFIRM_MAX_GAP_SECONDS", "8"))
@@ -141,6 +142,7 @@ _testnet_config = {
     "max_positions": TESTNET_MAX_POSITIONS,
     "cooldown_seconds": TESTNET_COOLDOWN_SECONDS,
     "auto_close_minutes": TESTNET_AUTO_CLOSE_MINUTES,
+    "strategy_mode": TESTNET_STRATEGY_MODE,
 }
 _trade_cooldown: dict[str, int] = {}
 _entry_candidates: dict[str, dict] = {}
@@ -155,6 +157,21 @@ _market_snapshots: dict[str, dict] = {}
 _market_snapshot_version = 0
 _paper_cash = PAPER_STARTING_BALANCE
 _paper_positions: dict[str, dict] = {}
+PRIMARY_AUTO_STRATEGIES = {"flow_exhaustion_reversal", "sector_lead_lag", "liquidation_reversal"}
+
+
+def _strategy_mode() -> str:
+    mode = str(_testnet_config.get("strategy_mode") or "primary").strip()
+    if mode in PRIMARY_AUTO_STRATEGIES or mode == "primary":
+        return mode
+    return "primary"
+
+
+def _strategy_allowed_for_auto(strategy: str) -> bool:
+    mode = _strategy_mode()
+    if mode == "primary":
+        return strategy in PRIMARY_AUTO_STRATEGIES
+    return strategy == mode
 
 
 def _public_testnet_get(path: str, params: dict | None = None) -> dict:
@@ -998,6 +1015,8 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
             strategy_label = str(row.get("strategy_label") or ("费率回归" if strategy == "funding_reversion" else "大单动量"))
             if follow not in {"FOLLOW_LONG", "FOLLOW_SHORT"} or not symbol:
                 continue
+            if not _strategy_allowed_for_auto(strategy):
+                continue
             if open_count >= int(_testnet_config["max_positions"]):
                 _event(f"{symbol} 跳过：持仓数量已达上限", "warn", symbol=symbol)
                 continue
@@ -1078,6 +1097,28 @@ def _public_testnet_status() -> dict:
     losses = [item for item in closes if _safe_float(item.get("realized")) < 0]
     gross_win = sum(_safe_float(item.get("realized")) for item in wins)
     gross_loss = abs(sum(_safe_float(item.get("realized")) for item in losses))
+    by_strategy = []
+    grouped_closes: dict[tuple[str, str], list[dict]] = {}
+    for item in closes:
+        strategy = str(item.get("strategy") or item.get("main_signal") or "unknown")
+        label = str(item.get("strategy_label") or strategy)
+        grouped_closes.setdefault((strategy, label), []).append(item)
+    for (strategy, label), items in grouped_closes.items():
+        item_wins = [_safe_float(row.get("realized")) for row in items if _safe_float(row.get("realized")) > 0]
+        item_losses = [_safe_float(row.get("realized")) for row in items if _safe_float(row.get("realized")) < 0]
+        item_gross_win = sum(item_wins)
+        item_gross_loss = abs(sum(item_losses))
+        by_strategy.append({
+            "strategy": strategy,
+            "label": label,
+            "count": len(items),
+            "net": sum(_safe_float(row.get("realized")) for row in items),
+            "wins": len(item_wins),
+            "losses": len(item_losses),
+            "win_rate": (len(item_wins) / len(items) * 100) if items else 0,
+            "profit_factor": (item_gross_win / item_gross_loss) if item_gross_loss > 0 else (item_gross_win if item_gross_win > 0 else 0),
+        })
+    by_strategy.sort(key=lambda row: _safe_float(row.get("net")), reverse=True)
     trade_stats = {
         "count": len(closes),
         "wins": len(wins),
@@ -1088,6 +1129,7 @@ def _public_testnet_status() -> dict:
         "avg_win": (gross_win / len(wins)) if wins else 0,
         "avg_loss": (gross_loss / len(losses)) if losses else 0,
         "recent": closes[-60:],
+        "by_strategy": by_strategy,
     }
     base = {
         "rest": BINANCE_TESTNET_REST,
@@ -1096,12 +1138,13 @@ def _public_testnet_status() -> dict:
         "has_api_key": bool(cfg.get("api_key")),
         "has_api_secret": bool(cfg.get("api_secret")),
         "auto_trade": bool(cfg.get("auto_trade")),
-        "order_usdt": cfg.get("order_usdt"),
-        "leverage": cfg.get("leverage"),
-        "max_positions": cfg.get("max_positions"),
-        "cooldown_seconds": cfg.get("cooldown_seconds"),
-        "auto_close_minutes": cfg.get("auto_close_minutes"),
-        "events": events[:200],
+      "order_usdt": cfg.get("order_usdt"),
+      "leverage": cfg.get("leverage"),
+      "max_positions": cfg.get("max_positions"),
+      "cooldown_seconds": cfg.get("cooldown_seconds"),
+      "auto_close_minutes": cfg.get("auto_close_minutes"),
+      "strategy_mode": _strategy_mode(),
+      "events": events[:200],
         "equity_curve": _equity_curve[-120:],
         "trade_stats": trade_stats,
     }
@@ -1343,6 +1386,8 @@ HTML = r"""
     .chart-meta { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; margin-top:8px; }
     .stats-strip { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; padding:10px 12px 0; }
     .stats-strip .mini-stat { min-height:58px; }
+    .trade-strategy-stats { padding:8px 12px 0; color:var(--muted); font-size:12px; line-height:1.6; }
+    .trade-strategy-stats strong { color:var(--ink); }
     .api-help { grid-column:1/-1; color:var(--muted); font-size:11px; line-height:1.45; margin-top:-2px; }
     .decision-summary { display:grid; grid-template-columns:1.1fr repeat(3,minmax(0,.7fr)); gap:10px; padding:12px 14px; border-bottom:1px solid var(--line); background:#fbfcfe; }
     .decision-box { border:1px solid var(--line); background:#fff; border-radius:8px; padding:10px; min-height:70px; }
@@ -1444,6 +1489,7 @@ HTML = r"""
             <label>杠杆<input id="tradeLeverage" type="number" min="1" max="20" step="1" value="4"></label>
             <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="10"></label>
             <label>平仓分钟<input id="autoCloseMinutes" type="number" min="1" step="1" value="5"></label>
+            <label class="wide">策略模式<select id="strategyMode"><option value="primary">主信号组合</option><option value="flow_exhaustion_reversal">只测大单耗尽反向</option><option value="sector_lead_lag">只测板块滞后</option><option value="liquidation_reversal">只测爆仓反弹</option></select></label>
           </div>
           <div class="trade-actions">
             <label class="toggle"><input id="autoTradeToggle" type="checkbox">FOLLOW 自动下单</label>
@@ -1490,6 +1536,7 @@ HTML = r"""
             <div class="mini-stat"><div class="label">胜率</div><div class="value" id="statWinRate">--</div></div>
             <div class="mini-stat"><div class="label">盈亏比</div><div class="value" id="statPF">--</div></div>
           </div>
+          <div class="trade-strategy-stats" id="tradeStrategyStats"></div>
           <div class="chart-wrap">
             <canvas id="tradeStatsChart"></canvas>
             <div class="chart-meta"><span id="tradeStatsLeft">等待交易</span><span id="tradeStatsRight">--</span></div>
@@ -1518,7 +1565,7 @@ HTML = r"""
       majorMaxP1:0.32, altMaxP1:0.45, majorMaxP5:0.85, altMaxP5:1.20,
     };
     const MICRO = {
-      enableMomentum:true,
+      enableMomentum:false,
       invertFollow:false,
       enableExhaustionReversal:true,
       minLiqX:2.2,
@@ -2378,6 +2425,7 @@ HTML = r"""
       document.getElementById("tradeLeverage").value=data.leverage||4;
       document.getElementById("maxPositions").value=data.max_positions||10;
       document.getElementById("autoCloseMinutes").value=data.auto_close_minutes||5;
+      document.getElementById("strategyMode").value=data.strategy_mode||"primary";
       updateExecutionModeUi(mode);
     }
     function renderTestnetStatus(data, forceForm=false){
@@ -2399,6 +2447,14 @@ HTML = r"""
       document.getElementById("statNet").className="value "+(Number(stats.net||0)>=0?"up":"down");
       document.getElementById("statWinRate").textContent=(stats.count?Number(stats.win_rate||0).toFixed(1):"--")+"%";
       document.getElementById("statPF").textContent=stats.count?(Number(stats.profit_factor||0).toFixed(2)):"--";
+      const byStrategy=document.getElementById("tradeStrategyStats");
+      if(byStrategy){
+        const rows=(stats.by_strategy||[]).slice(0,5);
+        byStrategy.innerHTML=rows.length?rows.map(item=>{
+          const net=Number(item.net||0), pf=Number(item.profit_factor||0);
+          return `${esc(item.label||item.strategy)} <strong>${item.count||0}</strong> 笔　净利 <span class="${net>=0?"up":"down"}">${net>=0?"+":""}${usdt(net)}</span>　胜率 ${Number(item.win_rate||0).toFixed(1)}%　PF ${pf?pf.toFixed(2):"--"}`;
+        }).join("<br>"):"等待主信号交易统计";
+      }
       drawPnlChart(data.equity_curve||[]);
       drawTradeStatsChart(stats);
     }
@@ -2414,6 +2470,7 @@ HTML = r"""
         leverage:Number(document.getElementById("tradeLeverage").value||4),
         max_positions:Number(document.getElementById("maxPositions").value||10),
         auto_close_minutes:Number(document.getElementById("autoCloseMinutes").value||5),
+        strategy_mode:document.getElementById("strategyMode").value,
       };
       const key=document.getElementById("testnetKey").value.trim();
       const secret=document.getElementById("testnetSecret").value.trim();
@@ -2477,7 +2534,7 @@ HTML = r"""
     document.getElementById("saveTradeCfg").addEventListener("click",saveTestnetConfig);
     document.getElementById("executionMode").addEventListener("change",handleExecutionModeChange);
     document.getElementById("autoTradeToggle").addEventListener("change",()=>{ markTradeFormDirty(); saveTestnetConfig(); });
-    for(const id of ["testnetKey","testnetSecret","orderUsdt","tradeLeverage","maxPositions","autoCloseMinutes"]){
+    for(const id of ["testnetKey","testnetSecret","orderUsdt","tradeLeverage","maxPositions","autoCloseMinutes","strategyMode"]){
       document.getElementById(id).addEventListener("input",markTradeFormDirty);
     }
     const oldRadarBody=document.getElementById("radarBody");
@@ -2596,6 +2653,9 @@ def testnet_config():
                 _equity_curve.clear()
         if "auto_trade" in payload:
             _testnet_config["auto_trade"] = bool(payload.get("auto_trade"))
+        if "strategy_mode" in payload:
+            mode = str(payload.get("strategy_mode") or "primary").strip()
+            _testnet_config["strategy_mode"] = mode if mode in PRIMARY_AUTO_STRATEGIES or mode == "primary" else "primary"
         for key, cast, default in [
             ("order_usdt", float, TESTNET_ORDER_USDT),
             ("leverage", int, TESTNET_LEVERAGE),
