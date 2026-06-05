@@ -157,22 +157,22 @@ _market_snapshots: dict[str, dict] = {}
 _market_snapshot_version = 0
 _paper_cash = PAPER_STARTING_BALANCE
 _paper_positions: dict[str, dict] = {}
-REMOVED_AUTO_STRATEGIES = {"flow_exhaustion_reversal"}
-PRIMARY_AUTO_STRATEGIES = {"sector_lead_lag", "liquidation_reversal"}
+PRIMARY_AUTO_STRATEGIES = {"flow_exhaustion_reversal", "sector_lead_lag", "liquidation_reversal"}
 STRATEGY_MODE_MAP = {
     "primary": PRIMARY_AUTO_STRATEGIES,
+    "exhaustion_sector": {"flow_exhaustion_reversal", "sector_lead_lag"},
+    "exhaustion_liquidation": {"flow_exhaustion_reversal", "liquidation_reversal"},
     "sector_liquidation": {"sector_lead_lag", "liquidation_reversal"},
+    "flow_exhaustion_reversal": {"flow_exhaustion_reversal"},
     "sector_lead_lag": {"sector_lead_lag"},
     "liquidation_reversal": {"liquidation_reversal"},
 }
-LEGACY_STRATEGY_MODE_ALIASES = {
-    "exhaustion_sector": "sector_lead_lag",
-    "exhaustion_liquidation": "liquidation_reversal",
-    "flow_exhaustion_reversal": "liquidation_reversal",
-}
 STRATEGY_MODE_LABELS = {
-    "primary": "主信号组合：板块+爆仓",
-    "sector_liquidation": "两信号：板块+爆仓",
+    "primary": "三信号组合：耗尽+板块+爆仓",
+    "exhaustion_sector": "两两：耗尽+板块",
+    "exhaustion_liquidation": "两两：耗尽+爆仓",
+    "sector_liquidation": "两两：板块+爆仓",
+    "flow_exhaustion_reversal": "单信号：大单耗尽反向",
     "sector_lead_lag": "单信号：板块滞后",
     "liquidation_reversal": "单信号：爆仓反弹",
 }
@@ -182,14 +182,12 @@ def _strategy_mode() -> str:
     mode = str(_testnet_config.get("strategy_mode") or "primary").strip()
     if mode in STRATEGY_MODE_MAP:
         return mode
-    if mode in LEGACY_STRATEGY_MODE_ALIASES:
-        return LEGACY_STRATEGY_MODE_ALIASES[mode]
     return "primary"
 
 
 def _strategy_allowed_for_auto(strategy: str) -> bool:
     strategy = str(strategy or "").strip()
-    return bool(strategy) and strategy not in REMOVED_AUTO_STRATEGIES and strategy in STRATEGY_MODE_MAP[_strategy_mode()]
+    return bool(strategy) and strategy in STRATEGY_MODE_MAP[_strategy_mode()]
 
 
 def _strategy_mode_label() -> str:
@@ -384,6 +382,30 @@ def _entry_key(symbol: str, follow: str, strategy: str = "") -> str:
     return "|".join(parts)
 
 
+def _opportunity_grade(row: dict) -> str:
+    prob = _safe_float(row.get("forecast_5m_prob") or row.get("forecast_prob"))
+    edge = _safe_float(row.get("net_edge_pct"))
+    grade = "B"
+    if prob >= 72:
+        grade = "A"
+    elif prob >= 68:
+        grade = "B+"
+    elif prob <= LOW_CONFIDENCE_PROB:
+        grade = "C"
+    if edge >= 0.35:
+        grade = "A" if grade in {"A", "B+"} else grade
+    return grade
+
+
+def _auto_signal_allowed_for_trade(row: dict) -> bool:
+    strategy = str(row.get("strategy") or "").strip()
+    if not _strategy_allowed_for_auto(strategy):
+        return False
+    if strategy == "flow_exhaustion_reversal" and _opportunity_grade(row) == "C":
+        return False
+    return True
+
+
 def _confirmed_entry_rows(rows: list[dict], market_rows: list[dict] | None, now_ms: int) -> list[dict]:
     source = market_rows or rows or []
     current: dict[str, dict] = {}
@@ -397,7 +419,7 @@ def _confirmed_entry_rows(rows: list[dict], market_rows: list[dict] | None, now_
         if follow not in {"FOLLOW_LONG", "FOLLOW_SHORT"}:
             continue
         strategy = str(row.get("strategy") or "").strip()
-        if not _strategy_allowed_for_auto(strategy):
+        if not _auto_signal_allowed_for_trade(row):
             continue
         current[_entry_key(symbol, str(follow), strategy)] = row
 
@@ -481,7 +503,7 @@ def _opportunity_margin_usdt(row: dict, account: dict, open_count: int) -> tuple
     edge = _safe_float(row.get("net_edge_pct"))
     strategy = str(row.get("strategy") or "")
     multiplier = 1.0
-    grade = "B"
+    grade = _opportunity_grade(row)
     if strategy == "sector_lead_lag":
         multiplier += 0.25
     elif strategy == "liquidation_reversal":
@@ -492,16 +514,12 @@ def _opportunity_margin_usdt(row: dict, account: dict, open_count: int) -> tuple
         multiplier -= 0.50
     if prob >= 72:
         multiplier += 1.4
-        grade = "A"
     elif prob >= 68:
         multiplier += 0.75
-        grade = "B+"
     elif prob <= LOW_CONFIDENCE_PROB:
         multiplier -= 0.35
-        grade = "C"
     if edge >= 0.35:
         multiplier += 0.65
-        grade = "A" if grade in {"A", "B+"} else grade
     elif edge >= 0.22:
         multiplier += 0.25
     elif edge < 0.12:
@@ -707,7 +725,7 @@ def _would_open_same_side(symbol: str, side: str, meta: dict, now_ms: int) -> tu
     if snap.get("follow") != _same_side_follow(side):
         return False, snap
     snap_strategy = str(snap.get("strategy") or "")
-    if snap_strategy and not _strategy_allowed_for_auto(snap_strategy):
+    if snap_strategy and not _auto_signal_allowed_for_trade(snap):
         return False, snap
     if snap_strategy and cur_strategy and snap_strategy != cur_strategy:
         return False, snap
@@ -735,7 +753,7 @@ def _snapshot_direction(snap: dict) -> str:
 
 
 def _same_direction_still_valid(side: str, snap: dict) -> bool:
-    if not _strategy_allowed_for_auto(str(snap.get("strategy") or "")):
+    if not _auto_signal_allowed_for_trade(snap):
         return False
     direction = _snapshot_direction(snap)
     if direction != side:
@@ -1047,7 +1065,7 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
             strategy_label = str(row.get("strategy_label") or ("费率回归" if strategy == "funding_reversion" else "大单动量"))
             if follow not in {"FOLLOW_LONG", "FOLLOW_SHORT"} or not symbol:
                 continue
-            if not _strategy_allowed_for_auto(strategy):
+            if not _auto_signal_allowed_for_trade(row):
                 continue
             if open_count >= int(_testnet_config["max_positions"]):
                 _event(f"{symbol} 跳过：持仓数量已达上限", "warn", symbol=symbol)
@@ -1524,7 +1542,11 @@ HTML = r"""
             <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="10"></label>
             <label>平仓分钟<input id="autoCloseMinutes" type="number" min="1" step="1" value="5"></label>
             <label class="wide">策略模式<select id="strategyMode">
-              <option value="primary">主信号组合：板块+爆仓</option>
+              <option value="primary">三信号组合：耗尽+板块+爆仓</option>
+              <option value="exhaustion_sector">两两：耗尽+板块</option>
+              <option value="exhaustion_liquidation">两两：耗尽+爆仓</option>
+              <option value="sector_liquidation">两两：板块+爆仓</option>
+              <option value="flow_exhaustion_reversal">单信号：大单耗尽反向</option>
               <option value="sector_lead_lag">单信号：板块滞后</option>
               <option value="liquidation_reversal">单信号：爆仓反弹</option>
             </select></label>
@@ -1605,7 +1627,7 @@ HTML = r"""
     const MICRO = {
       enableMomentum:false,
       invertFollow:false,
-      enableExhaustionReversal:false,
+      enableExhaustionReversal:true,
       minLiqX:2.2,
       strongLiqX:5.2,
       washoutP5:0.45,
@@ -2157,14 +2179,30 @@ HTML = r"""
     }
     function rows(){ return activeSymbols().map(scoreRow).sort((a,b)=>b.score-a.score||Math.abs(b.f60.net)-Math.abs(a.f60.net)||Number(b.m.quoteVolume||0)-Number(a.m.quoteVolume||0)); }
     function allowedStrategySet(){
-      const items=state.testnet&&Array.isArray(state.testnet.allowed_strategies)?state.testnet.allowed_strategies:["sector_lead_lag","liquidation_reversal"];
+      const items=state.testnet&&Array.isArray(state.testnet.allowed_strategies)?state.testnet.allowed_strategies:["flow_exhaustion_reversal","sector_lead_lag","liquidation_reversal"];
       return new Set(items);
     }
-    function strategyAllowed(row){ return !!(row&&row.strategy&&allowedStrategySet().has(row.strategy)); }
+    function estimatedGrade(row){
+      const forecast=row.forecast||{};
+      const prob=Number(forecast.prob5||row.forecast_5m_prob||0);
+      const edge=Number(forecast.netEdgePct!==undefined?forecast.netEdgePct:(row.net_edge_pct||0));
+      let grade="B";
+      if(prob>=72)grade="A";
+      else if(prob>=68)grade="B+";
+      else if(prob<=68)grade="C";
+      if(edge>=0.35)grade=grade==="A"||grade==="B+"?"A":grade;
+      return grade;
+    }
+    function strategyBlockReason(row){
+      if(!row||!row.strategy||!allowedStrategySet().has(row.strategy))return "当前策略模式不下单";
+      if(row.strategy==="flow_exhaustion_reversal"&&estimatedGrade(row)==="C")return "C级耗尽反向不下单";
+      return "";
+    }
+    function strategyAllowed(row){ return !strategyBlockReason(row); }
     function isFollowSignal(row){ return row.follow==="FOLLOW_LONG"||row.follow==="FOLLOW_SHORT"; }
     function isAutoSignal(row){ return isFollowSignal(row)&&strategyAllowed(row); }
     function filteredRows(){ const q=document.getElementById("search").value.trim().toUpperCase(); return rows().filter(r=>{ if(q&&!r.symbol.includes(q)&&!r.base.includes(q))return false; if(state.activeFilter==="follow")return isAutoSignal(r); if(state.activeFilter==="long")return r.signal==="LONG"; if(state.activeFilter==="short")return r.signal==="SHORT"; if(state.activeFilter==="alts")return !MAJORS.has(r.symbol); return true; }); }
-    function badge(row){ if(isFollowSignal(row)&&!strategyAllowed(row))return '<span class="badge watch">模式过滤</span>'; if(row.follow==="FOLLOW_LONG")return `<span class="badge long">${esc(row.label||"策略多")}</span>`; if(row.follow==="FOLLOW_SHORT")return `<span class="badge short">${esc(row.label||"策略空")}</span>`; if(row.follow==="WATCH_LONG")return '<span class="badge long">多头异动</span>'; if(row.follow==="WATCH_SHORT")return '<span class="badge short">空头异动</span>'; return '<span class="badge watch">观察</span>'; }
+    function badge(row){ const block=strategyBlockReason(row); if(isFollowSignal(row)&&block)return `<span class="badge watch">${block.includes("C级")?"C级过滤":"模式过滤"}</span>`; if(row.follow==="FOLLOW_LONG")return `<span class="badge long">${esc(row.label||"策略多")}</span>`; if(row.follow==="FOLLOW_SHORT")return `<span class="badge short">${esc(row.label||"策略空")}</span>`; if(row.follow==="WATCH_LONG")return '<span class="badge long">多头异动</span>'; if(row.follow==="WATCH_SHORT")return '<span class="badge short">空头异动</span>'; return '<span class="badge watch">观察</span>'; }
     function setDot(id,ok,err){ const el=document.getElementById(id); el.classList.toggle("ok",ok); el.classList.toggle("bad",!!err); }
     function addEvent(ev){ state.events.unshift(ev); state.events=state.events.slice(0,220); }
 
@@ -2214,14 +2252,15 @@ HTML = r"""
       return {text:"不交易", cls:"wait", order:"等待下一轮信号"};
     }
     function renderStrategyCard(row){
-      const allowedByMode=strategyAllowed(row);
-      const action=allowedByMode?strategyAction(row):{text:"模式过滤", cls:"wait", order:"当前策略模式不下单"};
+      const blockReason=strategyBlockReason(row);
+      const allowedByMode=!blockReason;
+      const action=allowedByMode?strategyAction(row):{text:blockReason.includes("C级")?"C级过滤":"模式过滤", cls:"wait", order:blockReason};
       const cls=allowedByMode&&row.follow==="FOLLOW_LONG"?"follow-long":(allowedByMode&&row.follow==="FOLLOW_SHORT"?"follow-short":"");
       const sideText=row.forecast.side==="LONG"?"多":(row.forecast.side==="SHORT"?"空":"震荡");
-      const riskItems=allowedByMode?(row.risks.length?row.risks.slice(0,4):["条件正常"]):["当前策略模式不下单"];
+      const riskItems=allowedByMode?(row.risks.length?row.risks.slice(0,4):["条件正常"]):[blockReason];
       const risks=riskItems.map(x=>`<span class="chip">${x}</span>`).join("");
       const reasons=row.reasons.slice(0,4).map(x=>`<span class="chip">${x}</span>`).join("");
-      const tradeState=allowedByMode?((state.testnet&&state.testnet.auto_trade&&state.testnet.account_ok)?action.order:(row.follow.startsWith("FOLLOW")?"等待模拟盘连接/开启自动下单":"不触发模拟单")):"当前策略模式不下单";
+      const tradeState=allowedByMode?((state.testnet&&state.testnet.auto_trade&&state.testnet.account_ok)?action.order:(row.follow.startsWith("FOLLOW")?"等待模拟盘连接/开启自动下单":"不触发模拟单")):blockReason;
       return `<div class="strategy-card ${cls}">
         <div class="strategy-head">
           <div><div class="strategy-symbol">${row.base}</div><div class="small">${row.symbol} · ${price(row.price)}</div></div>
@@ -2704,7 +2743,7 @@ def testnet_config():
             _testnet_config["auto_trade"] = bool(payload.get("auto_trade"))
         if "strategy_mode" in payload:
             mode = str(payload.get("strategy_mode") or "primary").strip()
-            next_mode = mode if mode in STRATEGY_MODE_MAP else LEGACY_STRATEGY_MODE_ALIASES.get(mode, "primary")
+            next_mode = mode if mode in STRATEGY_MODE_MAP else "primary"
             if next_mode != _strategy_mode():
                 _entry_candidates.clear()
             _testnet_config["strategy_mode"] = next_mode
