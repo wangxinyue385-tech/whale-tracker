@@ -83,28 +83,28 @@ TESTNET_LEVERAGE = int(os.environ.get("TESTNET_LEVERAGE", "4"))
 TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "10"))
 TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "300"))
 PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "100"))
-ENTRY_CONFIRM_SNAPSHOTS = int(os.environ.get("ENTRY_CONFIRM_SNAPSHOTS", "2"))
+ENTRY_CONFIRM_SNAPSHOTS = int(os.environ.get("ENTRY_CONFIRM_SNAPSHOTS", "3"))
 ENTRY_CONFIRM_MAX_GAP_SECONDS = int(os.environ.get("ENTRY_CONFIRM_MAX_GAP_SECONDS", "8"))
-EXIT_MIN_HOLD_SECONDS = int(os.environ.get("EXIT_MIN_HOLD_SECONDS", "15"))
-EXIT_TAKE_PROFIT_PCT = float(os.environ.get("EXIT_TAKE_PROFIT_PCT", "0.85"))
-EXIT_PROFIT_ARM_PCT = float(os.environ.get("EXIT_PROFIT_ARM_PCT", "0.35"))
-EXIT_TRAIL_KEEP_RATIO = float(os.environ.get("EXIT_TRAIL_KEEP_RATIO", "0.45"))
-EXIT_BREAKEVEN_ARM_PCT = float(os.environ.get("EXIT_BREAKEVEN_ARM_PCT", "0.25"))
-EXIT_BREAKEVEN_FLOOR_PCT = float(os.environ.get("EXIT_BREAKEVEN_FLOOR_PCT", "-0.05"))
+EXIT_MIN_HOLD_SECONDS = int(os.environ.get("EXIT_MIN_HOLD_SECONDS", "30"))
+EXIT_TAKE_PROFIT_PCT = float(os.environ.get("EXIT_TAKE_PROFIT_PCT", "1.20"))
+EXIT_PROFIT_ARM_PCT = float(os.environ.get("EXIT_PROFIT_ARM_PCT", "0.80"))
+EXIT_TRAIL_KEEP_RATIO = float(os.environ.get("EXIT_TRAIL_KEEP_RATIO", "0.35"))
+EXIT_BREAKEVEN_ARM_PCT = float(os.environ.get("EXIT_BREAKEVEN_ARM_PCT", "0.45"))
+EXIT_BREAKEVEN_FLOOR_PCT = float(os.environ.get("EXIT_BREAKEVEN_FLOOR_PCT", "0.02"))
 EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-2.0"))
 EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "150"))
 EXIT_STALL_MIN_PEAK_PCT = float(os.environ.get("EXIT_STALL_MIN_PEAK_PCT", "0.12"))
 EXIT_STALL_LOSS_PCT = float(os.environ.get("EXIT_STALL_LOSS_PCT", "-0.25"))
 EXIT_PROGRESS_EPS_PCT = float(os.environ.get("EXIT_PROGRESS_EPS_PCT", "0.03"))
 EXIT_MAX_HOLD_SECONDS = int(os.environ.get("EXIT_MAX_HOLD_SECONDS", "300"))
-EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT = float(os.environ.get("EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT", "0.05"))
+EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT = float(os.environ.get("EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT", "-0.20"))
 FUNDING_EXIT_TAKE_PROFIT_PCT = float(os.environ.get("FUNDING_EXIT_TAKE_PROFIT_PCT", "0.45"))
 FUNDING_EXIT_HARD_STOP_PCT = float(os.environ.get("FUNDING_EXIT_HARD_STOP_PCT", "-1.35"))
 FUNDING_EXIT_NORMAL_RATE_PCT = float(os.environ.get("FUNDING_EXIT_NORMAL_RATE_PCT", "0.035"))
 FUNDING_EXIT_MAX_HOLD_SECONDS = int(os.environ.get("FUNDING_EXIT_MAX_HOLD_SECONDS", "900"))
 EXIT_REVERSE_SCORE = float(os.environ.get("EXIT_REVERSE_SCORE", "70"))
 EXIT_HOLD_MIN_SCORE = float(os.environ.get("EXIT_HOLD_MIN_SCORE", "65"))
-EXIT_INVALID_SNAPSHOTS = int(os.environ.get("EXIT_INVALID_SNAPSHOTS", "3"))
+EXIT_INVALID_SNAPSHOTS = int(os.environ.get("EXIT_INVALID_SNAPSHOTS", "8"))
 
 _trade_lock = threading.Lock()
 _testnet_config = {
@@ -124,6 +124,7 @@ _auto_positions: dict[str, dict] = {}
 _trade_events: list[dict] = []
 _equity_curve: list[dict] = []
 _exchange_cache = {"ts": 0.0, "symbols": {}}
+_testnet_time_cache = {"ts": 0.0, "offset_ms": 0}
 _last_prices: dict[str, float] = {}
 _market_snapshots: dict[str, dict] = {}
 _market_snapshot_version = 0
@@ -138,30 +139,50 @@ def _public_testnet_get(path: str, params: dict | None = None) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _testnet_timestamp_ms(force_refresh: bool = False) -> int:
+    now_ts = time.time()
+    if force_refresh or now_ts - float(_testnet_time_cache["ts"]) > 30:
+        try:
+            data = _public_testnet_get("/fapi/v1/time")
+            server_ms = int(data.get("serverTime") or 0)
+            if server_ms > 0:
+                _testnet_time_cache["offset_ms"] = server_ms - int(now_ts * 1000)
+                _testnet_time_cache["ts"] = now_ts
+        except Exception:  # noqa: BLE001
+            _testnet_time_cache["ts"] = now_ts
+    return int(time.time() * 1000) + int(_testnet_time_cache.get("offset_ms") or 0)
+
+
 def _signed_testnet_request(method: str, path: str, params: dict | None = None) -> dict:
     cfg = _testnet_config
     if not cfg.get("api_key") or not cfg.get("api_secret"):
         raise RuntimeError("模拟盘 API Key/Secret 未配置")
-    payload = dict(params or {})
-    payload["timestamp"] = int(time.time() * 1000)
-    payload["recvWindow"] = 5000
-    query = urlencode(payload)
-    signature = hmac.new(cfg["api_secret"].encode(), query.encode(), hashlib.sha256).hexdigest()
-    body = (query + "&signature=" + signature).encode()
-    headers = {
-        "X-MBX-APIKEY": cfg["api_key"],
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    if method == "GET":
-        req = urllib.request.Request(BINANCE_TESTNET_REST + path + "?" + body.decode(), headers=headers, method="GET")
-    else:
-        req = urllib.request.Request(BINANCE_TESTNET_REST + path, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=25) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Binance testnet {exc.code}: {detail}") from exc
+    last_error = None
+    for attempt in range(2):
+        payload = dict(params or {})
+        payload["timestamp"] = _testnet_timestamp_ms(force_refresh=attempt > 0)
+        payload["recvWindow"] = 10000
+        query = urlencode(payload)
+        signature = hmac.new(cfg["api_secret"].encode(), query.encode(), hashlib.sha256).hexdigest()
+        body = (query + "&signature=" + signature).encode()
+        headers = {
+            "X-MBX-APIKEY": cfg["api_key"],
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        if method == "GET":
+            req = urllib.request.Request(BINANCE_TESTNET_REST + path + "?" + body.decode(), headers=headers, method="GET")
+        else:
+            req = urllib.request.Request(BINANCE_TESTNET_REST + path, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=25) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            last_error = RuntimeError(f"Binance testnet {exc.code}: {detail}")
+            if '"code":-1021' in detail or "Timestamp" in detail:
+                continue
+            raise last_error from exc
+    raise last_error or RuntimeError("Binance testnet request failed")
 
 
 def _event(message: str, level: str = "info", **extra) -> None:
@@ -603,7 +624,12 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     if peak_pct >= EXIT_BREAKEVEN_ARM_PCT and pnl_pct <= EXIT_BREAKEVEN_FLOOR_PCT:
         return f"浮盈回吐保护平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
-    if snap_fresh and invalid_count >= EXIT_INVALID_SNAPSHOTS and strategy != "funding_reversion":
+    if (
+        snap_fresh
+        and invalid_count >= EXIT_INVALID_SNAPSHOTS
+        and strategy != "funding_reversion"
+        and pnl_pct <= EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT
+    ):
         return f"当前策略连续 {invalid_count} 次不支持持仓，平仓"
 
     progress_age_ms = now_ms - int(meta.get("last_progress_at") or opened_at)
@@ -1130,11 +1156,12 @@ HTML = r"""
     const STABLE_SYMBOLS = new Set(["USDCUSDT","BUSDUSDT","FDUSDUSDT","TUSDUSDT","USDPUSDT","DAIUSDT"]);
     const MAJORS = new Set(["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]);
     const ALPHA = {
-      minScore:78, minProb:58, minEdgePct:0,
-      minTotal5x:4.0,
-      majorMaxP1:0.45, altMaxP1:0.75, majorMaxP5:1.20, altMaxP5:2.00,
+      minScore:86, minProb:65, minEdgePct:0.18,
+      minTotal5x:8.0, minDirectionGap:18,
+      majorMaxP1:0.32, altMaxP1:0.45, majorMaxP5:0.85, altMaxP5:1.20,
     };
     const FUNDING = {
+      enabled:false,
       extremePct:0.10, normalPct:0.035,
       minVolume24hUsd:80000000,
       maxAgainstP1:0.20, coolP1:0.03,
@@ -1229,6 +1256,7 @@ HTML = r"""
       return {bias, btc, eth};
     }
     function fundingReversionSetup(symbol,p1,p5,f60,cm,d,mb,signal,score,threshold){
+      if(!FUNDING.enabled)return null;
       if(!isNum(d.fundingRate)||Math.abs(d.fundingRate)<FUNDING.extremePct)return null;
       const quoteVolume=Number((meta(symbol)||{}).quoteVolume||0);
       if(!MAJORS.has(symbol)&&quoteVolume<FUNDING.minVolume24hUsd)return null;
@@ -1398,8 +1426,12 @@ HTML = r"""
       const closeLocation=isNum(cm.closeLocation)?cm.closeLocation:0.5;
       const chaseLong=p1>maxP1||p5>maxP5||(p1>0.25&&closeLocation>=0.92);
       const chaseShort=p1<-maxP1||p5<-maxP5||(p1<-0.25&&closeLocation<=0.08);
-      const alignedLong=signal==="LONG"&&score>=ALPHA.minScore&&forecastLong&&profitOk&&flowLong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&!oiFallingHard&&f60.largest>=threshold&&!chaseLong;
-      const alignedShort=signal==="SHORT"&&score>=ALPHA.minScore&&forecastShort&&profitOk&&flowShort&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&!oiFallingHard&&f60.largest>=threshold&&!chaseShort;
+      const directionGap=Math.abs(long-short);
+      const flowStrong=f5.total>=threshold*ALPHA.minTotal5x&&Math.abs(f5.imbalance)>=0.18;
+      const candleOkLong=!isNum(cm.closeLocation)||cm.closeLocation>=0.58;
+      const candleOkShort=!isNum(cm.closeLocation)||cm.closeLocation<=0.42;
+      const alignedLong=signal==="LONG"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastLong&&profitOk&&flowLong&&flowStrong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&candleOkLong&&!oiFallingHard&&f60.largest>=threshold&&!chaseLong;
+      const alignedShort=signal==="SHORT"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastShort&&profitOk&&flowShort&&flowStrong&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&candleOkShort&&!oiFallingHard&&f60.largest>=threshold&&!chaseShort;
       const fundingSetup=fundingReversionSetup(symbol,p1,p5,f60,cm,d,mb,signal,score,threshold);
       let follow=alignedLong?"FOLLOW_LONG":alignedShort?"FOLLOW_SHORT":"";
       let label=alignedLong?"策略多":alignedShort?"策略空":"";
@@ -1430,8 +1462,10 @@ HTML = r"""
         if(cost.fundingPct>0)risks.push("资金费成本");
         if(signal==="LONG"&&!priceLong)risks.push("价格未确认"); if(signal==="SHORT"&&!priceShort)risks.push("价格未确认");
         if(signal==="LONG"&&!flowLong)risks.push("净流不连续"); if(signal==="SHORT"&&!flowShort)risks.push("净流不连续");
+        if(signal!=="WATCH"&&!flowStrong)risks.push("资金流强度不足");
         if(signal==="LONG"&&!repeatLong)risks.push("孤立大单"); if(signal==="SHORT"&&!repeatShort)risks.push("孤立大单");
         if(signal==="LONG"&&chaseLong)risks.push("追涨过热"); if(signal==="SHORT"&&chaseShort)risks.push("追空过热");
+        if(signal==="LONG"&&!candleOkLong)risks.push("收盘位置偏弱"); if(signal==="SHORT"&&!candleOkShort)risks.push("收盘位置偏强");
         if(!volumeOk)risks.push("量能不足");
         if(signal==="LONG"&&!marketOkLong)risks.push("大盘反向"); if(signal==="SHORT"&&!marketOkShort)risks.push("大盘反向");
         if(oiFallingHard)risks.push("OI下降");
@@ -1833,6 +1867,7 @@ def testnet_status():
 def testnet_config():
     payload = request.get_json(silent=True) or {}
     with _trade_lock:
+        prev_mode = str(_testnet_config.get("execution_mode") or "paper")
         if "api_key" in payload:
             _testnet_config["api_key"] = str(payload.get("api_key") or "").strip()
         if payload.get("api_secret"):
@@ -1840,6 +1875,8 @@ def testnet_config():
         if "execution_mode" in payload:
             mode = str(payload.get("execution_mode") or "paper").strip()
             _testnet_config["execution_mode"] = "binance_testnet" if mode == "binance_testnet" else "paper"
+            if _testnet_config["execution_mode"] != prev_mode:
+                _equity_curve.clear()
         if "auto_trade" in payload:
             _testnet_config["auto_trade"] = bool(payload.get("auto_trade"))
         for key, cast, default in [
