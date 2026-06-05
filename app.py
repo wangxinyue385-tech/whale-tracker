@@ -83,6 +83,8 @@ TESTNET_LEVERAGE = int(os.environ.get("TESTNET_LEVERAGE", "4"))
 TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "10"))
 TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "300"))
 PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "100"))
+ENTRY_CONFIRM_SNAPSHOTS = int(os.environ.get("ENTRY_CONFIRM_SNAPSHOTS", "2"))
+ENTRY_CONFIRM_MAX_GAP_SECONDS = int(os.environ.get("ENTRY_CONFIRM_MAX_GAP_SECONDS", "8"))
 EXIT_MIN_HOLD_SECONDS = int(os.environ.get("EXIT_MIN_HOLD_SECONDS", "15"))
 EXIT_TAKE_PROFIT_PCT = float(os.environ.get("EXIT_TAKE_PROFIT_PCT", "0.85"))
 EXIT_PROFIT_ARM_PCT = float(os.environ.get("EXIT_PROFIT_ARM_PCT", "0.35"))
@@ -90,9 +92,12 @@ EXIT_TRAIL_KEEP_RATIO = float(os.environ.get("EXIT_TRAIL_KEEP_RATIO", "0.45"))
 EXIT_BREAKEVEN_ARM_PCT = float(os.environ.get("EXIT_BREAKEVEN_ARM_PCT", "0.25"))
 EXIT_BREAKEVEN_FLOOR_PCT = float(os.environ.get("EXIT_BREAKEVEN_FLOOR_PCT", "-0.05"))
 EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-0.85"))
-EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "90"))
-EXIT_STALL_MIN_PEAK_PCT = float(os.environ.get("EXIT_STALL_MIN_PEAK_PCT", "0.25"))
-EXIT_MAX_HOLD_SECONDS = int(os.environ.get("EXIT_MAX_HOLD_SECONDS", "180"))
+EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "150"))
+EXIT_STALL_MIN_PEAK_PCT = float(os.environ.get("EXIT_STALL_MIN_PEAK_PCT", "0.12"))
+EXIT_STALL_LOSS_PCT = float(os.environ.get("EXIT_STALL_LOSS_PCT", "-0.25"))
+EXIT_PROGRESS_EPS_PCT = float(os.environ.get("EXIT_PROGRESS_EPS_PCT", "0.03"))
+EXIT_MAX_HOLD_SECONDS = int(os.environ.get("EXIT_MAX_HOLD_SECONDS", "300"))
+EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT = float(os.environ.get("EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT", "0.05"))
 EXIT_REVERSE_SCORE = float(os.environ.get("EXIT_REVERSE_SCORE", "70"))
 EXIT_HOLD_MIN_SCORE = float(os.environ.get("EXIT_HOLD_MIN_SCORE", "65"))
 EXIT_INVALID_SNAPSHOTS = int(os.environ.get("EXIT_INVALID_SNAPSHOTS", "3"))
@@ -110,6 +115,7 @@ _testnet_config = {
     "auto_close_minutes": TESTNET_AUTO_CLOSE_MINUTES,
 }
 _trade_cooldown: dict[str, int] = {}
+_entry_candidates: dict[str, dict] = {}
 _auto_positions: dict[str, dict] = {}
 _trade_events: list[dict] = []
 _equity_curve: list[dict] = []
@@ -263,6 +269,58 @@ def _update_market_snapshots(rows: list[dict] | None) -> None:
     for symbol, row in list(_market_snapshots.items()):
         if int(row.get("ts") or 0) < cutoff:
             _market_snapshots.pop(symbol, None)
+
+
+def _entry_key(symbol: str, follow: str) -> str:
+    return f"{symbol}|{follow}"
+
+
+def _confirmed_entry_rows(rows: list[dict], market_rows: list[dict] | None, now_ms: int) -> list[dict]:
+    source = market_rows or rows or []
+    current: dict[str, dict] = {}
+    symbols_seen: set[str] = set()
+    for row in source:
+        symbol = str(row.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        symbols_seen.add(symbol)
+        follow = row.get("follow")
+        if follow not in {"FOLLOW_LONG", "FOLLOW_SHORT"}:
+            continue
+        current[_entry_key(symbol, str(follow))] = row
+
+    max_gap_ms = max(1, ENTRY_CONFIRM_MAX_GAP_SECONDS) * 1000
+    needed = max(1, ENTRY_CONFIRM_SNAPSHOTS)
+    snap_version = _market_snapshot_version if market_rows else now_ms
+    confirmed: list[dict] = []
+
+    for key, row in current.items():
+        prev = _entry_candidates.get(key) or {}
+        prev_version = int(prev.get("last_version") or 0)
+        last_seen = int(prev.get("last_seen") or 0)
+        if prev and prev_version == snap_version:
+            count = int(prev.get("count") or 0)
+        elif prev and now_ms - last_seen <= max_gap_ms:
+            count = int(prev.get("count") or 0) + 1
+        else:
+            count = 1
+        _entry_candidates[key] = {
+            "count": count,
+            "first_seen": int(prev.get("first_seen") or now_ms),
+            "last_seen": now_ms,
+            "last_version": snap_version,
+        }
+        if count >= needed:
+            confirmed.append({**row, "entry_confirm_count": count})
+
+    for key, item in list(_entry_candidates.items()):
+        if key in current:
+            continue
+        symbol = key.split("|", 1)[0]
+        if symbol in symbols_seen or now_ms - int(item.get("last_seen") or 0) > max_gap_ms:
+            _entry_candidates.pop(key, None)
+
+    return confirmed
 
 
 def _order_margin_usdt() -> float:
@@ -482,11 +540,15 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     opened_at = int(meta.get("opened_at", now_ms))
     age_ms = now_ms - opened_at
     pnl, pnl_pct = _position_pnl_pct(symbol, pos, meta)
-    peak_pct = max(_safe_float(meta.get("peak_pnl_pct"), pnl_pct), pnl_pct)
-    peak_pnl = max(_safe_float(meta.get("peak_pnl"), pnl), pnl)
+    prev_peak_pct = _safe_float(meta.get("peak_pnl_pct"), pnl_pct)
+    prev_peak_pnl = _safe_float(meta.get("peak_pnl"), pnl)
+    peak_pct = max(prev_peak_pct, pnl_pct)
+    peak_pnl = max(prev_peak_pnl, pnl)
     meta["peak_pnl_pct"] = peak_pct
     meta["peak_pnl"] = peak_pnl
-    if pnl_pct >= _safe_float(meta.get("last_favorable_pct"), -999):
+    if peak_pct > prev_peak_pct + EXIT_PROGRESS_EPS_PCT:
+        meta["last_progress_at"] = now_ms
+    if pnl_pct > _safe_float(meta.get("last_favorable_pct"), -999) + EXIT_PROGRESS_EPS_PCT:
         meta["last_favorable_pct"] = pnl_pct
         meta["last_favorable_at"] = now_ms
 
@@ -501,6 +563,8 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     snap_fresh = bool(snap and now_ms - int(snap.get("ts") or 0) <= 15 * 1000)
 
     invalid_count = int(meta.get("invalid_snapshots") or 0)
+    reverse = False
+    supported = False
     if snap_fresh:
         reverse = _is_reverse_snapshot(side, snap)
         supported = _same_direction_still_valid(side, snap)
@@ -518,11 +582,19 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     if snap_fresh and invalid_count >= EXIT_INVALID_SNAPSHOTS:
         return f"当前策略连续 {invalid_count} 次不支持持仓，平仓"
 
-    if age_ms >= EXIT_STALL_SECONDS * 1000 and peak_pct < EXIT_STALL_MIN_PEAK_PCT:
-        return f"走势未延续平仓，最高浮盈 {peak_pct:.2f}%"
+    progress_age_ms = now_ms - int(meta.get("last_progress_at") or opened_at)
+    if age_ms >= EXIT_STALL_SECONDS * 1000 and peak_pct < EXIT_STALL_MIN_PEAK_PCT and snap_fresh:
+        if reverse:
+            return f"走势转弱平仓，最高浮盈 {peak_pct:.2f}%"
+        if not supported and pnl_pct <= EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT:
+            return f"信号衰减平仓，最高浮盈 {peak_pct:.2f}%"
+        if progress_age_ms >= EXIT_STALL_SECONDS * 1000 and pnl_pct <= EXIT_STALL_LOSS_PCT:
+            return f"无进展且浮亏平仓，当前 {pnl_pct:.2f}%"
 
     if age_ms >= EXIT_MAX_HOLD_SECONDS * 1000:
-        return f"短线到时平仓，持仓 {int(age_ms / 1000)} 秒"
+        if snap_fresh and supported and pnl_pct >= EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT:
+            return None
+        return f"持仓信号衰减平仓，持仓 {int(age_ms / 1000)} 秒，最高浮盈 {peak_pct:.2f}%"
 
     close_ms = float(_testnet_config["auto_close_minutes"]) * 60 * 1000
     if not snap_fresh and age_ms >= close_ms:
@@ -572,7 +644,7 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
         positions = _position_map(_paper_account_snapshot() if _is_paper_mode() else _account_snapshot())
         open_count = len(positions)
         now_ms = int(time.time() * 1000)
-        rows = [row for row in rows if row.get("follow") in {"FOLLOW_LONG", "FOLLOW_SHORT"}]
+        rows = _confirmed_entry_rows(rows, market_rows, now_ms)
         if not rows:
             return
         for row in rows:
@@ -597,6 +669,7 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                     _set_leverage(symbol)
                     order = _place_market_order(symbol, follow, price)
                 _trade_cooldown[cooldown_key] = now_ms
+                _entry_candidates.pop(cooldown_key, None)
                 _auto_positions[symbol] = {
                     "follow": follow,
                     "opened_at": now_ms,
@@ -609,6 +682,7 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                     "peak_pnl_pct": 0.0,
                     "last_favorable_pct": 0.0,
                     "last_favorable_at": now_ms,
+                    "last_progress_at": now_ms,
                     "invalid_snapshots": 0,
                 }
                 open_count += 1
