@@ -107,6 +107,12 @@ EXIT_HOLD_MIN_SCORE = float(os.environ.get("EXIT_HOLD_MIN_SCORE", "65"))
 EXIT_INVALID_SNAPSHOTS = int(os.environ.get("EXIT_INVALID_SNAPSHOTS", "8"))
 LOW_CONFIDENCE_PROB = float(os.environ.get("LOW_CONFIDENCE_PROB", "68"))
 LOW_CONFIDENCE_TAKE_PROFIT_USDT = float(os.environ.get("LOW_CONFIDENCE_TAKE_PROFIT_USDT", "0.01"))
+POSITION_ADD_COOLDOWN_SECONDS = int(os.environ.get("POSITION_ADD_COOLDOWN_SECONDS", "45"))
+POSITION_MAX_ADDS = int(os.environ.get("POSITION_MAX_ADDS", "2"))
+POSITION_ADD_GROSS_LOSS_USDT = float(os.environ.get("POSITION_ADD_GROSS_LOSS_USDT", "0.03"))
+POSITION_PROFIT_FLOOR_USDT = float(os.environ.get("POSITION_PROFIT_FLOOR_USDT", "0.01"))
+POSITION_PROFIT_PULLBACK_USDT = float(os.environ.get("POSITION_PROFIT_PULLBACK_USDT", "0.02"))
+POSITION_UNSUPPORTED_GRACE_SECONDS = int(os.environ.get("POSITION_UNSUPPORTED_GRACE_SECONDS", "120"))
 
 _trade_lock = threading.Lock()
 _testnet_config = {
@@ -292,6 +298,10 @@ def _update_market_snapshots(rows: list[dict] | None) -> None:
             "price_5m_pct": _safe_float(row.get("price_5m_pct")),
             "net_60s_usd": _safe_float(row.get("net_60s_usd")),
             "net_5m_usd": _safe_float(row.get("net_5m_usd")),
+            "forecast_5m_prob": _safe_float(row.get("forecast_5m_prob")),
+            "net_edge_pct": _safe_float(row.get("net_edge_pct")),
+            "take_profit_pct": _safe_float(row.get("take_profit_pct")),
+            "trail_arm_pct": _safe_float(row.get("trail_arm_pct")),
             "funding_rate": _safe_float(row.get("funding_rate")),
             "risks": row.get("risks") or [],
         }
@@ -460,6 +470,25 @@ def _paper_place_market_order(symbol: str, follow: str, price: float, margin: fl
     order_id = uuid.uuid4().hex[:12]
     entry_cost = _paper_one_way_cost(notional)
     _paper_cash -= entry_cost
+    existing = _paper_positions.get(symbol)
+    if existing and (float(existing.get("amount") or 0) * amount) > 0:
+        old_amount = float(existing.get("amount") or 0)
+        new_amount = old_amount + amount
+        old_notional = float(existing.get("notional") or abs(old_amount) * float(existing.get("entry_price") or price))
+        old_entry = float(existing.get("entry_price") or price)
+        combined_notional = old_notional + notional
+        combined_entry = (old_entry * abs(old_amount) + price * abs(amount)) / max(abs(new_amount), 1e-12)
+        existing.update({
+            "amount": new_amount,
+            "entry_price": combined_entry,
+            "margin": float(existing.get("margin") or 0) + margin,
+            "notional": combined_notional,
+            "entry_cost": float(existing.get("entry_cost") or 0) + entry_cost,
+            "order_id": order_id,
+        })
+        return {"orderId": order_id, "symbol": symbol, "status": "FILLED", "avgPrice": price, "executedQty": qty, "entryCost": entry_cost, "paper": True, "added": True}
+    if existing:
+        raise RuntimeError(f"{symbol} 已有反向本地模拟持仓")
     _paper_positions[symbol] = {
         "symbol": symbol,
         "amount": amount,
@@ -557,6 +586,29 @@ def _position_side(pos: dict, meta: dict) -> str:
     return "LONG" if follow == "FOLLOW_LONG" else "SHORT"
 
 
+def _position_gross_pnl(pos: dict) -> float:
+    if "gross_unrealized" in pos:
+        return _safe_float(pos.get("gross_unrealized"))
+    return _safe_float(pos.get("unrealized"))
+
+
+def _same_side_follow(side: str) -> str:
+    return "FOLLOW_LONG" if side == "LONG" else "FOLLOW_SHORT"
+
+
+def _would_open_same_side(symbol: str, side: str, meta: dict, now_ms: int) -> tuple[bool, dict]:
+    snap = _market_snapshots.get(symbol) or {}
+    if not snap or now_ms - int(snap.get("ts") or 0) > 15 * 1000:
+        return False, snap
+    if snap.get("follow") != _same_side_follow(side):
+        return False, snap
+    snap_strategy = str(snap.get("strategy") or "")
+    cur_strategy = str(meta.get("strategy") or "")
+    if snap_strategy and cur_strategy and snap_strategy != cur_strategy:
+        return False, snap
+    return True, snap
+
+
 def _is_reverse_snapshot(side: str, snap: dict) -> bool:
     follow = snap.get("follow")
     signal = snap.get("signal")
@@ -644,6 +696,7 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     snap = _market_snapshots.get(symbol) or {}
     side = _position_side(pos, meta)
     snap_fresh = bool(snap and now_ms - int(snap.get("ts") or 0) <= 15 * 1000)
+    would_open, _ = _would_open_same_side(symbol, side, meta, now_ms)
 
     invalid_count = int(meta.get("invalid_snapshots") or 0)
     reverse = False
@@ -655,6 +708,9 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
 
     if age_ms < EXIT_MIN_HOLD_SECONDS * 1000:
         return None
+
+    if not would_open and pnl >= POSITION_PROFIT_FLOOR_USDT:
+        return f"当前不再触发开仓，净利落袋 {pnl:+.2f} USDT"
 
     entry_prob = _safe_float(meta.get("forecast_prob"))
     if (
@@ -674,6 +730,9 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
         if reverse and pnl_pct <= EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT:
             return f"费率单被动量反穿平仓，当前 {pnl_pct:.2f}%"
 
+    if would_open and peak_pnl >= POSITION_PROFIT_FLOOR_USDT and pnl >= POSITION_PROFIT_FLOOR_USDT and peak_pnl - pnl >= POSITION_PROFIT_PULLBACK_USDT:
+        return f"仍支持持仓但盈利回撤平仓，最高净利 {peak_pnl:+.2f} 回落到 {pnl:+.2f} USDT"
+
     if peak_pct >= trail_arm_pct and pnl_pct <= max(0.0, peak_pct * EXIT_TRAIL_KEEP_RATIO):
         return f"移动止盈平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
@@ -685,10 +744,26 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
         and invalid_count >= EXIT_INVALID_SNAPSHOTS
         and strategy != "funding_reversion"
         and pnl_pct <= EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT
+        and (would_open or pnl >= 0)
     ):
         return f"当前策略连续 {invalid_count} 次不支持持仓，平仓"
 
     progress_age_ms = now_ms - int(meta.get("last_progress_at") or opened_at)
+    unsupported_since = int(meta.get("unsupported_since") or 0)
+    if not would_open:
+        if not unsupported_since:
+            meta["unsupported_since"] = now_ms
+            unsupported_since = now_ms
+    else:
+        meta.pop("unsupported_since", None)
+    if (
+        not would_open
+        and pnl < 0
+        and age_ms >= POSITION_UNSUPPORTED_GRACE_SECONDS * 1000
+        and now_ms - unsupported_since >= POSITION_UNSUPPORTED_GRACE_SECONDS * 1000
+    ):
+        return f"不再触发开仓且亏损超时平仓，净利 {pnl:+.2f} USDT"
+
     if age_ms >= EXIT_STALL_SECONDS * 1000 and peak_pct < EXIT_STALL_MIN_PEAK_PCT and snap_fresh:
         if reverse:
             return f"走势转弱平仓，最高浮盈 {peak_pct:.2f}%"
@@ -723,6 +798,44 @@ def _close_due_positions(account: dict | None = None) -> None:
         if not pos:
             _auto_positions.pop(symbol, None)
             continue
+        side = _position_side(pos, meta)
+        would_open, snap = _would_open_same_side(symbol, side, meta, now_ms)
+        gross_pnl = _position_gross_pnl(pos)
+        _, pnl_pct = _position_pnl_pct(symbol, pos, meta)
+        add_count = int(meta.get("add_count") or 0)
+        last_add_at = int(meta.get("last_add_at") or 0)
+        if (
+            would_open
+            and gross_pnl <= -POSITION_ADD_GROSS_LOSS_USDT
+            and pnl_pct > EXIT_HARD_STOP_PCT * 0.70
+            and add_count < POSITION_MAX_ADDS
+            and now_ms - last_add_at >= POSITION_ADD_COOLDOWN_SECONDS * 1000
+        ):
+            try:
+                add_row = {
+                    **snap,
+                    "forecast_5m_prob": snap.get("forecast_5m_prob") or meta.get("forecast_prob"),
+                    "net_edge_pct": snap.get("net_edge_pct") or meta.get("net_edge_pct"),
+                    "strategy": meta.get("strategy"),
+                }
+                add_margin, add_grade = _opportunity_margin_usdt(add_row, account, len(positions))
+                add_margin = max(1.0, min(add_margin * 0.50, _safe_float(meta.get("margin"), _order_margin_usdt())))
+                price = _safe_float(snap.get("price")) or _paper_mark_price(symbol, _safe_float(meta.get("entry_price")))
+                if _is_paper_mode():
+                    order = _paper_place_market_order(symbol, meta.get("follow") or _same_side_follow(side), price, add_margin)
+                else:
+                    _set_leverage(symbol)
+                    order = _place_market_order(symbol, meta.get("follow") or _same_side_follow(side), price, add_margin)
+                meta["add_count"] = add_count + 1
+                meta["last_add_at"] = now_ms
+                meta["margin"] = _safe_float(meta.get("margin")) + add_margin
+                meta["notional"] = _safe_float(meta.get("notional")) + _order_notional_usdt(add_margin)
+                meta["entry_cost"] = _safe_float(meta.get("entry_cost")) + (_safe_float(order.get("entryCost")) if isinstance(order, dict) else 0.0)
+                meta["invalid_snapshots"] = 0
+                _event(f"{symbol} 仍触发开仓且浮亏，加仓 · {add_grade}级 {add_margin:.2f}U保证金 · 浮亏 {gross_pnl:+.2f} USDT", "info", symbol=symbol, order=order)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                _event(f"{symbol} 自动加仓失败：{exc}", "warn", symbol=symbol)
         reason = _exit_reason(symbol, pos, meta, now_ms)
         if not reason:
             continue
