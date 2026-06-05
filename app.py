@@ -131,6 +131,7 @@ _entry_candidates: dict[str, dict] = {}
 _auto_positions: dict[str, dict] = {}
 _trade_events: list[dict] = []
 _equity_curve: list[dict] = []
+_trade_closes: list[dict] = []
 _exchange_cache = {"ts": 0.0, "symbols": {}}
 _testnet_time_cache = {"ts": 0.0, "offset_ms": 0}
 _last_prices: dict[str, float] = {}
@@ -845,6 +846,18 @@ def _close_due_positions(account: dict | None = None) -> None:
             else:
                 order = _close_position(symbol, float(pos["amount"]))
             realized = _safe_float(order.get("realizedPnl")) if isinstance(order, dict) else 0.0
+            close_item = {
+                "ts": now_ms,
+                "symbol": symbol,
+                "realized": realized,
+                "strategy": meta.get("strategy"),
+                "strategy_label": meta.get("strategy_label"),
+                "grade": meta.get("opportunity_grade"),
+                "reason": reason,
+                "margin": meta.get("margin"),
+            }
+            _trade_closes.append(close_item)
+            del _trade_closes[:-400]
             extra = f" · 已实现 {realized:+.2f} USDT" if realized else ""
             _event(f"{symbol} {reason}{extra}", "info", symbol=symbol, order=order)
             _auto_positions.pop(symbol, None)
@@ -927,6 +940,22 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
 
 def _public_testnet_status() -> dict:
     cfg = _testnet_config
+    closes = _trade_closes[-200:]
+    wins = [item for item in closes if _safe_float(item.get("realized")) > 0]
+    losses = [item for item in closes if _safe_float(item.get("realized")) < 0]
+    gross_win = sum(_safe_float(item.get("realized")) for item in wins)
+    gross_loss = abs(sum(_safe_float(item.get("realized")) for item in losses))
+    trade_stats = {
+        "count": len(closes),
+        "wins": len(wins),
+        "losses": len(losses),
+        "net": sum(_safe_float(item.get("realized")) for item in closes),
+        "win_rate": (len(wins) / len(closes) * 100) if closes else 0,
+        "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else (gross_win if gross_win > 0 else 0),
+        "avg_win": (gross_win / len(wins)) if wins else 0,
+        "avg_loss": (gross_loss / len(losses)) if losses else 0,
+        "recent": closes[-60:],
+    }
     base = {
         "rest": BINANCE_TESTNET_REST,
         "execution_mode": cfg.get("execution_mode") or "paper",
@@ -941,6 +970,7 @@ def _public_testnet_status() -> dict:
         "auto_close_minutes": cfg.get("auto_close_minutes"),
         "events": _trade_events[:20],
         "equity_curve": _equity_curve[-120:],
+        "trade_stats": trade_stats,
     }
     if _is_paper_mode():
         account = _paper_account_snapshot()
@@ -1095,7 +1125,7 @@ HTML = r"""
     .sub { color:var(--muted); font-size:12px; margin-top:4px; }
     .up { color:var(--green); font-weight:850; }
     .down { color:var(--red); font-weight:850; }
-    .layout { display:grid; grid-template-columns:minmax(760px,1fr) 420px; gap:12px; align-items:start; }
+    .layout { display:grid; grid-template-columns:minmax(700px,1fr) 520px; gap:12px; align-items:start; }
     .main-stack { display:grid; gap:10px; min-width:0; }
     .side-stack { display:grid; gap:10px; position:sticky; top:70px; max-height:calc(100vh - 82px); overflow:auto; padding-bottom:2px; }
     .trade-grid { display:grid; gap:10px; align-items:start; }
@@ -1167,9 +1197,11 @@ HTML = r"""
     .mini-stat .value { font-size:16px; }
     .trade-log { border-top:1px solid var(--line); max-height:78px; overflow:auto; padding:7px 12px; color:var(--muted); font-size:12px; line-height:1.5; }
     .trade-log div { border-bottom:1px solid #edf1f5; padding:4px 0; }
-    .chart-wrap { padding:10px 12px 12px; height:176px; }
-    #pnlChart { width:100%; height:124px; display:block; border:1px solid var(--line); border-radius:8px; background:#fff; }
+    .chart-wrap { padding:10px 12px 12px; height:220px; }
+    #pnlChart,#tradeStatsChart { width:100%; height:160px; display:block; border:1px solid var(--line); border-radius:8px; background:#fff; }
     .chart-meta { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; margin-top:8px; }
+    .stats-strip { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; padding:10px 12px 0; }
+    .stats-strip .mini-stat { min-height:58px; }
     .api-help { grid-column:1/-1; color:var(--muted); font-size:11px; line-height:1.45; margin-top:-2px; }
     .decision-summary { display:grid; grid-template-columns:1.1fr repeat(3,minmax(0,.7fr)); gap:10px; padding:12px 14px; border-bottom:1px solid var(--line); background:#fbfcfe; }
     .decision-box { border:1px solid var(--line); background:#fff; border-radius:8px; padding:10px; min-height:70px; }
@@ -1304,16 +1336,24 @@ HTML = r"""
           </div>
           <div class="event-list" id="eventList"></div>
         </div>
-        <section class="ai-panel">
+        <div class="panel">
           <div class="panel-head">
             <div>
-              <div class="panel-title">AI 跟单分析</div>
-              <div class="panel-note">可选辅助分析</div>
+              <div class="panel-title">交易统计</div>
+              <div class="panel-note">次数、净盈利、盈亏比</div>
             </div>
-            <button class="ai-btn" id="aiBtn">分析</button>
           </div>
-          <div class="ai-body" id="aiOutput">等待行情累计后点击分析。没有配置 AI Key 时会使用内置规则分析。</div>
-        </section>
+          <div class="stats-strip">
+            <div class="mini-stat"><div class="label">交易</div><div class="value" id="statTrades">0</div></div>
+            <div class="mini-stat"><div class="label">净利</div><div class="value" id="statNet">--</div></div>
+            <div class="mini-stat"><div class="label">胜率</div><div class="value" id="statWinRate">--</div></div>
+            <div class="mini-stat"><div class="label">盈亏比</div><div class="value" id="statPF">--</div></div>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="tradeStatsChart"></canvas>
+            <div class="chart-meta"><span id="tradeStatsLeft">等待交易</span><span id="tradeStatsRight">--</span></div>
+          </div>
+        </div>
       </aside>
     </section>
   </main>
@@ -1901,7 +1941,6 @@ HTML = r"""
     function renderEvents(){ const list=document.getElementById("eventList"); if(!list)return; const text=[`价格流 ${state.priceConnected?"正常":"异常"}`,`大单流 ${state.tradeConnected?"正常":"异常"}`,`爆仓流 ${state.liqConnected?"正常":"异常"}`,`事件 ${state.events.length}`]; const latest=state.events.slice(0,4).map(ev=>{ const cls=ev.side==="BUY"?"buy":"sell"; return `<div class="event"><div class="event-side ${cls}">${ev.label}</div><div><div class="event-title"><span>${base(ev.symbol)}</span><span>${money(ev.notional)}</span></div><div class="event-meta">${new Date(ev.ts).toLocaleTimeString()} · 后台记录</div></div></div>`; }).join(""); list.innerHTML=`<div class="event"><div></div><div><div class="event-title">后台监控状态</div><div class="event-meta">${text.join(" · ")}</div></div></div>${latest}`; }
     function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,price:r.price,forecast_side:r.forecast.side,forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),forecast_5m_expected_pct:Number(r.forecast.expected5Pct.toFixed(3)),required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),take_profit_pct:r.forecast.targets?Number(r.forecast.targets.takeProfit.toFixed(3)):null,trail_arm_pct:r.forecast.targets?Number(r.forecast.targets.trailArm.toFixed(3)):null,funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),price_1m_pct:Number(r.p1.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,atr_pct:r.cm.atrPct,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_5m_pct:r.d.oi5Pct,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,risks:r.risks,reasons:r.reasons})); }
     function compactEvents(){ return state.events.slice(0,40).map(e=>({symbol:e.symbol,base:base(e.symbol),label:e.label,side:e.side,price:e.price,notional:Math.round(e.notional),time:new Date(e.ts).toLocaleTimeString()})); }
-    async function runAi(){ const btn=document.getElementById("aiBtn"), out=document.getElementById("aiOutput"); btn.disabled=true; out.textContent="正在分析当前大资金流..."; try{ const all=rows(); const payload={summary:{scanned_symbols:activeSymbols().length,follow_long:all.filter(r=>r.follow==="FOLLOW_LONG").length,follow_short:all.filter(r=>r.follow==="FOLLOW_SHORT").length,large_trade_threshold_usd:LARGE_TRADE_USD,taker_fee_bps:TAKER_FEE_BPS,slippage_bps:SLIPPAGE_BPS,safety_edge_bps:SAFETY_EDGE_BPS,base_required_cost_pct:Number(baseCostPct().toFixed(3)),hold_minutes:HOLD_MINUTES,generated_at:new Date().toLocaleString()},rows:compactRows(),events:compactEvents()}; const res=await fetch("/api/ai/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); const data=await res.json(); out.textContent=(data.mode==="ai"?"AI 分析\n\n":"规则分析\n\n")+data.analysis; }catch(err){ out.textContent="分析失败："+err; }finally{ btn.disabled=false; } }
     function trimOld(){ const cut=now()-6*60*1000; for(const map of [state.trades,state.liquidations]){ for(const [sym,list] of map){ while(list.length&&list[0].ts<cut)list.shift(); if(!list.length)map.delete(sym); } } }
 
     const loggedSignalKeys = new Set();
@@ -1971,27 +2010,64 @@ HTML = r"""
       const rect=canvas.getBoundingClientRect(), ratio=window.devicePixelRatio||1;
       canvas.width=Math.max(1,Math.floor(rect.width*ratio)); canvas.height=Math.max(1,Math.floor(rect.height*ratio));
       const ctx=canvas.getContext("2d"); ctx.setTransform(ratio,0,0,ratio,0,0);
-      const w=rect.width, h=rect.height, pad=26;
+      const w=rect.width, h=rect.height, padL=46, padR=12, padT=16, padB=26;
       ctx.clearRect(0,0,w,h); ctx.fillStyle="#fff"; ctx.fillRect(0,0,w,h);
-      ctx.strokeStyle="#edf1f5"; ctx.lineWidth=1;
-      for(let i=0;i<4;i++){ const y=pad+(h-pad*2)*i/3; ctx.beginPath(); ctx.moveTo(pad,y); ctx.lineTo(w-pad,y); ctx.stroke(); }
       if(!points||points.length<2){
-        ctx.fillStyle="#68758a"; ctx.font="12px Inter, sans-serif"; ctx.fillText("连接模拟盘后显示收益曲线",pad,Math.floor(h/2));
+        ctx.fillStyle="#68758a"; ctx.font="12px Inter, sans-serif"; ctx.fillText("等待收益数据",padL,Math.floor(h/2));
         if(left)left.textContent="等待数据"; if(right){ right.textContent="--"; right.className=""; }
         return;
       }
       const vals=points.map(p=>Number(p.equity||0)).filter(Number.isFinite);
-      const min=Math.min(...vals), max=Math.max(...vals), span=Math.max(max-min,Math.max(max,1)*0.001);
+      const minRaw=Math.min(...vals), maxRaw=Math.max(...vals), padVal=Math.max((maxRaw-minRaw)*0.16,Math.max(maxRaw,1)*0.001);
+      const min=minRaw-padVal, max=maxRaw+padVal, span=Math.max(max-min,1e-9);
       const first=vals[0], last=vals[vals.length-1];
-      const x=i=>pad+(w-pad*2)*i/Math.max(1,points.length-1);
-      const y=v=>pad+(max-v)/span*(h-pad*2);
-      ctx.strokeStyle=last>=first?"#087f5b":"#c92a2a"; ctx.lineWidth=2.5; ctx.beginPath();
+      const x=i=>padL+(w-padL-padR)*i/Math.max(1,points.length-1);
+      const y=v=>padT+(max-v)/span*(h-padT-padB);
+      ctx.strokeStyle="#edf1f5"; ctx.lineWidth=1;
+      ctx.fillStyle="#68758a"; ctx.font="10px Inter, sans-serif";
+      for(let i=0;i<5;i++){ const v=min+(max-min)*i/4, yy=y(v); ctx.beginPath(); ctx.moveTo(padL,yy); ctx.lineTo(w-padR,yy); ctx.stroke(); ctx.fillText(usdt(v),6,yy+3); }
+      const color=last>=first?"#087f5b":"#c92a2a";
+      const grad=ctx.createLinearGradient(0,padT,0,h-padB); grad.addColorStop(0,last>=first?"rgba(8,127,91,.18)":"rgba(201,42,42,.18)"); grad.addColorStop(1,"rgba(255,255,255,0)");
+      ctx.beginPath(); points.forEach((p,i)=>{ const xx=x(i), yy=y(Number(p.equity||0)); if(i)ctx.lineTo(xx,yy); else ctx.moveTo(xx,yy); });
+      ctx.lineTo(x(points.length-1),h-padB); ctx.lineTo(x(0),h-padB); ctx.closePath(); ctx.fillStyle=grad; ctx.fill();
+      ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath();
       points.forEach((p,i)=>{ const xx=x(i), yy=y(Number(p.equity||0)); if(i)ctx.lineTo(xx,yy); else ctx.moveTo(xx,yy); });
       ctx.stroke();
-      ctx.fillStyle="#162033"; ctx.font="12px Inter, sans-serif"; ctx.fillText(usdt(max),8,18); ctx.fillText(usdt(min),8,h-10);
-      const pnl=last-first;
-      if(left)left.textContent=`起始 ${usdt(first)} · 当前 ${usdt(last)}`;
+      ctx.fillStyle=color; vals.forEach((v,i)=>{ if(i===vals.length-1||i===0){ ctx.beginPath(); ctx.arc(x(i),y(v),3,0,Math.PI*2); ctx.fill(); } });
+      const pnl=last-first, peak=Math.max(...vals), dd=last-peak;
+      if(left)left.textContent=`起始 ${usdt(first)} · 当前 ${usdt(last)} · 回撤 ${dd<0?usdt(dd):"$0.00"}`;
       if(right){ right.textContent=`收益 ${pnl>=0?"+":""}${usdt(pnl)}`; right.className=pnl>=0?"up":"down"; }
+    }
+    function drawTradeStatsChart(stats){
+      const canvas=document.getElementById("tradeStatsChart");
+      const left=document.getElementById("tradeStatsLeft"), right=document.getElementById("tradeStatsRight");
+      if(!canvas)return;
+      const rect=canvas.getBoundingClientRect(), ratio=window.devicePixelRatio||1;
+      canvas.width=Math.max(1,Math.floor(rect.width*ratio)); canvas.height=Math.max(1,Math.floor(rect.height*ratio));
+      const ctx=canvas.getContext("2d"); ctx.setTransform(ratio,0,0,ratio,0,0);
+      const w=rect.width,h=rect.height,padL=36,padR=12,padT=14,padB=24;
+      ctx.clearRect(0,0,w,h); ctx.fillStyle="#fff"; ctx.fillRect(0,0,w,h);
+      const recent=(stats&&stats.recent||[]).slice(-40), vals=recent.map(x=>Number(x.realized||0));
+      if(!vals.length){
+        ctx.fillStyle="#68758a"; ctx.font="12px Inter, sans-serif"; ctx.fillText("等待平仓交易",padL,Math.floor(h/2));
+        if(left)left.textContent="等待交易"; if(right)right.textContent="--";
+        return;
+      }
+      const cum=[]; vals.reduce((s,v,i)=>{ cum[i]=s+v; return cum[i]; },0);
+      const all=[...vals,...cum,0], min=Math.min(...all), max=Math.max(...all), span=Math.max(max-min,0.01);
+      const x=i=>padL+(w-padL-padR)*(i+.5)/vals.length;
+      const y=v=>padT+(max-v)/span*(h-padT-padB);
+      const zeroY=y(0);
+      ctx.strokeStyle="#edf1f5"; ctx.lineWidth=1;
+      for(let i=0;i<4;i++){ const yy=padT+(h-padT-padB)*i/3; ctx.beginPath(); ctx.moveTo(padL,yy); ctx.lineTo(w-padR,yy); ctx.stroke(); }
+      ctx.strokeStyle="#a8b2c1"; ctx.beginPath(); ctx.moveTo(padL,zeroY); ctx.lineTo(w-padR,zeroY); ctx.stroke();
+      const barW=Math.max(3,(w-padL-padR)/vals.length*.62);
+      vals.forEach((v,i)=>{ const yy=y(v); ctx.fillStyle=v>=0?"rgba(8,127,91,.78)":"rgba(201,42,42,.72)"; ctx.fillRect(x(i)-barW/2,Math.min(yy,zeroY),barW,Math.max(2,Math.abs(zeroY-yy))); });
+      ctx.strokeStyle="#162033"; ctx.lineWidth=1.8; ctx.beginPath();
+      cum.forEach((v,i)=>{ const xx=x(i), yy=y(v); if(i)ctx.lineTo(xx,yy); else ctx.moveTo(xx,yy); }); ctx.stroke();
+      const net=Number(stats.net||0), pf=Number(stats.profit_factor||0);
+      if(left)left.textContent=`最近 ${vals.length} 笔 · 胜 ${stats.wins||0} / 负 ${stats.losses||0}`;
+      if(right){ right.textContent=`净利 ${net>=0?"+":""}${usdt(net)} · PF ${pf?pf.toFixed(2):"--"}`; right.className=net>=0?"up":"down"; }
     }
     function updateExecutionModeUi(mode){
       const isPaper=(mode||"paper")==="paper";
@@ -2030,7 +2106,14 @@ HTML = r"""
       const log=document.getElementById("tradeLog");
       const events=(data.events||[]).slice(0,8);
       log.innerHTML=events.length?events.map(e=>`<div class="${e.level==="error"?"down":e.level==="warn"?"":"up"}">${new Date(e.ts).toLocaleTimeString()} · ${esc(e.message)}</div>`).join(""):`<div>${esc(data.message||"等待模拟盘连接。")}</div>`;
+      const stats=data.trade_stats||{};
+      document.getElementById("statTrades").textContent=stats.count||0;
+      document.getElementById("statNet").textContent=(Number(stats.net||0)>=0?"+":"")+usdt(stats.net||0);
+      document.getElementById("statNet").className="value "+(Number(stats.net||0)>=0?"up":"down");
+      document.getElementById("statWinRate").textContent=(stats.count?Number(stats.win_rate||0).toFixed(1):"--")+"%";
+      document.getElementById("statPF").textContent=stats.count?(Number(stats.profit_factor||0).toFixed(2)):"--";
       drawPnlChart(data.equity_curve||[]);
+      drawTradeStatsChart(stats);
     }
     async function loadTestnetStatus(){
       try{ const res=await fetch("/api/testnet/status"); renderTestnetStatus(await res.json()); }
@@ -2097,7 +2180,6 @@ HTML = r"""
     function connectLiquidations(runId,index=0){ const host=BINANCE_WS_BASES[index%BINANCE_WS_BASES.length]; const ws=new WebSocket(`${host}/ws/!forceOrder@arr`); state.sockets.push(ws); const next=()=>setTimeout(()=>{ if(runId===state.runId)connectLiquidations(runId,index+1); },1000); const timeout=setTimeout(()=>{ if(runId!==state.runId)return; if(ws.readyState===WebSocket.CONNECTING){ state.liqError=`爆仓流超时：${host}`; try{ws.close();}catch(_){} next(); } },8000); ws.onopen=()=>{ if(runId!==state.runId)return; clearTimeout(timeout); state.liqConnected=true; state.liqError=""; render(); }; ws.onclose=()=>{ if(runId!==state.runId)return; clearTimeout(timeout); state.liqConnected=false; setTimeout(()=>{ if(runId===state.runId)connectLiquidations(runId,index); },3000); }; ws.onerror=()=>{ if(runId!==state.runId)return; state.liqError=`爆仓流连接失败：${host}`; render(); }; ws.onmessage=e=>{ if(runId!==state.runId)return; state.liqMessages++; const order=(JSON.parse(e.data)||{}).o||{}; const symbol=order.s; if(!activeSet().has(symbol))return; const p=Number(order.ap||order.p||0), q=Number(order.q||0), notional=p*q, threshold=tradeThreshold(symbol); if(notional<threshold)return; const side=order.S||""; const row={symbol,side,ts:order.T||Date.now(),price:p,qty:q,notional,threshold}; ensureList(state.liquidations,symbol).push(row); addEvent({...row,label:side==="BUY"?"空爆":"多爆"}); }; }
     async function start(){ state.runId++; const runId=state.runId; closeSockets(); await refreshMarketUniverse(); connectPrice(runId); connectTrades(runId); connectLiquidations(runId); fetchKlines(); fetchDerivatives(); if(!state.marketTimer)state.marketTimer=setInterval(refreshMarketUniverse,60*1000); if(!state.derivativesTimer)state.derivativesTimer=setInterval(fetchDerivatives,45*1000); if(!state.klineTimer)state.klineTimer=setInterval(fetchKlines,60*1000); render(); renderEvents(); }
     document.getElementById("refresh").addEventListener("click",start);
-    document.getElementById("aiBtn").addEventListener("click",runAi);
     document.getElementById("saveTradeCfg").addEventListener("click",saveTestnetConfig);
     document.getElementById("executionMode").addEventListener("change",handleExecutionModeChange);
     document.getElementById("autoTradeToggle").addEventListener("change",()=>{ markTradeFormDirty(); saveTestnetConfig(); });
@@ -2119,7 +2201,7 @@ HTML = r"""
     setInterval(loadTestnetStatus,5000);
     setTimeout(loadSignalStats,5000);
     setTimeout(loadTestnetStatus,1000);
-    window.addEventListener("resize",()=>drawPnlChart((state.testnet&&state.testnet.equity_curve)||[]));
+    window.addEventListener("resize",()=>{ drawPnlChart((state.testnet&&state.testnet.equity_curve)||[]); drawTradeStatsChart((state.testnet&&state.testnet.trade_stats)||{}); });
     start();
   </script>
 </body>
