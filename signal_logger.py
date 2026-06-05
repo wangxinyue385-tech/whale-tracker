@@ -95,6 +95,19 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_events_type ON trade_events(event_type)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_closes_ts ON trade_closes(ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_closes_symbol ON trade_closes(symbol)")
+        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
+        for name, ddl in {
+            "price_1m": "ALTER TABLE signals ADD COLUMN price_1m REAL DEFAULT NULL",
+            "price_3m": "ALTER TABLE signals ADD COLUMN price_3m REAL DEFAULT NULL",
+            "ret_1m": "ALTER TABLE signals ADD COLUMN ret_1m REAL DEFAULT NULL",
+            "ret_3m": "ALTER TABLE signals ADD COLUMN ret_3m REAL DEFAULT NULL",
+            "outcome_1m": "ALTER TABLE signals ADD COLUMN outcome_1m TEXT DEFAULT NULL",
+            "outcome_3m": "ALTER TABLE signals ADD COLUMN outcome_3m TEXT DEFAULT NULL",
+            "filled_1m": "ALTER TABLE signals ADD COLUMN filled_1m INTEGER DEFAULT 0",
+            "filled_3m": "ALTER TABLE signals ADD COLUMN filled_3m INTEGER DEFAULT 0",
+        }.items():
+            if name not in existing_cols:
+                conn.execute(ddl)
         conn.commit()
 
 
@@ -363,6 +376,30 @@ def fill_prices(price_map: dict[str, float]) -> None:
     now_ms = int(time.time() * 1000)
 
     with _get_conn() as conn:
+        for minutes in (1, 3):
+            pending = conn.execute(
+                f"""
+                SELECT id, symbol, follow, price, ts
+                FROM signals
+                WHERE filled_{minutes}m=0 AND ts <= ?
+                """,
+                (now_ms - minutes * 60 * 1000,),
+            ).fetchall()
+            for sig in pending:
+                cur = price_map.get(sig["symbol"])
+                if cur is None:
+                    continue
+                entry = sig["price"] or 0
+                ret = (cur - entry) / entry * 100 if entry else 0
+                conn.execute(
+                    f"""
+                    UPDATE signals
+                    SET price_{minutes}m=?, ret_{minutes}m=?, outcome_{minutes}m=?, filled_{minutes}m=1
+                    WHERE id=?
+                    """,
+                    (cur, round(ret, 4), _calc_outcome(sig["follow"], ret), sig["id"]),
+                )
+
         pending_5m = conn.execute(
             """
             SELECT id, symbol, follow, price, ts
@@ -417,7 +454,10 @@ def get_stats() -> dict:
         filled = conn.execute("SELECT COUNT(*) FROM signals WHERE filled_5m=1").fetchone()[0]
         rows = conn.execute(
             """
-            SELECT follow, outcome_5m, outcome_15m, ret_5m, ret_15m, filled_15m, features
+            SELECT follow,
+                   outcome_1m, outcome_3m, outcome_5m, outcome_15m,
+                   ret_1m, ret_3m, ret_5m, ret_15m,
+                   filled_1m, filled_3m, filled_15m, features
             FROM signals
             WHERE filled_5m=1
             """
@@ -442,6 +482,16 @@ def get_stats() -> dict:
         n = len(subset)
         wins_5m = sum(1 for r in subset if r["outcome_5m"] == "WIN")
         wins_15m = sum(1 for r in subset if r["outcome_15m"] == "WIN")
+        rets_1m = [
+            directional
+            for r in subset
+            if r["filled_1m"] and (directional := _directional_ret(r["follow"], r["ret_1m"])) is not None
+        ]
+        rets_3m = [
+            directional
+            for r in subset
+            if r["filled_3m"] and (directional := _directional_ret(r["follow"], r["ret_3m"])) is not None
+        ]
         rets_5m = [
             directional
             for r in subset
@@ -458,8 +508,12 @@ def get_stats() -> dict:
         gross_loss = abs(sum(lose_ret_5m))
         return {
             "count": n,
+            "winrate_1m": round(sum(1 for r in subset if r["outcome_1m"] == "WIN") / len(rets_1m) * 100, 1) if rets_1m else None,
+            "winrate_3m": round(sum(1 for r in subset if r["outcome_3m"] == "WIN") / len(rets_3m) * 100, 1) if rets_3m else None,
             "winrate_5m": round(wins_5m / n * 100, 1),
             "winrate_15m": round(wins_15m / len(rets_15m) * 100, 1) if rets_15m else None,
+            "avg_ret_1m": round(statistics.mean(rets_1m), 3) if rets_1m else None,
+            "avg_ret_3m": round(statistics.mean(rets_3m), 3) if rets_3m else None,
             "avg_ret_5m": round(statistics.mean(rets_5m), 3) if rets_5m else None,
             "avg_ret_15m": round(statistics.mean(rets_15m), 3) if rets_15m else None,
             "avg_win_5m": round(statistics.mean(win_ret_5m), 3) if win_ret_5m else None,
