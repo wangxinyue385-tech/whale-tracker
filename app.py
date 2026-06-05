@@ -157,21 +157,43 @@ _market_snapshots: dict[str, dict] = {}
 _market_snapshot_version = 0
 _paper_cash = PAPER_STARTING_BALANCE
 _paper_positions: dict[str, dict] = {}
-PRIMARY_AUTO_STRATEGIES = {"flow_exhaustion_reversal", "sector_lead_lag", "liquidation_reversal"}
+REMOVED_AUTO_STRATEGIES = {"flow_exhaustion_reversal"}
+PRIMARY_AUTO_STRATEGIES = {"sector_lead_lag", "liquidation_reversal"}
+STRATEGY_MODE_MAP = {
+    "primary": PRIMARY_AUTO_STRATEGIES,
+    "sector_liquidation": {"sector_lead_lag", "liquidation_reversal"},
+    "sector_lead_lag": {"sector_lead_lag"},
+    "liquidation_reversal": {"liquidation_reversal"},
+}
+LEGACY_STRATEGY_MODE_ALIASES = {
+    "exhaustion_sector": "sector_lead_lag",
+    "exhaustion_liquidation": "liquidation_reversal",
+    "flow_exhaustion_reversal": "liquidation_reversal",
+}
+STRATEGY_MODE_LABELS = {
+    "primary": "主信号组合：板块+爆仓",
+    "sector_liquidation": "两信号：板块+爆仓",
+    "sector_lead_lag": "单信号：板块滞后",
+    "liquidation_reversal": "单信号：爆仓反弹",
+}
 
 
 def _strategy_mode() -> str:
     mode = str(_testnet_config.get("strategy_mode") or "primary").strip()
-    if mode in PRIMARY_AUTO_STRATEGIES or mode == "primary":
+    if mode in STRATEGY_MODE_MAP:
         return mode
+    if mode in LEGACY_STRATEGY_MODE_ALIASES:
+        return LEGACY_STRATEGY_MODE_ALIASES[mode]
     return "primary"
 
 
 def _strategy_allowed_for_auto(strategy: str) -> bool:
-    mode = _strategy_mode()
-    if mode == "primary":
-        return strategy in PRIMARY_AUTO_STRATEGIES
-    return strategy == mode
+    strategy = str(strategy or "").strip()
+    return bool(strategy) and strategy not in REMOVED_AUTO_STRATEGIES and strategy in STRATEGY_MODE_MAP[_strategy_mode()]
+
+
+def _strategy_mode_label() -> str:
+    return STRATEGY_MODE_LABELS.get(_strategy_mode(), STRATEGY_MODE_LABELS["primary"])
 
 
 def _public_testnet_get(path: str, params: dict | None = None) -> dict:
@@ -374,7 +396,10 @@ def _confirmed_entry_rows(rows: list[dict], market_rows: list[dict] | None, now_
         follow = row.get("follow")
         if follow not in {"FOLLOW_LONG", "FOLLOW_SHORT"}:
             continue
-        current[_entry_key(symbol, str(follow), str(row.get("strategy") or "flow_momentum"))] = row
+        strategy = str(row.get("strategy") or "").strip()
+        if not _strategy_allowed_for_auto(strategy):
+            continue
+        current[_entry_key(symbol, str(follow), strategy)] = row
 
     max_gap_ms = max(1, ENTRY_CONFIRM_MAX_GAP_SECONDS) * 1000
     needed = max(1, ENTRY_CONFIRM_SNAPSHOTS)
@@ -676,10 +701,14 @@ def _would_open_same_side(symbol: str, side: str, meta: dict, now_ms: int) -> tu
     snap = _market_snapshots.get(symbol) or {}
     if not snap or now_ms - int(snap.get("ts") or 0) > 15 * 1000:
         return False, snap
+    cur_strategy = str(meta.get("strategy") or "")
+    if cur_strategy and not _strategy_allowed_for_auto(cur_strategy):
+        return False, snap
     if snap.get("follow") != _same_side_follow(side):
         return False, snap
     snap_strategy = str(snap.get("strategy") or "")
-    cur_strategy = str(meta.get("strategy") or "")
+    if snap_strategy and not _strategy_allowed_for_auto(snap_strategy):
+        return False, snap
     if snap_strategy and cur_strategy and snap_strategy != cur_strategy:
         return False, snap
     return True, snap
@@ -706,6 +735,8 @@ def _snapshot_direction(snap: dict) -> str:
 
 
 def _same_direction_still_valid(side: str, snap: dict) -> bool:
+    if not _strategy_allowed_for_auto(str(snap.get("strategy") or "")):
+        return False
     direction = _snapshot_direction(snap)
     if direction != side:
         return False
@@ -902,6 +933,7 @@ def _close_due_positions(account: dict | None = None) -> None:
         last_add_at = int(meta.get("last_add_at") or 0)
         if (
             would_open
+            and _strategy_allowed_for_auto(str(meta.get("strategy") or ""))
             and gross_pnl <= -POSITION_ADD_GROSS_LOSS_USDT
             and pnl_pct > EXIT_HARD_STOP_PCT * 0.70
             and add_count < POSITION_MAX_ADDS
@@ -1138,13 +1170,15 @@ def _public_testnet_status() -> dict:
         "has_api_key": bool(cfg.get("api_key")),
         "has_api_secret": bool(cfg.get("api_secret")),
         "auto_trade": bool(cfg.get("auto_trade")),
-      "order_usdt": cfg.get("order_usdt"),
-      "leverage": cfg.get("leverage"),
-      "max_positions": cfg.get("max_positions"),
-      "cooldown_seconds": cfg.get("cooldown_seconds"),
-      "auto_close_minutes": cfg.get("auto_close_minutes"),
-      "strategy_mode": _strategy_mode(),
-      "events": events[:200],
+        "order_usdt": cfg.get("order_usdt"),
+        "leverage": cfg.get("leverage"),
+        "max_positions": cfg.get("max_positions"),
+        "cooldown_seconds": cfg.get("cooldown_seconds"),
+        "auto_close_minutes": cfg.get("auto_close_minutes"),
+        "strategy_mode": _strategy_mode(),
+        "strategy_mode_label": _strategy_mode_label(),
+        "allowed_strategies": sorted(STRATEGY_MODE_MAP[_strategy_mode()]),
+        "events": events[:200],
         "equity_curve": _equity_curve[-120:],
         "trade_stats": trade_stats,
     }
@@ -1489,7 +1523,11 @@ HTML = r"""
             <label>杠杆<input id="tradeLeverage" type="number" min="1" max="20" step="1" value="4"></label>
             <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="10"></label>
             <label>平仓分钟<input id="autoCloseMinutes" type="number" min="1" step="1" value="5"></label>
-            <label class="wide">策略模式<select id="strategyMode"><option value="primary">主信号组合</option><option value="flow_exhaustion_reversal">只测大单耗尽反向</option><option value="sector_lead_lag">只测板块滞后</option><option value="liquidation_reversal">只测爆仓反弹</option></select></label>
+            <label class="wide">策略模式<select id="strategyMode">
+              <option value="primary">主信号组合：板块+爆仓</option>
+              <option value="sector_lead_lag">单信号：板块滞后</option>
+              <option value="liquidation_reversal">单信号：爆仓反弹</option>
+            </select></label>
           </div>
           <div class="trade-actions">
             <label class="toggle"><input id="autoTradeToggle" type="checkbox">FOLLOW 自动下单</label>
@@ -1567,7 +1605,7 @@ HTML = r"""
     const MICRO = {
       enableMomentum:false,
       invertFollow:false,
-      enableExhaustionReversal:true,
+      enableExhaustionReversal:false,
       minLiqX:2.2,
       strongLiqX:5.2,
       washoutP5:0.45,
@@ -2118,12 +2156,19 @@ HTML = r"""
       return {symbol,base:base(symbol),price:state.prices.get(symbol)||0,p1,p3,p5,f60,f5,l5,d,m:meta(symbol),cm,mb,threshold,signal,score,follow,label,strategy,strategyLabel,mainSignal,signalVariant,rawFollow,rawLabel,rawStrategy,rawStrategyLabel,rawForecast,forecast,cost,risks,reasons};
     }
     function rows(){ return activeSymbols().map(scoreRow).sort((a,b)=>b.score-a.score||Math.abs(b.f60.net)-Math.abs(a.f60.net)||Number(b.m.quoteVolume||0)-Number(a.m.quoteVolume||0)); }
-    function filteredRows(){ const q=document.getElementById("search").value.trim().toUpperCase(); return rows().filter(r=>{ if(q&&!r.symbol.includes(q)&&!r.base.includes(q))return false; if(state.activeFilter==="follow")return r.follow==="FOLLOW_LONG"||r.follow==="FOLLOW_SHORT"; if(state.activeFilter==="long")return r.signal==="LONG"; if(state.activeFilter==="short")return r.signal==="SHORT"; if(state.activeFilter==="alts")return !MAJORS.has(r.symbol); return true; }); }
-    function badge(row){ if(row.follow==="FOLLOW_LONG")return `<span class="badge long">${esc(row.label||"策略多")}</span>`; if(row.follow==="FOLLOW_SHORT")return `<span class="badge short">${esc(row.label||"策略空")}</span>`; if(row.follow==="WATCH_LONG")return '<span class="badge long">多头异动</span>'; if(row.follow==="WATCH_SHORT")return '<span class="badge short">空头异动</span>'; return '<span class="badge watch">观察</span>'; }
+    function allowedStrategySet(){
+      const items=state.testnet&&Array.isArray(state.testnet.allowed_strategies)?state.testnet.allowed_strategies:["sector_lead_lag","liquidation_reversal"];
+      return new Set(items);
+    }
+    function strategyAllowed(row){ return !!(row&&row.strategy&&allowedStrategySet().has(row.strategy)); }
+    function isFollowSignal(row){ return row.follow==="FOLLOW_LONG"||row.follow==="FOLLOW_SHORT"; }
+    function isAutoSignal(row){ return isFollowSignal(row)&&strategyAllowed(row); }
+    function filteredRows(){ const q=document.getElementById("search").value.trim().toUpperCase(); return rows().filter(r=>{ if(q&&!r.symbol.includes(q)&&!r.base.includes(q))return false; if(state.activeFilter==="follow")return isAutoSignal(r); if(state.activeFilter==="long")return r.signal==="LONG"; if(state.activeFilter==="short")return r.signal==="SHORT"; if(state.activeFilter==="alts")return !MAJORS.has(r.symbol); return true; }); }
+    function badge(row){ if(isFollowSignal(row)&&!strategyAllowed(row))return '<span class="badge watch">模式过滤</span>'; if(row.follow==="FOLLOW_LONG")return `<span class="badge long">${esc(row.label||"策略多")}</span>`; if(row.follow==="FOLLOW_SHORT")return `<span class="badge short">${esc(row.label||"策略空")}</span>`; if(row.follow==="WATCH_LONG")return '<span class="badge long">多头异动</span>'; if(row.follow==="WATCH_SHORT")return '<span class="badge short">空头异动</span>'; return '<span class="badge watch">观察</span>'; }
     function setDot(id,ok,err){ const el=document.getElementById(id); el.classList.toggle("ok",ok); el.classList.toggle("bad",!!err); }
     function addEvent(ev){ state.events.unshift(ev); state.events=state.events.slice(0,220); }
 
-    function renderStats(all){ document.getElementById("statSymbols").textContent=activeSymbols().length; document.getElementById("statLong").textContent=all.filter(r=>r.follow==="FOLLOW_LONG").length; document.getElementById("statShort").textContent=all.filter(r=>r.follow==="FOLLOW_SHORT").length; document.getElementById("statCost").textContent=baseCostPct().toFixed(2)+"%"; document.getElementById("statLiq").textContent=money(all.reduce((s,r)=>s+r.l5.total,0)); setDot("priceDot",state.priceConnected,state.priceError); setDot("tradeDot",state.tradeConnected,state.tradeError); setDot("liqDot",state.liqConnected,state.liqError); const err=[state.priceError,state.tradeError,state.liqError,state.restError].filter(Boolean); document.getElementById("connText").textContent=err.length?"连接错误":`实时连接中 · 价格${state.priceMessages} 大单${state.tradeMessages} 范围${activeSymbols().length}`; document.getElementById("errorNote").textContent=err[0]||""; }
+    function renderStats(all){ const active=all.filter(isAutoSignal); document.getElementById("statSymbols").textContent=activeSymbols().length; document.getElementById("statLong").textContent=active.filter(r=>r.follow==="FOLLOW_LONG").length; document.getElementById("statShort").textContent=active.filter(r=>r.follow==="FOLLOW_SHORT").length; document.getElementById("statCost").textContent=baseCostPct().toFixed(2)+"%"; document.getElementById("statLiq").textContent=money(all.reduce((s,r)=>s+r.l5.total,0)); setDot("priceDot",state.priceConnected,state.priceError); setDot("tradeDot",state.tradeConnected,state.tradeError); setDot("liqDot",state.liqConnected,state.liqError); const err=[state.priceError,state.tradeError,state.liqError,state.restError].filter(Boolean); document.getElementById("connText").textContent=err.length?"连接错误":`实时连接中 · 价格${state.priceMessages} 大单${state.tradeMessages} 范围${activeSymbols().length}`; document.getElementById("errorNote").textContent=err[0]||""; }
     function detailItem(label,value){ return `<div class="detail-item"><div class="detail-label">${label}</div><div class="detail-value">${value}</div></div>`; }
     function renderDetail(row){
       const reasons=row.reasons.map(x=>`<span class="chip">${x}</span>`).join("");
@@ -2169,12 +2214,14 @@ HTML = r"""
       return {text:"不交易", cls:"wait", order:"等待下一轮信号"};
     }
     function renderStrategyCard(row){
-      const action=strategyAction(row);
-      const cls=row.follow==="FOLLOW_LONG"?"follow-long":(row.follow==="FOLLOW_SHORT"?"follow-short":"");
+      const allowedByMode=strategyAllowed(row);
+      const action=allowedByMode?strategyAction(row):{text:"模式过滤", cls:"wait", order:"当前策略模式不下单"};
+      const cls=allowedByMode&&row.follow==="FOLLOW_LONG"?"follow-long":(allowedByMode&&row.follow==="FOLLOW_SHORT"?"follow-short":"");
       const sideText=row.forecast.side==="LONG"?"多":(row.forecast.side==="SHORT"?"空":"震荡");
-      const risks=(row.risks.length?row.risks.slice(0,4):["条件正常"]).map(x=>`<span class="chip">${x}</span>`).join("");
+      const riskItems=allowedByMode?(row.risks.length?row.risks.slice(0,4):["条件正常"]):["当前策略模式不下单"];
+      const risks=riskItems.map(x=>`<span class="chip">${x}</span>`).join("");
       const reasons=row.reasons.slice(0,4).map(x=>`<span class="chip">${x}</span>`).join("");
-      const tradeState=(state.testnet&&state.testnet.auto_trade&&state.testnet.account_ok)?action.order:(row.follow.startsWith("FOLLOW")?"等待模拟盘连接/开启自动下单":"不触发模拟单");
+      const tradeState=allowedByMode?((state.testnet&&state.testnet.auto_trade&&state.testnet.account_ok)?action.order:(row.follow.startsWith("FOLLOW")?"等待模拟盘连接/开启自动下单":"不触发模拟单")):"当前策略模式不下单";
       return `<div class="strategy-card ${cls}">
         <div class="strategy-head">
           <div><div class="strategy-symbol">${row.base}</div><div class="small">${row.symbol} · ${price(row.price)}</div></div>
@@ -2195,7 +2242,8 @@ HTML = r"""
     }
     function renderDecisionSummary(all,cards){
       const box=document.getElementById("decisionSummary");
-      const followLong=all.filter(r=>r.follow==="FOLLOW_LONG").length, followShort=all.filter(r=>r.follow==="FOLLOW_SHORT").length;
+      const active=all.filter(isAutoSignal);
+      const followLong=active.filter(r=>r.follow==="FOLLOW_LONG").length, followShort=active.filter(r=>r.follow==="FOLLOW_SHORT").length;
       const best=cards[0];
       const action=best?strategyAction(best):{text:"等待信号",cls:"wait"};
       const market=`BTC ${signedPlain(marketBias().btc,2)} / ETH ${signedPlain(marketBias().eth,2)}`;
@@ -2209,22 +2257,22 @@ HTML = r"""
       const all=rows(), visible=filteredRows();
       renderStats(all);
       const board=document.getElementById("strategyBoard");
-      const follow=visible.filter(r=>r.follow==="FOLLOW_LONG"||r.follow==="FOLLOW_SHORT");
-      const watch=visible.filter(r=>r.follow==="WATCH_LONG"||r.follow==="WATCH_SHORT");
+      const follow=visible.filter(isAutoSignal);
+      const watch=visible.filter(r=>strategyAllowed(r)&&(r.follow==="WATCH_LONG"||r.follow==="WATCH_SHORT"));
       const cards=[...follow,...watch].slice(0,6);
       renderDecisionSummary(all,cards);
-      if(!cards.length){ board.innerHTML='<div class="empty-board">当前没有可测试策略。后台仍在监控 180 个交易对；出现 FOLLOW_LONG / FOLLOW_SHORT 后会自动生成模拟盘买卖方案。</div>'; return; }
+      if(!cards.length){ const mode=state.testnet&&state.testnet.strategy_mode_label?state.testnet.strategy_mode_label:"当前策略模式"; board.innerHTML=`<div class="empty-board">${esc(mode)} 暂无可测试信号。后台仍在监控交易对；出现允许策略的 FOLLOW_LONG / FOLLOW_SHORT 后才会自动生成模拟盘买卖方案。</div>`; return; }
       board.innerHTML=cards.map(renderStrategyCard).join("");
     }
     function renderEvents(){ const list=document.getElementById("eventList"); if(!list)return; const text=[`价格流 ${state.priceConnected?"正常":"异常"}`,`大单流 ${state.tradeConnected?"正常":"异常"}`,`爆仓流 ${state.liqConnected?"正常":"异常"}`,`事件 ${state.events.length}`]; const latest=state.events.slice(0,4).map(ev=>{ const cls=ev.side==="BUY"?"buy":"sell"; return `<div class="event"><div class="event-side ${cls}">${ev.label}</div><div><div class="event-title"><span>${base(ev.symbol)}</span><span>${money(ev.notional)}</span></div><div class="event-meta">${new Date(ev.ts).toLocaleTimeString()} · 后台记录</div></div></div>`; }).join(""); list.innerHTML=`<div class="event"><div></div><div><div class="event-title">后台监控状态</div><div class="event-meta">${text.join(" · ")}</div></div></div>${latest}`; }
-    function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,price:r.price,forecast_side:r.forecast.side,forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),forecast_5m_expected_pct:Number(r.forecast.expected5Pct.toFixed(3)),required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),take_profit_pct:r.forecast.targets?Number(r.forecast.targets.takeProfit.toFixed(3)):null,trail_arm_pct:r.forecast.targets?Number(r.forecast.targets.trailArm.toFixed(3)):null,funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),price_1m_pct:Number(r.p1.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,atr_pct:r.cm.atrPct,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_5m_pct:r.d.oi5Pct,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,book_spread_pct:r.d.bookSpreadPct,book_imbalance:r.d.bookImbalance,bid_depth_usd:r.d.bidDepthUsd,ask_depth_usd:r.d.askDepthUsd,risks:r.risks,reasons:r.reasons})); }
+    function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,strategy:r.strategy,strategy_label:r.strategyLabel,main_signal:r.mainSignal,signal_variant:r.signalVariant,price:r.price,forecast_side:r.forecast.side,forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),forecast_5m_expected_pct:Number(r.forecast.expected5Pct.toFixed(3)),required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),take_profit_pct:r.forecast.targets?Number(r.forecast.targets.takeProfit.toFixed(3)):null,trail_arm_pct:r.forecast.targets?Number(r.forecast.targets.trailArm.toFixed(3)):null,funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),price_1m_pct:Number(r.p1.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,atr_pct:r.cm.atrPct,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_5m_pct:r.d.oi5Pct,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,book_spread_pct:r.d.bookSpreadPct,book_imbalance:r.d.bookImbalance,bid_depth_usd:r.d.bidDepthUsd,ask_depth_usd:r.d.askDepthUsd,risks:r.risks,reasons:r.reasons})); }
     function compactEvents(){ return state.events.slice(0,40).map(e=>({symbol:e.symbol,base:base(e.symbol),label:e.label,side:e.side,price:e.price,notional:Math.round(e.notional),time:new Date(e.ts).toLocaleTimeString()})); }
     function trimOld(){ const cut=now()-6*60*1000; for(const map of [state.trades,state.liquidations]){ for(const [sym,list] of map){ while(list.length&&list[0].ts<cut)list.shift(); if(!list.length)map.delete(sym); } } }
 
     const loggedSignalKeys = new Set();
     function logSignals(){
       const all=rows();
-      const follow=all.filter(r=>r.follow==="FOLLOW_LONG"||r.follow==="FOLLOW_SHORT");
+      const follow=all.filter(isAutoSignal);
       const prices={};
       for(const row of all){ if(row.price)prices[row.symbol]=row.price; }
       const toLog=follow.filter(r=>{
@@ -2432,7 +2480,7 @@ HTML = r"""
       state.testnet=data;
       const note=document.getElementById("tradeConnNote");
       const isPaper=(data.execution_mode||"paper")==="paper";
-      note.textContent=data.account_ok?(isPaper?"本地模拟盘已连接":"Binance Testnet 已连接"):(data.message||"未配置模拟盘 API");
+      note.textContent=data.account_ok?`${isPaper?"本地模拟盘已连接":"Binance Testnet 已连接"} · ${data.strategy_mode_label||"主信号组合"}`:(data.message||"未配置模拟盘 API");
       syncTradeForm(data, forceForm);
       document.getElementById("tradeEquity").textContent=data.account_ok?usdt(data.equity):"--";
       document.getElementById("tradePnl").textContent=data.account_ok?usdt(data.unrealized):"--";
@@ -2534,6 +2582,7 @@ HTML = r"""
     document.getElementById("saveTradeCfg").addEventListener("click",saveTestnetConfig);
     document.getElementById("executionMode").addEventListener("change",handleExecutionModeChange);
     document.getElementById("autoTradeToggle").addEventListener("change",()=>{ markTradeFormDirty(); saveTestnetConfig(); });
+    document.getElementById("strategyMode").addEventListener("change",()=>{ markTradeFormDirty(); saveTestnetConfig(); });
     for(const id of ["testnetKey","testnetSecret","orderUsdt","tradeLeverage","maxPositions","autoCloseMinutes","strategyMode"]){
       document.getElementById(id).addEventListener("input",markTradeFormDirty);
     }
@@ -2655,7 +2704,10 @@ def testnet_config():
             _testnet_config["auto_trade"] = bool(payload.get("auto_trade"))
         if "strategy_mode" in payload:
             mode = str(payload.get("strategy_mode") or "primary").strip()
-            _testnet_config["strategy_mode"] = mode if mode in PRIMARY_AUTO_STRATEGIES or mode == "primary" else "primary"
+            next_mode = mode if mode in STRATEGY_MODE_MAP else LEGACY_STRATEGY_MODE_ALIASES.get(mode, "primary")
+            if next_mode != _strategy_mode():
+                _entry_candidates.clear()
+            _testnet_config["strategy_mode"] = next_mode
         for key, cast, default in [
             ("order_usdt", float, TESTNET_ORDER_USDT),
             ("leverage", int, TESTNET_LEVERAGE),
@@ -2669,9 +2721,9 @@ def testnet_config():
                 except (TypeError, ValueError):
                     _testnet_config[key] = default
         if _is_paper_mode():
-            _event("本地模拟盘配置已更新", "info")
+            _event(f"本地模拟盘配置已更新 · 策略模式：{_strategy_mode_label()}", "info")
         elif _testnet_config.get("api_key") and _testnet_config.get("api_secret"):
-            _event("模拟盘配置已更新", "info")
+            _event(f"模拟盘配置已更新 · 策略模式：{_strategy_mode_label()}", "info")
         else:
             _event("模拟盘配置未完整：第一次连接需要 API Key 和 Secret", "warn")
     return jsonify(_public_testnet_status())
