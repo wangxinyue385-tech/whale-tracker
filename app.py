@@ -98,6 +98,9 @@ EXIT_STALL_LOSS_PCT = float(os.environ.get("EXIT_STALL_LOSS_PCT", "-0.25"))
 EXIT_PROGRESS_EPS_PCT = float(os.environ.get("EXIT_PROGRESS_EPS_PCT", "0.03"))
 EXIT_MAX_HOLD_SECONDS = int(os.environ.get("EXIT_MAX_HOLD_SECONDS", "300"))
 EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT = float(os.environ.get("EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT", "0.05"))
+FUNDING_EXIT_TAKE_PROFIT_PCT = float(os.environ.get("FUNDING_EXIT_TAKE_PROFIT_PCT", "0.45"))
+FUNDING_EXIT_NORMAL_RATE_PCT = float(os.environ.get("FUNDING_EXIT_NORMAL_RATE_PCT", "0.035"))
+FUNDING_EXIT_MAX_HOLD_SECONDS = int(os.environ.get("FUNDING_EXIT_MAX_HOLD_SECONDS", "900"))
 EXIT_REVERSE_SCORE = float(os.environ.get("EXIT_REVERSE_SCORE", "70"))
 EXIT_HOLD_MIN_SCORE = float(os.environ.get("EXIT_HOLD_MIN_SCORE", "65"))
 EXIT_INVALID_SNAPSHOTS = int(os.environ.get("EXIT_INVALID_SNAPSHOTS", "3"))
@@ -258,11 +261,14 @@ def _update_market_snapshots(rows: list[dict] | None) -> None:
             "follow": row.get("follow"),
             "signal": row.get("signal"),
             "score": _safe_float(row.get("score")),
+            "strategy": row.get("strategy") or "flow_momentum",
+            "strategy_label": row.get("strategy_label") or "",
             "price": _safe_float(row.get("price")),
             "price_1m_pct": _safe_float(row.get("price_1m_pct")),
             "price_5m_pct": _safe_float(row.get("price_5m_pct")),
             "net_60s_usd": _safe_float(row.get("net_60s_usd")),
             "net_5m_usd": _safe_float(row.get("net_5m_usd")),
+            "funding_rate": _safe_float(row.get("funding_rate")),
             "risks": row.get("risks") or [],
         }
     cutoff = now_ms - 10 * 60 * 1000
@@ -271,8 +277,11 @@ def _update_market_snapshots(rows: list[dict] | None) -> None:
             _market_snapshots.pop(symbol, None)
 
 
-def _entry_key(symbol: str, follow: str) -> str:
-    return f"{symbol}|{follow}"
+def _entry_key(symbol: str, follow: str, strategy: str = "") -> str:
+    parts = [symbol, follow]
+    if strategy:
+        parts.append(strategy)
+    return "|".join(parts)
 
 
 def _confirmed_entry_rows(rows: list[dict], market_rows: list[dict] | None, now_ms: int) -> list[dict]:
@@ -287,7 +296,7 @@ def _confirmed_entry_rows(rows: list[dict], market_rows: list[dict] | None, now_
         follow = row.get("follow")
         if follow not in {"FOLLOW_LONG", "FOLLOW_SHORT"}:
             continue
-        current[_entry_key(symbol, str(follow))] = row
+        current[_entry_key(symbol, str(follow), str(row.get("strategy") or "flow_momentum"))] = row
 
     max_gap_ms = max(1, ENTRY_CONFIRM_MAX_GAP_SECONDS) * 1000
     needed = max(1, ENTRY_CONFIRM_SNAPSHOTS)
@@ -555,6 +564,10 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     if pnl_pct <= EXIT_HARD_STOP_PCT:
         return f"止损平仓 {pnl_pct:.2f}%"
 
+    strategy = str(meta.get("strategy") or "flow_momentum")
+    if strategy == "funding_reversion" and pnl_pct >= FUNDING_EXIT_TAKE_PROFIT_PCT:
+        return f"费率回归止盈 {pnl_pct:.2f}%"
+
     if pnl_pct >= EXIT_TAKE_PROFIT_PCT:
         return f"净止盈平仓 {pnl_pct:.2f}%"
 
@@ -573,13 +586,22 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     if age_ms < EXIT_MIN_HOLD_SECONDS * 1000:
         return None
 
+    if strategy == "funding_reversion" and snap_fresh:
+        funding_rate = _safe_float(snap.get("funding_rate"))
+        if side == "LONG" and funding_rate >= -FUNDING_EXIT_NORMAL_RATE_PCT:
+            return f"负资金费回归平仓，当前 {funding_rate:.4f}%"
+        if side == "SHORT" and funding_rate <= FUNDING_EXIT_NORMAL_RATE_PCT:
+            return f"正资金费回归平仓，当前 {funding_rate:.4f}%"
+        if reverse and pnl_pct <= EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT:
+            return f"费率单被动量反穿平仓，当前 {pnl_pct:.2f}%"
+
     if peak_pct >= EXIT_PROFIT_ARM_PCT and pnl_pct <= max(0.0, peak_pct * EXIT_TRAIL_KEEP_RATIO):
         return f"移动止盈平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
     if peak_pct >= EXIT_BREAKEVEN_ARM_PCT and pnl_pct <= EXIT_BREAKEVEN_FLOOR_PCT:
         return f"浮盈回吐保护平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
-    if snap_fresh and invalid_count >= EXIT_INVALID_SNAPSHOTS:
+    if snap_fresh and invalid_count >= EXIT_INVALID_SNAPSHOTS and strategy != "funding_reversion":
         return f"当前策略连续 {invalid_count} 次不支持持仓，平仓"
 
     progress_age_ms = now_ms - int(meta.get("last_progress_at") or opened_at)
@@ -590,6 +612,9 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
             return f"信号衰减平仓，最高浮盈 {peak_pct:.2f}%"
         if progress_age_ms >= EXIT_STALL_SECONDS * 1000 and pnl_pct <= EXIT_STALL_LOSS_PCT:
             return f"无进展且浮亏平仓，当前 {pnl_pct:.2f}%"
+
+    if strategy == "funding_reversion" and age_ms >= FUNDING_EXIT_MAX_HOLD_SECONDS * 1000:
+        return f"费率回归到时平仓，持仓 {int(age_ms / 1000)} 秒，最高浮盈 {peak_pct:.2f}%"
 
     if age_ms >= EXIT_MAX_HOLD_SECONDS * 1000:
         if snap_fresh and supported and pnl_pct >= EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT:
@@ -650,6 +675,8 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
         for row in rows:
             symbol = str(row.get("symbol") or "")
             follow = row.get("follow")
+            strategy = str(row.get("strategy") or "flow_momentum")
+            strategy_label = str(row.get("strategy_label") or ("费率回归" if strategy == "funding_reversion" else "大单动量"))
             if follow not in {"FOLLOW_LONG", "FOLLOW_SHORT"} or not symbol:
                 continue
             if open_count >= int(_testnet_config["max_positions"]):
@@ -669,9 +696,11 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                     _set_leverage(symbol)
                     order = _place_market_order(symbol, follow, price)
                 _trade_cooldown[cooldown_key] = now_ms
-                _entry_candidates.pop(cooldown_key, None)
+                _entry_candidates.pop(_entry_key(symbol, str(follow), strategy), None)
                 _auto_positions[symbol] = {
                     "follow": follow,
+                    "strategy": strategy,
+                    "strategy_label": strategy_label,
                     "opened_at": now_ms,
                     "order_id": order.get("orderId"),
                     "entry_price": price,
@@ -687,7 +716,7 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                 }
                 open_count += 1
                 mode = "本地模拟盘" if _is_paper_mode() else "Binance Testnet"
-                _event(f"{symbol} {('做多' if follow == 'FOLLOW_LONG' else '做空')} {mode}自动下单", "info", symbol=symbol, order=order)
+                _event(f"{symbol} {('做多' if follow == 'FOLLOW_LONG' else '做空')} {strategy_label} {mode}自动下单", "info", symbol=symbol, order=order)
             except Exception as exc:  # noqa: BLE001
                 _event(f"{symbol} 自动下单失败：{exc}", "error", symbol=symbol)
 
@@ -1103,6 +1132,12 @@ HTML = r"""
       minTotal5x:4.0,
       majorMaxP1:0.45, altMaxP1:0.75, majorMaxP5:1.20, altMaxP5:2.00,
     };
+    const FUNDING = {
+      extremePct:0.08, normalPct:0.035,
+      minVolume24hUsd:20000000,
+      maxAgainstP1:0.35, coolP1:0.12,
+      minP5Stretch:0.15,
+    };
 
     const state = {
       activeSymbols:[...SEED_SYMBOLS], marketMeta:new Map(), derivatives:new Map(), candles:new Map(),
@@ -1190,6 +1225,34 @@ HTML = r"""
       if(btc>0.18)bias++; if(btc<-0.18)bias--;
       if(eth>0.22)bias++; if(eth<-0.22)bias--;
       return {bias, btc, eth};
+    }
+    function fundingReversionSetup(symbol,p1,p5,f60,cm,d,mb,signal,score,threshold){
+      if(!isNum(d.fundingRate)||Math.abs(d.fundingRate)<FUNDING.extremePct)return null;
+      const quoteVolume=Number((meta(symbol)||{}).quoteVolume||0);
+      if(!MAJORS.has(symbol)&&quoteVolume<FUNDING.minVolume24hUsd)return null;
+      const rate=d.fundingRate, absRate=Math.abs(rate);
+      const closeLocation=isNum(cm.closeLocation)?cm.closeLocation:0.5;
+      const taker=isNum(d.takerRatio)?d.takerRatio:1;
+      const oiOk=!isNum(d.oi15Pct)||d.oi15Pct>-4.0;
+      if(!oiOk)return null;
+      if(rate>0){
+        const crowded=p5>=FUNDING.minP5Stretch||closeLocation>=0.68||taker>=1.15;
+        const cooling=p1<=FUNDING.coolP1||f60.net<0||closeLocation<=0.55;
+        const fightingPump=p1>FUNDING.maxAgainstP1||(signal==="LONG"&&score>=85&&f60.net>threshold);
+        const marketOk=MAJORS.has(symbol)||mb.bias<=1;
+        if(crowded&&cooling&&!fightingPump&&marketOk){
+          return {follow:"FOLLOW_SHORT", side:"SHORT", label:"费率空", strategy:"funding_reversion", strategyLabel:"费率回归", score:Math.min(96,Math.round(72+absRate*100)), reason:`正资金费 ${rate.toFixed(4)}% 拥挤回归`};
+        }
+      }else{
+        const crowded=p5<=-FUNDING.minP5Stretch||closeLocation<=0.32||taker<=0.88;
+        const cooling=p1>=-FUNDING.coolP1||f60.net>0||closeLocation>=0.45;
+        const fightingDump=p1<-FUNDING.maxAgainstP1||(signal==="SHORT"&&score>=85&&f60.net<-threshold);
+        const marketOk=MAJORS.has(symbol)||mb.bias>=-1;
+        if(crowded&&cooling&&!fightingDump&&marketOk){
+          return {follow:"FOLLOW_LONG", side:"LONG", label:"费率多", strategy:"funding_reversion", strategyLabel:"费率回归", score:Math.min(96,Math.round(72+absRate*100)), reason:`负资金费 ${rate.toFixed(4)}% 拥挤回归`};
+        }
+      }
+      return null;
     }
     function forecastModel(symbol,longScore,shortScore,p1,p3,p5,f60,f5,cm,d,mb){
       const edge=longScore-shortScore;
@@ -1315,9 +1378,9 @@ HTML = r"""
       if(isNum(d.fundingRate)&&d.fundingRate>0.04)long-=5; if(isNum(d.fundingRate)&&d.fundingRate<-0.04)short-=5;
       if(!MAJORS.has(symbol)){ if(mb.bias<=-1)long-=8; if(mb.bias<=-2)long-=8; if(mb.bias>=1)short-=8; if(mb.bias>=2)short-=8; }
       long=Math.max(0,Math.min(100,long)); short=Math.max(0,Math.min(100,short));
-      const signal=long>=short&&long>=35?"LONG":short>long&&short>=35?"SHORT":"WATCH"; const score=Math.round(Math.max(long,short));
-      const forecast=forecastModel(symbol,long,short,p1,p3,p5,f60,f5,cm,d,mb);
-      const cost=costModel(d,forecast.side);
+      let signal=long>=short&&long>=35?"LONG":short>long&&short>=35?"SHORT":"WATCH"; let score=Math.round(Math.max(long,short));
+      let forecast=forecastModel(symbol,long,short,p1,p3,p5,f60,f5,cm,d,mb);
+      let cost=costModel(d,forecast.side);
       forecast.netEdgePct=Math.abs(forecast.expected5Pct)-cost.requiredPct;
       forecast.cost=cost;
       const repeatLong=f60.buyCount>=2||f60.lastSide==="BUY"&&f60.streak>=2, repeatShort=f60.sellCount>=2||f60.lastSide==="SELL"&&f60.streak>=2;
@@ -1329,34 +1392,66 @@ HTML = r"""
       const profitOk=forecast.side!=="NEUTRAL"&&forecast.netEdgePct>ALPHA.minEdgePct;
       const forecastLong=forecast.side==="LONG"&&forecast.prob5>=ALPHA.minProb&&forecast.expected5Pct>0;
       const forecastShort=forecast.side==="SHORT"&&forecast.prob5>=ALPHA.minProb&&forecast.expected5Pct<0;
-      const alignedLong=signal==="LONG"&&score>=ALPHA.minScore&&forecastLong&&profitOk&&flowLong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&!oiFallingHard&&f60.largest>=threshold;
-      const alignedShort=signal==="SHORT"&&score>=ALPHA.minScore&&forecastShort&&profitOk&&flowShort&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&!oiFallingHard&&f60.largest>=threshold;
+      const maxP1=MAJORS.has(symbol)?ALPHA.majorMaxP1:ALPHA.altMaxP1, maxP5=MAJORS.has(symbol)?ALPHA.majorMaxP5:ALPHA.altMaxP5;
+      const closeLocation=isNum(cm.closeLocation)?cm.closeLocation:0.5;
+      const chaseLong=p1>maxP1||p5>maxP5||(p1>0.25&&closeLocation>=0.92);
+      const chaseShort=p1<-maxP1||p5<-maxP5||(p1<-0.25&&closeLocation<=0.08);
+      const alignedLong=signal==="LONG"&&score>=ALPHA.minScore&&forecastLong&&profitOk&&flowLong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&!oiFallingHard&&f60.largest>=threshold&&!chaseLong;
+      const alignedShort=signal==="SHORT"&&score>=ALPHA.minScore&&forecastShort&&profitOk&&flowShort&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&!oiFallingHard&&f60.largest>=threshold&&!chaseShort;
+      const fundingSetup=fundingReversionSetup(symbol,p1,p5,f60,cm,d,mb,signal,score,threshold);
+      let follow=alignedLong?"FOLLOW_LONG":alignedShort?"FOLLOW_SHORT":"";
+      let label=alignedLong?"策略多":alignedShort?"策略空":"";
+      let strategy=follow?"flow_momentum":"none";
+      let strategyLabel=follow?"大单动量":"";
+      if(!follow&&fundingSetup){
+        follow=fundingSetup.follow;
+        label=fundingSetup.label;
+        strategy=fundingSetup.strategy;
+        strategyLabel=fundingSetup.strategyLabel;
+        signal=fundingSetup.side;
+        score=Math.max(score,fundingSetup.score);
+        forecast.side=fundingSetup.side;
+        forecast.prob5=Math.max(forecast.prob5,Math.min(76,58+Math.abs(d.fundingRate)*90));
+        const fundingExpected=Math.max(Math.abs(forecast.expected5Pct),0.20+Math.min(0.35,Math.abs(d.fundingRate)*2));
+        forecast.expected5Pct=fundingSetup.side==="LONG"?fundingExpected:-fundingExpected;
+        cost=costModel(d,forecast.side);
+        forecast.cost=cost;
+        forecast.netEdgePct=Math.abs(forecast.expected5Pct)-cost.requiredPct;
+      }
       const risks=[];
-      if(signal!=="WATCH"&&!profitOk)risks.push("成本不过");
-      if(cost.fundingPct>0)risks.push("资金费成本");
-      if(signal==="LONG"&&!priceLong)risks.push("价格未确认"); if(signal==="SHORT"&&!priceShort)risks.push("价格未确认");
-      if(signal==="LONG"&&!flowLong)risks.push("净流不连续"); if(signal==="SHORT"&&!flowShort)risks.push("净流不连续");
-      if(signal==="LONG"&&!repeatLong)risks.push("孤立大单"); if(signal==="SHORT"&&!repeatShort)risks.push("孤立大单");
-      if(!volumeOk)risks.push("量能不足");
-      if(signal==="LONG"&&!marketOkLong)risks.push("大盘反向"); if(signal==="SHORT"&&!marketOkShort)risks.push("大盘反向");
-      if(oiFallingHard)risks.push("OI下降");
+      if(strategy==="funding_reversion"){
+        if(follow==="FOLLOW_LONG"&&f60.net<0&&Math.abs(f60.net)>=threshold)risks.push("短流反向");
+        if(follow==="FOLLOW_SHORT"&&f60.net>0&&Math.abs(f60.net)>=threshold)risks.push("短流反向");
+        if(cost.fundingPct>0)risks.push("资金费成本");
+      }else{
+        if(signal!=="WATCH"&&!profitOk)risks.push("成本不过");
+        if(cost.fundingPct>0)risks.push("资金费成本");
+        if(signal==="LONG"&&!priceLong)risks.push("价格未确认"); if(signal==="SHORT"&&!priceShort)risks.push("价格未确认");
+        if(signal==="LONG"&&!flowLong)risks.push("净流不连续"); if(signal==="SHORT"&&!flowShort)risks.push("净流不连续");
+        if(signal==="LONG"&&!repeatLong)risks.push("孤立大单"); if(signal==="SHORT"&&!repeatShort)risks.push("孤立大单");
+        if(signal==="LONG"&&chaseLong)risks.push("追涨过热"); if(signal==="SHORT"&&chaseShort)risks.push("追空过热");
+        if(!volumeOk)risks.push("量能不足");
+        if(signal==="LONG"&&!marketOkLong)risks.push("大盘反向"); if(signal==="SHORT"&&!marketOkShort)risks.push("大盘反向");
+        if(oiFallingHard)risks.push("OI下降");
+      }
       const reasons=[];
-      if(alignedLong||alignedShort)reasons.push("Alpha过滤通过");
+      if(strategy==="flow_momentum")reasons.push("Alpha过滤通过");
+      if(strategy==="funding_reversion"&&fundingSetup)reasons.push(fundingSetup.reason);
       if(Math.abs(f60.net)>=threshold)reasons.push((f60.net>0?"主动买净流 ":"主动卖净流 ")+money(Math.abs(f60.net)));
       if(f60.largest>=threshold)reasons.push("最大单 "+money(f60.largest));
+      if(isNum(d.fundingRate)&&Math.abs(d.fundingRate)>=FUNDING.extremePct)reasons.push("资金费 "+d.fundingRate.toFixed(4)+"%");
       if(isNum(cm.volSpike))reasons.push("量能 "+cm.volSpike.toFixed(1)+"x");
       if(Math.abs(p5)>=0.25)reasons.push("5m价格 "+(p5>0?"+":"")+p5.toFixed(2)+"%");
       if(isNum(cm.closeLocation))reasons.push("收盘位置 "+Math.round(cm.closeLocation*100)+"%");
       if(isNum(d.oi15Pct)&&Math.abs(d.oi15Pct)>=1.2)reasons.push("OI15m "+(d.oi15Pct>0?"+":"")+d.oi15Pct.toFixed(2)+"%");
       if(isNum(d.takerRatio)&&(d.takerRatio>=1.12||d.takerRatio<=0.9))reasons.push("Taker "+d.takerRatio.toFixed(2));
       if(!reasons.length)reasons.push("等待大额资金流");
-      const follow=alignedLong?"FOLLOW_LONG":alignedShort?"FOLLOW_SHORT":signal==="LONG"?"WATCH_LONG":signal==="SHORT"?"WATCH_SHORT":"WAIT";
-      const label=follow==="FOLLOW_LONG"?"策略多":follow==="FOLLOW_SHORT"?"策略空":follow==="WATCH_LONG"?"多头异动":follow==="WATCH_SHORT"?"空头异动":"观察";
-      return {symbol,base:base(symbol),price:state.prices.get(symbol)||0,p1,p3,p5,f60,f5,l5,d,m:meta(symbol),cm,mb,threshold,signal,score,follow,label,forecast,cost,risks,reasons};
+      if(!follow){ follow=signal==="LONG"?"WATCH_LONG":signal==="SHORT"?"WATCH_SHORT":"WAIT"; label=follow==="WATCH_LONG"?"多头异动":follow==="WATCH_SHORT"?"空头异动":"观察"; }
+      return {symbol,base:base(symbol),price:state.prices.get(symbol)||0,p1,p3,p5,f60,f5,l5,d,m:meta(symbol),cm,mb,threshold,signal,score,follow,label,strategy,strategyLabel,forecast,cost,risks,reasons};
     }
     function rows(){ return activeSymbols().map(scoreRow).sort((a,b)=>b.score-a.score||Math.abs(b.f60.net)-Math.abs(a.f60.net)||Number(b.m.quoteVolume||0)-Number(a.m.quoteVolume||0)); }
     function filteredRows(){ const q=document.getElementById("search").value.trim().toUpperCase(); return rows().filter(r=>{ if(q&&!r.symbol.includes(q)&&!r.base.includes(q))return false; if(state.activeFilter==="follow")return r.follow==="FOLLOW_LONG"||r.follow==="FOLLOW_SHORT"; if(state.activeFilter==="long")return r.signal==="LONG"; if(state.activeFilter==="short")return r.signal==="SHORT"; if(state.activeFilter==="alts")return !MAJORS.has(r.symbol); return true; }); }
-    function badge(row){ if(row.follow==="FOLLOW_LONG")return '<span class="badge long">策略多</span>'; if(row.follow==="FOLLOW_SHORT")return '<span class="badge short">策略空</span>'; if(row.follow==="WATCH_LONG")return '<span class="badge long">多头异动</span>'; if(row.follow==="WATCH_SHORT")return '<span class="badge short">空头异动</span>'; return '<span class="badge watch">观察</span>'; }
+    function badge(row){ if(row.follow==="FOLLOW_LONG")return `<span class="badge long">${esc(row.label||"策略多")}</span>`; if(row.follow==="FOLLOW_SHORT")return `<span class="badge short">${esc(row.label||"策略空")}</span>`; if(row.follow==="WATCH_LONG")return '<span class="badge long">多头异动</span>'; if(row.follow==="WATCH_SHORT")return '<span class="badge short">空头异动</span>'; return '<span class="badge watch">观察</span>'; }
     function setDot(id,ok,err){ const el=document.getElementById(id); el.classList.toggle("ok",ok); el.classList.toggle("bad",!!err); }
     function addEvent(ev){ state.events.unshift(ev); state.events=state.events.slice(0,220); }
 
@@ -1390,8 +1485,8 @@ HTML = r"""
       return expanded ? main + renderDetail(row) : main;
     }
     function strategyAction(row){
-      if(row.follow==="FOLLOW_LONG")return {text:"自动测试做多", cls:"long", order:"模拟盘将市价 BUY"};
-      if(row.follow==="FOLLOW_SHORT")return {text:"自动测试做空", cls:"short", order:"模拟盘将市价 SELL"};
+      if(row.follow==="FOLLOW_LONG")return {text:row.strategy==="funding_reversion"?"自动测试费率多":"自动测试做多", cls:"long", order:"模拟盘将市价 BUY"};
+      if(row.follow==="FOLLOW_SHORT")return {text:row.strategy==="funding_reversion"?"自动测试费率空":"自动测试做空", cls:"short", order:"模拟盘将市价 SELL"};
       if(row.follow==="WATCH_LONG")return {text:"观察多头", cls:"wait", order:"条件未齐，不下单"};
       if(row.follow==="WATCH_SHORT")return {text:"观察空头", cls:"wait", order:"条件未齐，不下单"};
       return {text:"不交易", cls:"wait", order:"等待下一轮信号"};
@@ -1466,13 +1561,14 @@ HTML = r"""
       if(!toLog.length&&Object.keys(prices).length<1)return;
       const positionSymbols=new Set(((state.testnet&&state.testnet.positions)||[]).map(p=>p.symbol));
       const marketRows=all.filter((r,i)=>i<90||positionSymbols.has(r.symbol)||r.follow==="FOLLOW_LONG"||r.follow==="FOLLOW_SHORT").map(r=>({
-        symbol:r.symbol, follow:r.follow, signal:r.signal, score:r.score, price:r.price,
+        symbol:r.symbol, follow:r.follow, signal:r.signal, score:r.score, strategy:r.strategy, strategy_label:r.strategyLabel, price:r.price,
         price_1m_pct:r.p1, price_5m_pct:r.p5,
         net_60s_usd:Math.round(r.f60.net), net_5m_usd:Math.round(r.f5.net),
+        funding_rate:r.d.fundingRate,
         risks:r.risks,
       }));
       const payload=toLog.map(r=>({
-        symbol:r.symbol, follow:r.follow, score:r.score, price:r.price,
+        symbol:r.symbol, follow:r.follow, score:r.score, strategy:r.strategy, strategy_label:r.strategyLabel, price:r.price,
         price_1m_pct:r.p1, price_5m_pct:r.p5,
         net_60s_usd:Math.round(r.f60.net), net_5m_usd:Math.round(r.f5.net),
         flow_60s_imbalance:Number(r.f60.imbalance.toFixed(4)),
@@ -1486,7 +1582,7 @@ HTML = r"""
         candle_body_pct:isNum(r.cm.bodyPct)?Number(r.cm.bodyPct.toFixed(4)):null,
         upper_wick_pct:isNum(r.cm.upperWickPct)?Number(r.cm.upperWickPct.toFixed(4)):null,
         lower_wick_pct:isNum(r.cm.lowerWickPct)?Number(r.cm.lowerWickPct.toFixed(4)):null,
-        oi_15m_pct:r.d.oi15Pct, taker_ratio:r.d.takerRatio,
+        oi_15m_pct:r.d.oi15Pct, taker_ratio:r.d.takerRatio, funding_rate:r.d.fundingRate,
         market_bias:r.mb.bias,
         btc_5m_pct:Number(r.mb.btc.toFixed(4)),
         eth_5m_pct:Number(r.mb.eth.toFixed(4)),
