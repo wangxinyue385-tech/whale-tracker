@@ -102,9 +102,13 @@ EXIT_TRAIL_KEEP_RATIO = float(os.environ.get("EXIT_TRAIL_KEEP_RATIO", "0.35"))
 EXIT_BREAKEVEN_ARM_PCT = float(os.environ.get("EXIT_BREAKEVEN_ARM_PCT", "0.45"))
 EXIT_BREAKEVEN_FLOOR_PCT = float(os.environ.get("EXIT_BREAKEVEN_FLOOR_PCT", "0.02"))
 EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-2.0"))
-EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "150"))
+FLOW_EXIT_HARD_STOP_PCT = float(os.environ.get("FLOW_EXIT_HARD_STOP_PCT", "-0.85"))
+EXHAUSTION_EXIT_HARD_STOP_PCT = float(os.environ.get("EXHAUSTION_EXIT_HARD_STOP_PCT", "-0.95"))
+SECTOR_EXIT_HARD_STOP_PCT = float(os.environ.get("SECTOR_EXIT_HARD_STOP_PCT", "-0.75"))
+LIQUIDATION_EXIT_HARD_STOP_PCT = float(os.environ.get("LIQUIDATION_EXIT_HARD_STOP_PCT", "-1.10"))
+EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "90"))
 EXIT_STALL_MIN_PEAK_PCT = float(os.environ.get("EXIT_STALL_MIN_PEAK_PCT", "0.12"))
-EXIT_STALL_LOSS_PCT = float(os.environ.get("EXIT_STALL_LOSS_PCT", "-0.25"))
+EXIT_STALL_LOSS_PCT = float(os.environ.get("EXIT_STALL_LOSS_PCT", "-0.14"))
 EXIT_PROGRESS_EPS_PCT = float(os.environ.get("EXIT_PROGRESS_EPS_PCT", "0.03"))
 EXIT_MAX_HOLD_SECONDS = int(os.environ.get("EXIT_MAX_HOLD_SECONDS", "300"))
 EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT = float(os.environ.get("EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT", "-0.20"))
@@ -122,7 +126,9 @@ POSITION_MAX_ADDS = int(os.environ.get("POSITION_MAX_ADDS", "2"))
 POSITION_ADD_GROSS_LOSS_USDT = float(os.environ.get("POSITION_ADD_GROSS_LOSS_USDT", "0.03"))
 POSITION_PROFIT_FLOOR_USDT = float(os.environ.get("POSITION_PROFIT_FLOOR_USDT", "0.01"))
 POSITION_PROFIT_PULLBACK_USDT = float(os.environ.get("POSITION_PROFIT_PULLBACK_USDT", "0.02"))
-POSITION_UNSUPPORTED_GRACE_SECONDS = int(os.environ.get("POSITION_UNSUPPORTED_GRACE_SECONDS", "120"))
+POSITION_UNSUPPORTED_GRACE_SECONDS = int(os.environ.get("POSITION_UNSUPPORTED_GRACE_SECONDS", "45"))
+FLOW_POSITION_UNSUPPORTED_GRACE_SECONDS = int(os.environ.get("FLOW_POSITION_UNSUPPORTED_GRACE_SECONDS", "25"))
+FLOW_MOMENTUM_MAX_MARGIN_MULT = float(os.environ.get("FLOW_MOMENTUM_MAX_MARGIN_MULT", "1.15"))
 
 _trade_lock = threading.Lock()
 _testnet_config = {
@@ -403,6 +409,30 @@ def _available_margin_usdt(account: dict, open_count: int) -> float:
     return max(1.0, equity - used - reserve - slot_reserve)
 
 
+def _recent_strategy_risk_scale(strategy: str) -> float:
+    try:
+        closes = get_trade_closes(80)
+    except Exception:
+        closes = []
+    rows = [item for item in closes if str(item.get("strategy") or "") == strategy]
+    if len(rows) < 4:
+        return 1.0
+    pnls = [_safe_float(item.get("realized")) for item in rows[-20:]]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    gross_win = sum(wins)
+    gross_loss = abs(sum(losses))
+    pf = gross_win / gross_loss if gross_loss > 0 else (gross_win if gross_win > 0 else 0)
+    net = sum(pnls)
+    if net < 0 and pf < 0.7:
+        return 0.45
+    if net < 0:
+        return 0.70
+    if pf >= 1.25 and len(rows) >= 8:
+        return 1.10
+    return 1.0
+
+
 def _opportunity_margin_usdt(row: dict, account: dict, open_count: int) -> tuple[float, str]:
     base = _order_margin_usdt()
     prob = _safe_float(row.get("forecast_5m_prob") or row.get("forecast_prob"))
@@ -416,6 +446,8 @@ def _opportunity_margin_usdt(row: dict, account: dict, open_count: int) -> tuple
         multiplier += 0.15
     elif strategy == "flow_exhaustion_reversal":
         multiplier += 0.10
+    elif strategy == "flow_momentum":
+        multiplier -= 0.50
     if prob >= 72:
         multiplier += 1.4
         grade = "A"
@@ -432,7 +464,11 @@ def _opportunity_margin_usdt(row: dict, account: dict, open_count: int) -> tuple
         multiplier += 0.25
     elif edge < 0.12:
         multiplier -= 0.25
-    target = max(1.0, base * multiplier)
+    target = max(1.0, base * multiplier * _recent_strategy_risk_scale(strategy))
+    if strategy == "flow_momentum":
+        target = min(target, base * FLOW_MOMENTUM_MAX_MARGIN_MULT)
+        if grade == "A":
+            grade = "B"
     available = _available_margin_usdt(account, open_count)
     equity = _safe_float(account.get("equity") or account.get("wallet"), PAPER_STARTING_BALANCE)
     per_trade_cap = max(base, equity * 0.45)
@@ -671,6 +707,26 @@ def _same_direction_still_valid(side: str, snap: dict) -> bool:
     return (net_5m <= 0 or net_60s <= 0) and not fatal.intersection(risks)
 
 
+def _strategy_hard_stop_pct(strategy: str) -> float:
+    if strategy == "funding_reversion":
+        return FUNDING_EXIT_HARD_STOP_PCT
+    if strategy == "flow_momentum":
+        return FLOW_EXIT_HARD_STOP_PCT
+    if strategy == "flow_exhaustion_reversal":
+        return EXHAUSTION_EXIT_HARD_STOP_PCT
+    if strategy == "sector_lead_lag":
+        return SECTOR_EXIT_HARD_STOP_PCT
+    if strategy == "liquidation_reversal":
+        return LIQUIDATION_EXIT_HARD_STOP_PCT
+    return EXIT_HARD_STOP_PCT
+
+
+def _strategy_unsupported_grace_seconds(strategy: str) -> int:
+    if strategy == "flow_momentum":
+        return FLOW_POSITION_UNSUPPORTED_GRACE_SECONDS
+    return POSITION_UNSUPPORTED_GRACE_SECONDS
+
+
 def _track_hold_support(meta: dict, supported: bool, reverse: bool, snap_version: int) -> int:
     if snap_version and int(meta.get("last_hold_snapshot_version") or 0) == snap_version:
         return int(meta.get("invalid_snapshots") or 0)
@@ -704,7 +760,7 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
         meta["last_favorable_at"] = now_ms
 
     strategy = str(meta.get("strategy") or "flow_momentum")
-    hard_stop_pct = FUNDING_EXIT_HARD_STOP_PCT if strategy == "funding_reversion" else EXIT_HARD_STOP_PCT
+    hard_stop_pct = _strategy_hard_stop_pct(strategy)
     if pnl_pct <= hard_stop_pct:
         return f"止损平仓 {pnl_pct:.2f}%"
 
@@ -767,11 +823,11 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
         and invalid_count >= EXIT_INVALID_SNAPSHOTS
         and strategy != "funding_reversion"
         and pnl_pct <= EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT
-        and (would_open or pnl >= 0)
     ):
         return f"当前策略连续 {invalid_count} 次不支持持仓，平仓"
 
     progress_age_ms = now_ms - int(meta.get("last_progress_at") or opened_at)
+    unsupported_grace_ms = _strategy_unsupported_grace_seconds(strategy) * 1000
     unsupported_since = int(meta.get("unsupported_since") or 0)
     if not would_open:
         if not unsupported_since:
@@ -782,8 +838,8 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     if (
         not would_open
         and pnl < 0
-        and age_ms >= POSITION_UNSUPPORTED_GRACE_SECONDS * 1000
-        and now_ms - unsupported_since >= POSITION_UNSUPPORTED_GRACE_SECONDS * 1000
+        and age_ms >= unsupported_grace_ms
+        and now_ms - unsupported_since >= unsupported_grace_ms
     ):
         return f"不再触发开仓且亏损超时平仓，净利 {pnl:+.2f} USDT"
 
@@ -1887,8 +1943,14 @@ HTML = r"""
       const depthShortRatio=isNum(d.bidDepthUsd)&&d.bidDepthUsd>0?Math.abs(f60.net)/d.bidDepthUsd:null;
       const depthLongOk=!isNum(depthLongRatio)||depthLongRatio>=0.03;
       const depthShortOk=!isNum(depthShortRatio)||depthShortRatio>=0.03;
-      const alignedLong=MICRO.enableMomentum&&signal==="LONG"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastLong&&profitOk&&flowLong&&flowStrong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&btcOkLong&&oiLongOk&&candleOkLong&&spreadOk&&bookLongOk&&depthLongOk&&!oiFallingHard&&f60.largest>=threshold&&!chaseLong;
-      const alignedShort=MICRO.enableMomentum&&signal==="SHORT"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastShort&&profitOk&&flowShort&&flowStrong&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&btcOkShort&&oiShortOk&&candleOkShort&&spreadOk&&bookShortOk&&depthShortOk&&!oiFallingHard&&f60.largest>=threshold&&!chaseShort;
+      const momentumImpulseLong=p1>=0.03&&p3>=0.08&&p5>=0.12&&closeLocation>=0.62;
+      const momentumImpulseShort=p1<=-0.03&&p3<=-0.08&&p5<=-0.12&&closeLocation<=0.38;
+      const momentumBookLong=!bookKnown||d.bookImbalance>=0.08;
+      const momentumBookShort=!bookKnown||d.bookImbalance<=-0.08;
+      const momentumDepthLong=!isNum(depthLongRatio)||depthLongRatio>=0.08;
+      const momentumDepthShort=!isNum(depthShortRatio)||depthShortRatio>=0.08;
+      const alignedLong=MICRO.enableMomentum&&signal==="LONG"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastLong&&profitOk&&flowLong&&flowStrong&&priceLong&&momentumImpulseLong&&repeatLong&&volumeOk&&marketOkLong&&btcOkLong&&oiLongOk&&candleOkLong&&spreadOk&&bookLongOk&&momentumBookLong&&depthLongOk&&momentumDepthLong&&!oiFallingHard&&f60.largest>=threshold&&!chaseLong;
+      const alignedShort=MICRO.enableMomentum&&signal==="SHORT"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastShort&&profitOk&&flowShort&&flowStrong&&priceShort&&momentumImpulseShort&&repeatShort&&volumeOk&&marketOkShort&&btcOkShort&&oiShortOk&&candleOkShort&&spreadOk&&bookShortOk&&momentumBookShort&&depthShortOk&&momentumDepthShort&&!oiFallingHard&&f60.largest>=threshold&&!chaseShort;
       const liquidationSetup=liquidationReversalSetup(symbol,p1,p5,f60,l5,cm,d,mb,threshold);
       const leadLagSetup=sectorLeadLagSetup(symbol,p1,p5,f60,f5,cm,mb,threshold);
       const exhaustionSetup=flowExhaustionSetup(symbol,p1,p5,f60,f5,cm,d,mb,threshold);
@@ -1957,6 +2019,8 @@ HTML = r"""
         if(signal!=="WATCH"&&!profitOk)risks.push("成本不过");
         if(cost.fundingPct>0)risks.push("资金费成本");
         if(signal==="LONG"&&!priceLong)risks.push("价格未确认"); if(signal==="SHORT"&&!priceShort)risks.push("价格未确认");
+        if(signal==="LONG"&&!momentumImpulseLong)risks.push("顺势动量不足");
+        if(signal==="SHORT"&&!momentumImpulseShort)risks.push("顺势动量不足");
         if(signal==="LONG"&&!flowLong)risks.push("净流不连续"); if(signal==="SHORT"&&!flowShort)risks.push("净流不连续");
         if(signal!=="WATCH"&&!flowStrong)risks.push("资金流强度不足");
         if(signal==="LONG"&&!repeatLong)risks.push("孤立大单"); if(signal==="SHORT"&&!repeatShort)risks.push("孤立大单");
@@ -1969,6 +2033,8 @@ HTML = r"""
         if(!spreadOk)risks.push("点差过宽");
         if(signal==="LONG"&&!bookLongOk)risks.push("盘口不支持多");
         if(signal==="SHORT"&&!bookShortOk)risks.push("盘口不支持空");
+        if(signal==="LONG"&&!momentumBookLong)risks.push("盘口顺势不够");
+        if(signal==="SHORT"&&!momentumBookShort)risks.push("盘口顺势不够");
         if(signal==="LONG"&&!depthLongOk)risks.push("主动买流弱于盘口");
         if(signal==="SHORT"&&!depthShortOk)risks.push("主动卖流弱于盘口");
         if(oiFallingHard)risks.push("OI下降");
@@ -2392,7 +2458,7 @@ HTML = r"""
           html+="<br><strong>主信号表现</strong><br>";
           for(const item of data.groups.slice(0,6)){
             const mark=item.reliable?"":"<span class=\"small\">样本少</span>";
-            html+=esc(item.label)+" <span class=\"small\">"+esc(item.variant)+"</span> <strong>"+item.count+"</strong> 条　胜率 <strong>"+fmt(item.winrate_5m)+"%</strong>　期望 "+fmtPct(item.expect_5m)+"　PF "+fmt(item.profit_factor_5m)+" "+mark+"<br>";
+            html+=esc(item.label)+" <span class=\"small\">"+esc(item.variant)+"</span> <strong>"+item.count+"</strong> 条　1m "+fmtPct(item.avg_ret_1m)+"　3m "+fmtPct(item.avg_ret_3m)+"　5m "+fmtPct(item.expect_5m)+"　PF "+fmt(item.profit_factor_5m)+" "+mark+"<br>";
           }
         }
         if(!data.long&&!data.short)html+="暂无已回填数据，等待信号触发后 5 分钟开始显示统计。";
