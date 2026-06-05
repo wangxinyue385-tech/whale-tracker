@@ -593,8 +593,10 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     if strategy == "funding_reversion" and pnl_pct >= FUNDING_EXIT_TAKE_PROFIT_PCT:
         return f"费率回归止盈 {pnl_pct:.2f}%"
 
-    if pnl_pct >= EXIT_TAKE_PROFIT_PCT:
-        return f"净止盈平仓 {pnl_pct:.2f}%"
+    take_profit_pct = _safe_float(meta.get("take_profit_pct")) or EXIT_TAKE_PROFIT_PCT
+    trail_arm_pct = _safe_float(meta.get("trail_arm_pct")) or EXIT_PROFIT_ARM_PCT
+    if pnl_pct >= take_profit_pct:
+        return f"动态止盈平仓 {pnl_pct:.2f}% · 目标 {take_profit_pct:.2f}%"
 
     snap = _market_snapshots.get(symbol) or {}
     side = _position_side(pos, meta)
@@ -629,7 +631,7 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
         if reverse and pnl_pct <= EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT:
             return f"费率单被动量反穿平仓，当前 {pnl_pct:.2f}%"
 
-    if peak_pct >= EXIT_PROFIT_ARM_PCT and pnl_pct <= max(0.0, peak_pct * EXIT_TRAIL_KEEP_RATIO):
+    if peak_pct >= trail_arm_pct and pnl_pct <= max(0.0, peak_pct * EXIT_TRAIL_KEEP_RATIO):
         return f"移动止盈平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
     if peak_pct >= EXIT_BREAKEVEN_ARM_PCT and pnl_pct <= EXIT_BREAKEVEN_FLOOR_PCT:
@@ -748,6 +750,8 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                     "entry_cost": _safe_float(order.get("entryCost")) if isinstance(order, dict) else 0.0,
                     "forecast_prob": _safe_float(row.get("forecast_5m_prob") or row.get("forecast_prob")),
                     "net_edge_pct": _safe_float(row.get("net_edge_pct")),
+                    "take_profit_pct": _safe_float(row.get("take_profit_pct")) or EXIT_TAKE_PROFIT_PCT,
+                    "trail_arm_pct": _safe_float(row.get("trail_arm_pct")) or EXIT_PROFIT_ARM_PCT,
                     "peak_pnl": 0.0,
                     "peak_pnl_pct": 0.0,
                     "last_favorable_pct": 0.0,
@@ -1169,12 +1173,12 @@ HTML = r"""
     const STABLE_SYMBOLS = new Set(["USDCUSDT","BUSDUSDT","FDUSDUSDT","TUSDUSDT","USDPUSDT","DAIUSDT"]);
     const MAJORS = new Set(["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]);
     const ALPHA = {
-      minScore:86, minProb:65, minEdgePct:0.18,
-      minTotal5x:8.0, minDirectionGap:18,
+      minScore:82, minProb:62, minEdgePct:0.12,
+      minTotal5x:5.0, minDirectionGap:12,
       majorMaxP1:0.32, altMaxP1:0.45, majorMaxP5:0.85, altMaxP5:1.20,
     };
     const MICRO = {
-      enableMomentum:false,
+      enableMomentum:true,
       minLiqX:2.5,
       strongLiqX:6.0,
       washoutP5:0.55,
@@ -1255,13 +1259,18 @@ HTML = r"""
     function priceRet(symbol, ms){ const rows=state.priceHistory.get(symbol)||[]; if(rows.length<2)return 0; const recent=rows[rows.length-1].value; const old=(rows.find(row=>row.ts>=now()-ms)||rows[0]).value; return old ? (recent-old)/old*100 : 0; }
     function candleMetrics(symbol){
       const rows=state.candles.get(symbol)||[];
-      if(rows.length<8)return {volSpike:null,rangePct:null,breakout:0,position:null,ret15:null};
+      if(rows.length<8)return {volSpike:null,rangePct:null,atrPct:null,breakout:0,position:null,ret15:null};
       const last=rows[rows.length-1], prev=rows.slice(Math.max(0,rows.length-21),rows.length-1);
       const avgVol=prev.reduce((sum,row)=>sum+Number(row.quoteVolume||0),0)/Math.max(1,prev.length);
       const high=Math.max(...prev.map(row=>row.high)), low=Math.min(...prev.map(row=>row.low));
       const span=Math.max(high-low, last.close*0.0001);
       const position=(last.close-low)/span;
       const rangePct=prev.reduce((sum,row)=>sum+(row.high-row.low)/Math.max(row.close,1)*100,0)/Math.max(1,prev.length);
+      const atrPct=prev.reduce((sum,row,idx)=>{
+        const prevClose=idx>0 ? prev[idx-1].close : row.open;
+        const tr=Math.max(row.high-row.low,Math.abs(row.high-prevClose),Math.abs(row.low-prevClose));
+        return sum + tr/Math.max(row.close,1)*100;
+      },0)/Math.max(1,prev.length);
       const first=rows[Math.max(0,rows.length-16)];
       const lastRange=Math.max(last.high-last.low,last.close*0.0001);
       const closeLocation=(last.close-last.low)/lastRange;
@@ -1271,6 +1280,7 @@ HTML = r"""
       return {
         volSpike: avgVol ? Number(last.quoteVolume||0)/avgVol : null,
         rangePct,
+        atrPct,
         breakout: last.close>high ? 1 : (last.close<low ? -1 : 0),
         position,
         closeLocation,
@@ -1286,6 +1296,13 @@ HTML = r"""
       if(btc>0.18)bias++; if(btc<-0.18)bias--;
       if(eth>0.22)bias++; if(eth<-0.22)bias--;
       return {bias, btc, eth};
+    }
+    function dynamicTargets(cm,cost){
+      const atr=isNum(cm.atrPct)?cm.atrPct:(isNum(cm.rangePct)?cm.rangePct:0.35);
+      const minTarget=Math.max(cost.requiredPct+0.10,0.35);
+      const takeProfit=clamp(atr*1.25,minTarget,1.60);
+      const trailArm=clamp(atr*0.80,0.45,1.05);
+      return {takeProfit, trailArm};
     }
     function sectorFor(symbol){
       for(const [name,members] of Object.entries(SECTOR_GROUPS)){
@@ -1494,10 +1511,15 @@ HTML = r"""
       let cost=costModel(d,forecast.side);
       forecast.netEdgePct=Math.abs(forecast.expected5Pct)-cost.requiredPct;
       forecast.cost=cost;
+      forecast.targets=dynamicTargets(cm,cost);
       const repeatLong=f60.buyCount>=2||f60.lastSide==="BUY"&&f60.streak>=2, repeatShort=f60.sellCount>=2||f60.lastSide==="SELL"&&f60.streak>=2;
       const volumeOk=isNum(cm.volSpike)?cm.volSpike>=1.2:f5.total>=threshold*ALPHA.minTotal5x;
       const marketOkLong=MAJORS.has(symbol)||mb.bias>=-1, marketOkShort=MAJORS.has(symbol)||mb.bias<=1;
       const oiFallingHard=isNum(d.oi15Pct)&&d.oi15Pct<-2.5;
+      const oiExpanding=isNum(d.oi5Pct)?d.oi5Pct>=0.08:(isNum(d.oi15Pct)?d.oi15Pct>=0.35:false);
+      const oiNotShrinking=!isNum(d.oi5Pct)||d.oi5Pct>=-0.20;
+      const oiLongOk=oiNotShrinking&&(oiExpanding||MAJORS.has(symbol)||Math.abs(f5.imbalance)>=0.35);
+      const oiShortOk=oiNotShrinking&&(oiExpanding||MAJORS.has(symbol)||Math.abs(f5.imbalance)>=0.35);
       const flowLong=f60.net>0&&f5.net>0, flowShort=f60.net<0&&f5.net<0;
       const priceLong=p1>=-0.04&&p3>=0.04&&p5>=0.08, priceShort=p1<=0.04&&p3<=-0.04&&p5<=-0.08;
       const profitOk=forecast.side!=="NEUTRAL"&&forecast.netEdgePct>ALPHA.minEdgePct;
@@ -1511,8 +1533,10 @@ HTML = r"""
       const flowStrong=f5.total>=threshold*ALPHA.minTotal5x&&Math.abs(f5.imbalance)>=0.18;
       const candleOkLong=!isNum(cm.closeLocation)||cm.closeLocation>=0.58;
       const candleOkShort=!isNum(cm.closeLocation)||cm.closeLocation<=0.42;
-      const alignedLong=MICRO.enableMomentum&&signal==="LONG"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastLong&&profitOk&&flowLong&&flowStrong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&candleOkLong&&!oiFallingHard&&f60.largest>=threshold&&!chaseLong;
-      const alignedShort=MICRO.enableMomentum&&signal==="SHORT"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastShort&&profitOk&&flowShort&&flowStrong&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&candleOkShort&&!oiFallingHard&&f60.largest>=threshold&&!chaseShort;
+      const btcOkLong=MAJORS.has(symbol)||mb.btc>=-0.08&&mb.eth>=-0.12;
+      const btcOkShort=MAJORS.has(symbol)||mb.btc<=0.08&&mb.eth<=0.12;
+      const alignedLong=MICRO.enableMomentum&&signal==="LONG"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastLong&&profitOk&&flowLong&&flowStrong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&btcOkLong&&oiLongOk&&candleOkLong&&!oiFallingHard&&f60.largest>=threshold&&!chaseLong;
+      const alignedShort=MICRO.enableMomentum&&signal==="SHORT"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastShort&&profitOk&&flowShort&&flowStrong&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&btcOkShort&&oiShortOk&&candleOkShort&&!oiFallingHard&&f60.largest>=threshold&&!chaseShort;
       const liquidationSetup=liquidationReversalSetup(symbol,p1,p5,f60,l5,cm,d,mb,threshold);
       const leadLagSetup=sectorLeadLagSetup(symbol,p1,p5,f60,f5,cm,mb,threshold);
       const fundingSetup=fundingReversionSetup(symbol,p1,p5,f60,cm,d,mb,signal,score,threshold);
@@ -1531,6 +1555,7 @@ HTML = r"""
         cost=costModel(d,forecast.side);
         forecast.cost=cost;
         forecast.netEdgePct=Math.abs(forecast.expected5Pct)-cost.requiredPct;
+        forecast.targets=dynamicTargets(cm,cost);
       }
       if(!follow&&fundingSetup){
         follow=fundingSetup.follow;
@@ -1546,6 +1571,7 @@ HTML = r"""
         cost=costModel(d,forecast.side);
         forecast.cost=cost;
         forecast.netEdgePct=Math.abs(forecast.expected5Pct)-cost.requiredPct;
+        forecast.targets=dynamicTargets(cm,cost);
       }
       const risks=[];
       if(strategy==="funding_reversion"){
@@ -1576,6 +1602,8 @@ HTML = r"""
         if(signal==="LONG"&&!candleOkLong)risks.push("收盘位置偏弱"); if(signal==="SHORT"&&!candleOkShort)risks.push("收盘位置偏强");
         if(!volumeOk)risks.push("量能不足");
         if(signal==="LONG"&&!marketOkLong)risks.push("大盘反向"); if(signal==="SHORT"&&!marketOkShort)risks.push("大盘反向");
+        if(signal==="LONG"&&!btcOkLong)risks.push("BTC/ETH压制"); if(signal==="SHORT"&&!btcOkShort)risks.push("BTC/ETH反抽");
+        if(signal==="LONG"&&!oiLongOk)risks.push("OI不支持多"); if(signal==="SHORT"&&!oiShortOk)risks.push("OI不支持空");
         if(oiFallingHard)risks.push("OI下降");
       }
       const reasons=[];
@@ -1589,6 +1617,7 @@ HTML = r"""
       if(Math.abs(p5)>=0.25)reasons.push("5m价格 "+(p5>0?"+":"")+p5.toFixed(2)+"%");
       if(isNum(cm.closeLocation))reasons.push("收盘位置 "+Math.round(cm.closeLocation*100)+"%");
       if(isNum(d.oi15Pct)&&Math.abs(d.oi15Pct)>=1.2)reasons.push("OI15m "+(d.oi15Pct>0?"+":"")+d.oi15Pct.toFixed(2)+"%");
+      if(isNum(d.oi5Pct)&&Math.abs(d.oi5Pct)>=0.08)reasons.push("OI5m "+(d.oi5Pct>0?"+":"")+d.oi5Pct.toFixed(2)+"%");
       if(isNum(d.takerRatio)&&(d.takerRatio>=1.12||d.takerRatio<=0.9))reasons.push("Taker "+d.takerRatio.toFixed(2));
       if(!reasons.length)reasons.push("等待大额资金流");
       if(!follow){ follow=signal==="LONG"?"WATCH_LONG":signal==="SHORT"?"WATCH_SHORT":"WAIT"; label=follow==="WATCH_LONG"?"多头异动":follow==="WATCH_SHORT"?"空头异动":"观察"; }
@@ -1616,6 +1645,7 @@ HTML = r"""
         ${detailItem("连续",streak)}
         ${detailItem("OI / Taker",`${pctOrDash(row.d.oi15Pct)} / ${ratioOrDash(row.d.takerRatio)}`)}
         ${detailItem("量能 / 收盘位置",`${isNum(row.cm.volSpike)?row.cm.volSpike.toFixed(1)+"x":"--"} / ${closeLoc}`)}
+        ${detailItem("ATR目标",`${row.forecast.targets?row.forecast.targets.takeProfit.toFixed(2)+"% / 移动 "+row.forecast.targets.trailArm.toFixed(2)+"%":"--"}`)}
         ${detailItem("爆仓",`多爆 ${money(row.l5.longLiq)} / 空爆 ${money(row.l5.shortLiq)}`)}
         ${detailItem("大盘",marketText)}
       </div></td></tr>`;
@@ -1691,7 +1721,7 @@ HTML = r"""
       board.innerHTML=cards.map(renderStrategyCard).join("");
     }
     function renderEvents(){ const list=document.getElementById("eventList"); if(!list)return; const text=[`价格流 ${state.priceConnected?"正常":"异常"}`,`大单流 ${state.tradeConnected?"正常":"异常"}`,`爆仓流 ${state.liqConnected?"正常":"异常"}`,`事件 ${state.events.length}`]; const latest=state.events.slice(0,4).map(ev=>{ const cls=ev.side==="BUY"?"buy":"sell"; return `<div class="event"><div class="event-side ${cls}">${ev.label}</div><div><div class="event-title"><span>${base(ev.symbol)}</span><span>${money(ev.notional)}</span></div><div class="event-meta">${new Date(ev.ts).toLocaleTimeString()} · 后台记录</div></div></div>`; }).join(""); list.innerHTML=`<div class="event"><div></div><div><div class="event-title">后台监控状态</div><div class="event-meta">${text.join(" · ")}</div></div></div>${latest}`; }
-    function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,price:r.price,forecast_side:r.forecast.side,forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),forecast_5m_expected_pct:Number(r.forecast.expected5Pct.toFixed(3)),required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),price_1m_pct:Number(r.p1.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,risks:r.risks,reasons:r.reasons})); }
+    function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,price:r.price,forecast_side:r.forecast.side,forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),forecast_5m_expected_pct:Number(r.forecast.expected5Pct.toFixed(3)),required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),take_profit_pct:r.forecast.targets?Number(r.forecast.targets.takeProfit.toFixed(3)):null,trail_arm_pct:r.forecast.targets?Number(r.forecast.targets.trailArm.toFixed(3)):null,funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),price_1m_pct:Number(r.p1.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,atr_pct:r.cm.atrPct,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_5m_pct:r.d.oi5Pct,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,risks:r.risks,reasons:r.reasons})); }
     function compactEvents(){ return state.events.slice(0,40).map(e=>({symbol:e.symbol,base:base(e.symbol),label:e.label,side:e.side,price:e.price,notional:Math.round(e.notional),time:new Date(e.ts).toLocaleTimeString()})); }
     async function runAi(){ const btn=document.getElementById("aiBtn"), out=document.getElementById("aiOutput"); btn.disabled=true; out.textContent="正在分析当前大资金流..."; try{ const all=rows(); const payload={summary:{scanned_symbols:activeSymbols().length,follow_long:all.filter(r=>r.follow==="FOLLOW_LONG").length,follow_short:all.filter(r=>r.follow==="FOLLOW_SHORT").length,large_trade_threshold_usd:LARGE_TRADE_USD,taker_fee_bps:TAKER_FEE_BPS,slippage_bps:SLIPPAGE_BPS,safety_edge_bps:SAFETY_EDGE_BPS,base_required_cost_pct:Number(baseCostPct().toFixed(3)),hold_minutes:HOLD_MINUTES,generated_at:new Date().toLocaleString()},rows:compactRows(),events:compactEvents()}; const res=await fetch("/api/ai/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); const data=await res.json(); out.textContent=(data.mode==="ai"?"AI 分析\n\n":"规则分析\n\n")+data.analysis; }catch(err){ out.textContent="分析失败："+err; }finally{ btn.disabled=false; } }
     function trimOld(){ const cut=now()-6*60*1000; for(const map of [state.trades,state.liquidations]){ for(const [sym,list] of map){ while(list.length&&list[0].ts<cut)list.shift(); if(!list.length)map.delete(sym); } } }
@@ -1717,6 +1747,8 @@ HTML = r"""
         net_60s_usd:Math.round(r.f60.net), net_5m_usd:Math.round(r.f5.net),
         forecast_side:r.forecast.side, forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),
         net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),
+        take_profit_pct:r.forecast.targets?Number(r.forecast.targets.takeProfit.toFixed(3)):null,
+        trail_arm_pct:r.forecast.targets?Number(r.forecast.targets.trailArm.toFixed(3)):null,
         funding_rate:r.d.fundingRate,
         risks:r.risks,
       }));
@@ -1743,6 +1775,8 @@ HTML = r"""
         liq_short_5m_usd:Math.round(r.l5.shortLiq||0),
         forecast_side:r.forecast.side, forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),
         net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),
+        take_profit_pct:r.forecast.targets?Number(r.forecast.targets.takeProfit.toFixed(3)):null,
+        trail_arm_pct:r.forecast.targets?Number(r.forecast.targets.trailArm.toFixed(3)):null,
         required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),
         funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),
         risks:r.risks, reasons:r.reasons,
