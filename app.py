@@ -360,8 +360,51 @@ def _order_margin_usdt() -> float:
     return max(1.0, float(_testnet_config["order_usdt"]))
 
 
-def _order_notional_usdt() -> float:
-    return _order_margin_usdt() * max(1, int(_testnet_config["leverage"]))
+def _order_notional_usdt(margin: float | None = None) -> float:
+    return max(1.0, float(margin if margin is not None else _order_margin_usdt())) * max(1, int(_testnet_config["leverage"]))
+
+
+def _available_margin_usdt(account: dict, open_count: int) -> float:
+    equity = _safe_float(account.get("equity") or account.get("wallet"), PAPER_STARTING_BALANCE)
+    used = sum(_safe_float(pos.get("margin")) for pos in account.get("positions", []))
+    reserve = max(5.0, equity * 0.20)
+    slot_reserve = max(0, int(_testnet_config["max_positions"]) - open_count - 1) * max(1.0, _order_margin_usdt() * 0.35)
+    return max(1.0, equity - used - reserve - slot_reserve)
+
+
+def _opportunity_margin_usdt(row: dict, account: dict, open_count: int) -> tuple[float, str]:
+    base = _order_margin_usdt()
+    prob = _safe_float(row.get("forecast_5m_prob") or row.get("forecast_prob"))
+    edge = _safe_float(row.get("net_edge_pct"))
+    strategy = str(row.get("strategy") or "")
+    multiplier = 1.0
+    grade = "B"
+    if strategy == "sector_lead_lag":
+        multiplier += 0.25
+    elif strategy == "liquidation_reversal":
+        multiplier += 0.15
+    if prob >= 72:
+        multiplier += 1.4
+        grade = "A"
+    elif prob >= 68:
+        multiplier += 0.75
+        grade = "B+"
+    elif prob <= LOW_CONFIDENCE_PROB:
+        multiplier -= 0.35
+        grade = "C"
+    if edge >= 0.35:
+        multiplier += 0.65
+        grade = "A" if grade in {"A", "B+"} else grade
+    elif edge >= 0.22:
+        multiplier += 0.25
+    elif edge < 0.12:
+        multiplier -= 0.25
+    target = max(1.0, base * multiplier)
+    available = _available_margin_usdt(account, open_count)
+    equity = _safe_float(account.get("equity") or account.get("wallet"), PAPER_STARTING_BALANCE)
+    per_trade_cap = max(base, equity * 0.45)
+    margin = min(target, available, per_trade_cap)
+    return max(1.0, margin), grade
 
 
 def _paper_one_way_cost(notional: float) -> float:
@@ -404,14 +447,14 @@ def _paper_account_snapshot() -> dict:
     return {"wallet": _paper_cash, "unrealized": unrealized, "equity": equity, "positions": positions}
 
 
-def _paper_place_market_order(symbol: str, follow: str, price: float) -> dict:
+def _paper_place_market_order(symbol: str, follow: str, price: float, margin: float | None = None) -> dict:
     global _paper_cash
     if price <= 0:
         price = _paper_mark_price(symbol)
     if price <= 0:
         raise RuntimeError(f"{symbol} 没有可用价格")
-    margin = _order_margin_usdt()
-    notional = _order_notional_usdt()
+    margin = max(1.0, float(margin if margin is not None else _order_margin_usdt()))
+    notional = _order_notional_usdt(margin)
     qty = notional / price
     amount = qty if follow == "FOLLOW_LONG" else -qty
     order_id = uuid.uuid4().hex[:12]
@@ -463,14 +506,14 @@ def _set_leverage(symbol: str) -> None:
         _event(f"{symbol} 设置杠杆失败：{exc}", "warn", symbol=symbol)
 
 
-def _place_market_order(symbol: str, follow: str, price: float) -> dict:
+def _place_market_order(symbol: str, follow: str, price: float, margin: float | None = None) -> dict:
     side = "BUY" if follow == "FOLLOW_LONG" else "SELL"
     if price <= 0:
         ticker = _public_testnet_get("/fapi/v1/ticker/price", {"symbol": symbol})
         price = float(ticker.get("price") or 0)
     if price <= 0:
         raise RuntimeError(f"{symbol} 没有可用价格")
-    qty = _round_qty(symbol, _order_notional_usdt() / price)
+    qty = _round_qty(symbol, _order_notional_usdt(margin) / price)
     params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": qty}
     return _signed_testnet_request("POST", "/fapi/v1/order", params)
 
@@ -731,11 +774,13 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                 continue
             try:
                 price = float(row.get("price") or prices.get(symbol) or 0)
+                order_margin, opportunity_grade = _opportunity_margin_usdt(row, account, open_count)
+                order_notional = _order_notional_usdt(order_margin)
                 if _is_paper_mode():
-                    order = _paper_place_market_order(symbol, follow, price)
+                    order = _paper_place_market_order(symbol, follow, price, order_margin)
                 else:
                     _set_leverage(symbol)
-                    order = _place_market_order(symbol, follow, price)
+                    order = _place_market_order(symbol, follow, price, order_margin)
                 _trade_cooldown[cooldown_key] = now_ms
                 _entry_candidates.pop(_entry_key(symbol, str(follow), strategy), None)
                 _auto_positions[symbol] = {
@@ -745,8 +790,9 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                     "opened_at": now_ms,
                     "order_id": order.get("orderId"),
                     "entry_price": price,
-                    "margin": _order_margin_usdt(),
-                    "notional": _order_notional_usdt(),
+                    "margin": order_margin,
+                    "notional": order_notional,
+                    "opportunity_grade": opportunity_grade,
                     "entry_cost": _safe_float(order.get("entryCost")) if isinstance(order, dict) else 0.0,
                     "forecast_prob": _safe_float(row.get("forecast_5m_prob") or row.get("forecast_prob")),
                     "net_edge_pct": _safe_float(row.get("net_edge_pct")),
@@ -761,7 +807,7 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                 }
                 open_count += 1
                 mode = "本地模拟盘" if _is_paper_mode() else "Binance Testnet"
-                _event(f"{symbol} {('做多' if follow == 'FOLLOW_LONG' else '做空')} {strategy_label} {mode}自动下单", "info", symbol=symbol, order=order)
+                _event(f"{symbol} {('做多' if follow == 'FOLLOW_LONG' else '做空')} {strategy_label} {mode}自动下单 · {opportunity_grade}级 {order_margin:.2f}U保证金", "info", symbol=symbol, order=order)
             except Exception as exc:  # noqa: BLE001
                 _event(f"{symbol} 自动下单失败：{exc}", "error", symbol=symbol)
 
