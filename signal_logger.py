@@ -10,14 +10,6 @@ from contextlib import contextmanager
 DB_PATH = os.environ.get("SIGNAL_DB_PATH", "signals.db")
 _lock = threading.Lock()
 
-# ── 成本常量（和 app.py 保持一致）────────────────────────────────────────────
-TAKER_FEE_BPS  = float(os.environ.get("TAKER_FEE_BPS",  "5"))
-SLIPPAGE_BPS   = float(os.environ.get("SLIPPAGE_BPS",   "3"))
-# 胜负判定：价格涨跌超过来回成本 + 0.05% 才算有意义
-_ROUND_TRIP_COST_PCT = (TAKER_FEE_BPS * 2 + SLIPPAGE_BPS * 2) / 100  # 约 0.16%
-WIN_THRESHOLD  = _ROUND_TRIP_COST_PCT + 0.05   # ≈ 0.21%  涨跌超过这个才算赢
-FLAT_THRESHOLD = _ROUND_TRIP_COST_PCT           # ≈ 0.16%  在此范围内算平局
-
 
 @contextmanager
 def _get_conn():
@@ -39,7 +31,6 @@ def init_db() -> None:
                 ts          INTEGER NOT NULL,
                 symbol      TEXT NOT NULL,
                 follow      TEXT NOT NULL,
-                strategy    TEXT NOT NULL DEFAULT 'flow_momentum',
                 score       INTEGER,
                 price       REAL,
                 features    TEXT,
@@ -55,17 +46,9 @@ def init_db() -> None:
             )
             """
         )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts       ON signals(ts)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol   ON signals(symbol)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_follow   ON signals(follow)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_strategy ON signals(strategy)")
-
-        # ── 迁移旧表：补 strategy 列 ──────────────────────────────────────────
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(signals)").fetchall()]
-        if "strategy" not in cols:
-            conn.execute(
-                "ALTER TABLE signals ADD COLUMN strategy TEXT NOT NULL DEFAULT 'flow_momentum'"
-            )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_follow ON signals(follow)")
         conn.commit()
 
 
@@ -74,103 +57,128 @@ def log_signal(row: dict) -> None:
     if follow not in {"FOLLOW_LONG", "FOLLOW_SHORT"}:
         return
 
-    strategy = str(row.get("strategy") or "flow_momentum")
-
     features = {
-        "score":                row.get("score"),
-        "strategy_label":       row.get("strategy_label"),
-        "price_1m_pct":         row.get("price_1m_pct"),
-        "price_5m_pct":         row.get("price_5m_pct"),
-        "net_60s_usd":          row.get("net_60s_usd"),
-        "net_5m_usd":           row.get("net_5m_usd"),
-        "flow_60s_imbalance":   row.get("flow_60s_imbalance"),
-        "flow_5m_imbalance":    row.get("flow_5m_imbalance"),
-        "flow_60s_count":       row.get("flow_60s_count"),
-        "flow_5m_count":        row.get("flow_5m_count"),
-        "largest_usd":          row.get("largest_usd"),
-        "streak_side":          row.get("streak_side"),
-        "streak_count":         row.get("streak_count"),
-        "volume_spike":         row.get("volume_spike"),
-        "candle_close_location":row.get("candle_close_location"),
-        "candle_body_pct":      row.get("candle_body_pct"),
-        "upper_wick_pct":       row.get("upper_wick_pct"),
-        "lower_wick_pct":       row.get("lower_wick_pct"),
-        "oi_15m_pct":           row.get("oi_15m_pct"),
-        "taker_ratio":          row.get("taker_ratio"),
-        "funding_rate":         row.get("funding_rate"),
-        "market_bias":          row.get("market_bias"),
-        "btc_5m_pct":           row.get("btc_5m_pct"),
-        "eth_5m_pct":           row.get("eth_5m_pct"),
-        "liq_long_5m_usd":      row.get("liq_long_5m_usd"),
-        "liq_short_5m_usd":     row.get("liq_short_5m_usd"),
-        "forecast_side":        row.get("forecast_side"),
-        "forecast_prob":        row.get("forecast_5m_prob"),
-        "net_edge_pct":         row.get("net_edge_pct"),
-        "required_cost":        row.get("required_cost_pct"),
-        "funding_cost":         row.get("funding_cost_pct"),
-        "volume_24h":           row.get("volume_24h_usd"),
-        "risks":                row.get("risks", []),
-        "reasons":              row.get("reasons", []),
+        "score": row.get("score"),
+        "strategy": row.get("strategy"),
+        "strategy_label": row.get("strategy_label"),
+        "main_signal": row.get("main_signal") or row.get("strategy"),
+        "signal_variant": row.get("signal_variant") or "primary",
+        "test_variant": "executed",
+        "raw_follow": row.get("raw_follow"),
+        "raw_strategy": row.get("raw_strategy"),
+        "raw_strategy_label": row.get("raw_strategy_label"),
+        "raw_forecast_side": row.get("raw_forecast_side"),
+        "raw_forecast_prob": row.get("raw_forecast_5m_prob"),
+        "price_1m_pct": row.get("price_1m_pct"),
+        "price_5m_pct": row.get("price_5m_pct"),
+        "net_60s_usd": row.get("net_60s_usd"),
+        "net_5m_usd": row.get("net_5m_usd"),
+        "flow_60s_imbalance": row.get("flow_60s_imbalance"),
+        "flow_5m_imbalance": row.get("flow_5m_imbalance"),
+        "flow_60s_count": row.get("flow_60s_count"),
+        "flow_5m_count": row.get("flow_5m_count"),
+        "largest_usd": row.get("largest_usd"),
+        "streak_side": row.get("streak_side"),
+        "streak_count": row.get("streak_count"),
+        "volume_spike": row.get("volume_spike"),
+        "candle_close_location": row.get("candle_close_location"),
+        "candle_body_pct": row.get("candle_body_pct"),
+        "upper_wick_pct": row.get("upper_wick_pct"),
+        "lower_wick_pct": row.get("lower_wick_pct"),
+        "oi_15m_pct": row.get("oi_15m_pct"),
+        "taker_ratio": row.get("taker_ratio"),
+        "funding_rate": row.get("funding_rate"),
+        "market_bias": row.get("market_bias"),
+        "btc_5m_pct": row.get("btc_5m_pct"),
+        "eth_5m_pct": row.get("eth_5m_pct"),
+        "liq_long_5m_usd": row.get("liq_long_5m_usd"),
+        "liq_short_5m_usd": row.get("liq_short_5m_usd"),
+        "forecast_side": row.get("forecast_side"),
+        "forecast_prob": row.get("forecast_5m_prob"),
+        "net_edge_pct": row.get("net_edge_pct"),
+        "required_cost": row.get("required_cost_pct"),
+        "funding_cost": row.get("funding_cost_pct"),
+        "volume_24h": row.get("volume_24h_usd"),
+        "risks": row.get("risks", []),
+        "reasons": row.get("reasons", []),
     }
 
     with _get_conn() as conn:
-        # 同一币种 + 同一方向 + 同一策略，60 秒内不重复记录
-        recent = conn.execute(
-            """
-            SELECT id FROM signals
-            WHERE symbol=? AND ts>? AND follow=? AND strategy=?
-            LIMIT 1
-            """,
-            (row["symbol"], int(time.time() * 1000) - 60_000, follow, strategy),
-        ).fetchone()
-        if recent:
-            return
+        ts_ms = int(time.time() * 1000)
+        _insert_signal(conn, row, follow, features, ts_ms)
 
-        conn.execute(
-            """
-            INSERT INTO signals (ts, symbol, follow, strategy, score, price, features)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                int(time.time() * 1000),
-                row["symbol"],
-                follow,
-                strategy,
-                row.get("score"),
-                row.get("price"),
-                json.dumps(features, ensure_ascii=False),
-            ),
-        )
+        raw_follow = row.get("raw_follow")
+        if raw_follow in {"FOLLOW_LONG", "FOLLOW_SHORT"} and raw_follow != follow:
+            raw_features = {
+                **features,
+                "strategy": row.get("raw_strategy") or row.get("strategy"),
+                "strategy_label": row.get("raw_strategy_label") or row.get("strategy_label"),
+                "main_signal": row.get("raw_strategy") or row.get("strategy"),
+                "signal_variant": "raw",
+                "test_variant": "raw_control",
+                "executed_follow": follow,
+            }
+            _insert_signal(conn, row, raw_follow, raw_features, ts_ms)
         conn.commit()
 
 
 def _calc_outcome(follow: str, ret_pct: float) -> str:
-    """
-    胜负判定基于价格涨跌幅（不含杠杆），并扣除来回成本。
-    WIN  = 净收益为正且超过成本门槛
-    LOSS = 净亏损超过成本门槛（即价格反向超过成本）
-    FLAT = 在成本范围内，结果不明确
-    """
+    threshold = 0.15
     if follow == "FOLLOW_LONG":
-        net = ret_pct - _ROUND_TRIP_COST_PCT   # 扣除来回手续费+滑点
-        if net > WIN_THRESHOLD - _ROUND_TRIP_COST_PCT:
+        if ret_pct > threshold:
             return "WIN"
-        if net < -(WIN_THRESHOLD - _ROUND_TRIP_COST_PCT):
+        if ret_pct < -threshold:
             return "LOSS"
     elif follow == "FOLLOW_SHORT":
-        net = -ret_pct - _ROUND_TRIP_COST_PCT  # 做空时价格下跌才赚
-        if net > WIN_THRESHOLD - _ROUND_TRIP_COST_PCT:
+        if ret_pct < -threshold:
             return "WIN"
-        if net < -(WIN_THRESHOLD - _ROUND_TRIP_COST_PCT):
+        if ret_pct > threshold:
             return "LOSS"
     return "FLAT"
+
+
+def _directional_ret(follow: str, ret_pct: float | None) -> float | None:
+    if ret_pct is None:
+        return None
+    return ret_pct if follow == "FOLLOW_LONG" else -ret_pct
+
+
+def _insert_signal(conn: sqlite3.Connection, row: dict, follow: str, features: dict, ts_ms: int) -> None:
+    recent_rows = conn.execute(
+        "SELECT features FROM signals WHERE symbol=? AND ts>? AND follow=?",
+        (row["symbol"], ts_ms - 60_000, follow),
+    ).fetchall()
+    for recent in recent_rows:
+        try:
+            recent_features = json.loads(recent["features"] or "{}")
+        except json.JSONDecodeError:
+            recent_features = {}
+        if (
+            recent_features.get("main_signal") == features.get("main_signal")
+            and recent_features.get("test_variant") == features.get("test_variant")
+        ):
+            return
+
+    conn.execute(
+        """
+        INSERT INTO signals (ts, symbol, follow, score, price, features)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ts_ms,
+            row["symbol"],
+            follow,
+            row.get("score"),
+            row.get("price"),
+            json.dumps(features, ensure_ascii=False),
+        ),
+    )
 
 
 def fill_prices(price_map: dict[str, float]) -> None:
     now_ms = int(time.time() * 1000)
 
     with _get_conn() as conn:
-        # ── 回填 5m 结果 ─────────────────────────────────────────────────────
         pending_5m = conn.execute(
             """
             SELECT id, symbol, follow, price, ts
@@ -194,7 +202,6 @@ def fill_prices(price_map: dict[str, float]) -> None:
                 (cur, round(ret, 4), _calc_outcome(sig["follow"], ret), sig["id"]),
             )
 
-        # ── 回填 15m 结果 ────────────────────────────────────────────────────
         pending_15m = conn.execute(
             """
             SELECT id, symbol, follow, price, ts
@@ -222,11 +229,11 @@ def fill_prices(price_map: dict[str, float]) -> None:
 
 def get_stats() -> dict:
     with _get_conn() as conn:
-        total  = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
         filled = conn.execute("SELECT COUNT(*) FROM signals WHERE filled_5m=1").fetchone()[0]
-        rows   = conn.execute(
+        rows = conn.execute(
             """
-            SELECT follow, strategy, outcome_5m, outcome_15m, ret_5m, ret_15m, features
+            SELECT follow, outcome_5m, outcome_15m, ret_5m, ret_15m, filled_15m, features
             FROM signals
             WHERE filled_5m=1
             """
@@ -237,134 +244,85 @@ def get_stats() -> dict:
 
     import statistics
 
-    def bucket(follow_filter: str, strategy_filter: str | None = None) -> dict | None:
-        subset = [
-            r for r in rows
-            if r["follow"] == follow_filter
-            and (strategy_filter is None or r["strategy"] == strategy_filter)
-        ]
+    enriched = []
+    for row in rows:
+        try:
+            features = json.loads(row["features"] or "{}")
+        except json.JSONDecodeError:
+            features = {}
+        enriched.append({**dict(row), "features": features})
+
+    def summarize(subset: list[dict]) -> dict | None:
         if not subset:
             return None
         n = len(subset)
-        wins_5m   = sum(1 for r in subset if r["outcome_5m"]  == "WIN")
-        losses_5m = sum(1 for r in subset if r["outcome_5m"]  == "LOSS")
-        wins_15m  = sum(1 for r in subset if r["outcome_15m"] == "WIN")
-        rets_5m   = [r["ret_5m"]  for r in subset if r["ret_5m"]  is not None]
-        rets_15m  = [r["ret_15m"] for r in subset if r["ret_15m"] is not None]
-        win_rets  = [r for r in rets_5m if r > 0]
-        lose_rets = [r for r in rets_5m if r < 0]
-
-        # ── 按退出原因分组（从 features 里取 risks） ─────────────────────────
-        exit_groups: dict[str, list[float]] = {}
-        for r in subset:
-            try:
-                feats = json.loads(r["features"] or "{}")
-                risks = feats.get("risks") or ["无风险标记"]
-                key = risks[0] if risks else "无风险标记"
-            except (json.JSONDecodeError, TypeError):
-                key = "解析失败"
-            exit_groups.setdefault(key, []).append(r["ret_5m"] or 0)
-
-        exit_summary = {
-            k: {
-                "count": len(v),
-                "avg_ret": round(statistics.mean(v), 3) if v else None,
-            }
-            for k, v in sorted(exit_groups.items(), key=lambda x: -len(x[1]))
-        }
-
+        wins_5m = sum(1 for r in subset if r["outcome_5m"] == "WIN")
+        wins_15m = sum(1 for r in subset if r["outcome_15m"] == "WIN")
+        rets_5m = [
+            directional
+            for r in subset
+            if (directional := _directional_ret(r["follow"], r["ret_5m"])) is not None
+        ]
+        rets_15m = [
+            directional
+            for r in subset
+            if r["filled_15m"] and (directional := _directional_ret(r["follow"], r["ret_15m"])) is not None
+        ]
+        win_ret_5m = [r for r in rets_5m if r > 0]
+        lose_ret_5m = [r for r in rets_5m if r < 0]
+        gross_win = sum(win_ret_5m)
+        gross_loss = abs(sum(lose_ret_5m))
         return {
-            "count":       n,
-            "wins_5m":     wins_5m,
-            "losses_5m":   losses_5m,
-            "flat_5m":     n - wins_5m - losses_5m,
-            "winrate_5m":  round(wins_5m / n * 100, 1),
-            "winrate_15m": round(wins_15m / n * 100, 1) if any(r["outcome_15m"] for r in subset) else None,
-            "avg_ret_5m":  round(statistics.mean(rets_5m),  3) if rets_5m  else None,
+            "count": n,
+            "winrate_5m": round(wins_5m / n * 100, 1),
+            "winrate_15m": round(wins_15m / len(rets_15m) * 100, 1) if rets_15m else None,
+            "avg_ret_5m": round(statistics.mean(rets_5m), 3) if rets_5m else None,
             "avg_ret_15m": round(statistics.mean(rets_15m), 3) if rets_15m else None,
-            "avg_win_5m":  round(statistics.mean(win_rets),  3) if win_rets  else None,
-            "avg_loss_5m": round(statistics.mean(lose_rets), 3) if lose_rets else None,
-            # 期望值 = 均收益（已含方向，负号由 _calc_outcome 处理）
-            "expect_5m":   round(statistics.mean(rets_5m), 3) if rets_5m else None,
-            # 盈亏比
-            "rr_ratio":    round(
-                abs(statistics.mean(win_rets)) / abs(statistics.mean(lose_rets)), 2
-            ) if win_rets and lose_rets else None,
-            "exit_groups": exit_summary,
+            "avg_win_5m": round(statistics.mean(win_ret_5m), 3) if win_ret_5m else None,
+            "avg_loss_5m": round(statistics.mean(lose_ret_5m), 3) if lose_ret_5m else None,
+            "profit_factor_5m": round(gross_win / gross_loss, 2) if gross_loss > 0 else (round(gross_win, 2) if gross_win > 0 else 0),
+            "expect_5m": round(statistics.mean(rets_5m), 3) if rets_5m else None,
         }
 
-    # ── 总体分组 ─────────────────────────────────────────────────────────────
-    result = {
-        "total":  total,
-        "filled": filled,
-        "long":   bucket("FOLLOW_LONG"),
-        "short":  bucket("FOLLOW_SHORT"),
-    }
+    def bucket(follow_filter: str) -> dict | None:
+        return summarize([r for r in enriched if r["follow"] == follow_filter])
 
-    # ── 按策略分组 ───────────────────────────────────────────────────────────
-    strategies = list({r["strategy"] for r in rows})
-    by_strategy: dict[str, dict] = {}
-    for strat in strategies:
-        by_strategy[strat] = {
-            "long":  bucket("FOLLOW_LONG",  strat),
-            "short": bucket("FOLLOW_SHORT", strat),
-        }
-    result["by_strategy"] = by_strategy
+    grouped: dict[tuple[str, str, str], list[dict]] = {}
+    for row in enriched:
+        features = row["features"]
+        main_signal = str(features.get("main_signal") or features.get("strategy") or "unknown")
+        label = str(features.get("strategy_label") or main_signal)
+        variant = str(features.get("test_variant") or features.get("signal_variant") or "executed")
+        grouped.setdefault((main_signal, label, variant), []).append(row)
 
-    # ── 按币种分组（只列出信号数 >= 5 的） ──────────────────────────────────
-    symbols = list({r["follow"] + "|" + dict(r)["strategy"] for r in rows})  # noqa
-    symbol_rows: dict[str, list] = {}
-    for r in rows:
-        symbol_rows.setdefault(r["follow"] + "|" + str(dict(r).get("strategy", "")), [])
-
-    sym_map: dict[str, list] = {}
-    for r in rows:
-        try:
-            sym = json.loads(r["features"] or "{}").get("volume_24h")  # 用 volume 做占位
-        except Exception:
-            sym = None
-        # 直接用 DB row 里没有 symbol 字段，需从上层查
-        pass
-
-    # 重新查一次含 symbol 字段
-    with _get_conn() as conn:
-        sym_rows = conn.execute(
-            """
-            SELECT symbol, follow, strategy, outcome_5m, ret_5m
-            FROM signals
-            WHERE filled_5m=1
-            """
-        ).fetchall()
-
-    sym_buckets: dict[str, list] = {}
-    for r in sym_rows:
-        key = r["symbol"]
-        sym_buckets.setdefault(key, []).append(r)
-
-    by_symbol = {}
-    for sym, bucket_rows in sym_buckets.items():
-        if len(bucket_rows) < 5:
+    groups = []
+    for (main_signal, label, variant), subset in grouped.items():
+        item = summarize(subset)
+        if not item:
             continue
-        import statistics as _st
-        rets = [r["ret_5m"] for r in bucket_rows if r["ret_5m"] is not None]
-        wins = sum(1 for r in bucket_rows if r["outcome_5m"] == "WIN")
-        by_symbol[sym] = {
-            "count":      len(bucket_rows),
-            "winrate_5m": round(wins / len(bucket_rows) * 100, 1),
-            "avg_ret_5m": round(_st.mean(rets), 3) if rets else None,
-        }
-    result["by_symbol"] = dict(
-        sorted(by_symbol.items(), key=lambda x: -x[1]["count"])
-    )
+        groups.append({
+            **item,
+            "main_signal": main_signal,
+            "label": label,
+            "variant": variant,
+            "reliable": item["count"] >= 20,
+        })
+    groups.sort(key=lambda item: (item["count"] >= 20, item.get("expect_5m") or -999, item.get("winrate_5m") or 0), reverse=True)
 
-    return result
+    return {
+        "total": total,
+        "filled": filled,
+        "long": bucket("FOLLOW_LONG"),
+        "short": bucket("FOLLOW_SHORT"),
+        "groups": groups[:12],
+    }
 
 
 def get_recent(limit: int = 50) -> list[dict]:
     with _get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT ts, symbol, follow, strategy, score, price,
+            SELECT ts, symbol, follow, score, price,
                    price_5m, ret_5m, outcome_5m,
                    price_15m, ret_15m, outcome_15m,
                    features
