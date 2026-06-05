@@ -1014,10 +1014,10 @@ def _public_testnet_status() -> dict:
     if not closes:
         closes = _trade_closes[-200:]
     try:
-        persisted_events = get_trade_events(80)
+        persisted_events = get_trade_events(300)
     except Exception:
         persisted_events = []
-    events = persisted_events or _trade_events[:80]
+    events = persisted_events or _trade_events[:300]
     wins = [item for item in closes if _safe_float(item.get("realized")) > 0]
     losses = [item for item in closes if _safe_float(item.get("realized")) < 0]
     gross_win = sum(_safe_float(item.get("realized")) for item in wins)
@@ -1045,7 +1045,7 @@ def _public_testnet_status() -> dict:
         "max_positions": cfg.get("max_positions"),
         "cooldown_seconds": cfg.get("cooldown_seconds"),
         "auto_close_minutes": cfg.get("auto_close_minutes"),
-        "events": events[:20],
+        "events": events[:200],
         "equity_curve": _equity_curve[-120:],
         "trade_stats": trade_stats,
     }
@@ -1059,7 +1059,7 @@ def _public_testnet_status() -> dict:
             "account_ok": True,
             "message": "本地模拟盘已启用，无需 API Key",
             **account,
-            "events": events[:20],
+            "events": events[:200],
             "equity_curve": _equity_curve[-120:],
         }
     if cfg.get("api_key") and not cfg.get("api_secret"):
@@ -1202,7 +1202,7 @@ HTML = r"""
     .sub { color:var(--muted); font-size:12px; margin-top:4px; }
     .up { color:var(--green); font-weight:850; }
     .down { color:var(--red); font-weight:850; }
-    .layout { display:grid; grid-template-columns:minmax(700px,1fr) 520px; gap:12px; align-items:start; }
+    .layout { display:grid; grid-template-columns:minmax(700px,1fr) 640px; gap:12px; align-items:start; }
     .main-stack { display:grid; gap:10px; min-width:0; }
     .side-stack { display:grid; gap:10px; position:sticky; top:70px; max-height:calc(100vh - 82px); overflow:auto; padding-bottom:2px; }
     .trade-grid { display:grid; gap:10px; align-items:start; }
@@ -1272,8 +1272,16 @@ HTML = r"""
     .mini-stat { border:1px solid var(--line); background:var(--surface2); border-radius:6px; padding:7px; min-height:50px; }
     .mini-stat .label { margin-bottom:4px; font-size:11px; }
     .mini-stat .value { font-size:16px; }
-    .trade-log { border-top:1px solid var(--line); max-height:78px; overflow:auto; padding:7px 12px; color:var(--muted); font-size:12px; line-height:1.5; }
-    .trade-log div { border-bottom:1px solid #edf1f5; padding:4px 0; }
+    .trade-log { border-top:1px solid var(--line); height:360px; overflow:auto; padding:0; color:var(--muted); font-size:12px; line-height:1.45; background:#fff; }
+    .trade-log-row { display:grid; grid-template-columns:68px 54px minmax(0,1fr) 72px; gap:8px; padding:8px 12px; border-bottom:1px solid #edf1f5; align-items:start; }
+    .trade-log-row.open { background:#f8fafc; }
+    .trade-log-row.close.win { background:#f5fbf7; }
+    .trade-log-row.close.loss { background:#fff7f7; }
+    .trade-log-time { color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
+    .trade-log-type { color:var(--ink); font-weight:900; }
+    .trade-log-main { color:var(--text); min-width:0; overflow-wrap:anywhere; }
+    .trade-log-meta { color:var(--muted); font-size:11px; margin-top:3px; overflow-wrap:anywhere; }
+    .trade-log-pnl { text-align:right; font-weight:900; font-variant-numeric:tabular-nums; white-space:nowrap; }
     .chart-wrap { padding:10px 12px 12px; height:220px; }
     #pnlChart,#tradeStatsChart { width:100%; height:160px; display:block; border:1px solid var(--line); border-radius:8px; background:#fff; }
     .chart-meta { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; margin-top:8px; }
@@ -2251,6 +2259,46 @@ HTML = r"""
       document.getElementById("testnetKey").disabled=false;
       document.getElementById("testnetSecret").disabled=false;
     }
+    function eventTypeText(type,message){
+      const text=String(message||"");
+      if(type==="open"||text.includes("自动下单"))return text.includes("加仓")?"加仓":"开仓";
+      if(type==="add"||text.includes("加仓"))return "加仓";
+      if(type==="close"||text.includes("平仓")||text.includes("已实现"))return "平仓";
+      if(type==="skip"||text.includes("跳过"))return "跳过";
+      if(type==="error"||text.includes("失败"))return "失败";
+      return "事件";
+    }
+    function eventRealized(e){
+      if(e.realized!==null&&e.realized!==undefined)return Number(e.realized);
+      const order=e.order_json||e.order||{};
+      if(order&&order.realizedPnl!==undefined)return Number(order.realizedPnl||0);
+      const match=String(e.message||"").match(/已实现 ([+-]?\d+(?:\.\d+)?) USDT/);
+      return match?Number(match[1]):null;
+    }
+    function renderTradeEvent(e){
+      const type=eventTypeText(e.event_type,e.message);
+      const realized=eventRealized(e);
+      const isClose=type==="平仓";
+      const win=realized!==null&&realized>=0;
+      const cls=`trade-log-row ${type==="开仓"?"open":""} ${isClose?"close":""} ${isClose?(win?"win":"loss"):""}`;
+      const symbol=e.symbol?String(e.symbol).replace("USDT",""):"--";
+      const meta=[
+        e.strategy_label||"",
+        e.grade?e.grade+"级":"",
+        e.margin?Number(e.margin).toFixed(2)+"U保证金":"",
+        e.main_signal||"",
+      ].filter(Boolean).join(" · ");
+      const pnl=realized===null?"":(realized>=0?"+":"")+realized.toFixed(2)+"U";
+      const pnlCls=realized===null?"":(realized>=0?"up":"down");
+      return `<div class="${cls}">
+        <div class="trade-log-time">${new Date(e.ts).toLocaleTimeString()}</div>
+        <div class="trade-log-type">${type}</div>
+        <div class="trade-log-main"><strong>${esc(symbol)}</strong> · ${esc(e.message||"")}
+          ${meta?`<div class="trade-log-meta">${esc(meta)}</div>`:""}
+        </div>
+        <div class="trade-log-pnl ${pnlCls}">${pnl}</div>
+      </div>`;
+    }
     function syncTradeForm(data, force=false){
       const active=document.activeElement;
       const editing=!!(active&&active.closest&&active.closest(".trade-form,.trade-actions"));
@@ -2277,8 +2325,8 @@ HTML = r"""
       document.getElementById("tradePnl").className="value "+(Number(data.unrealized||0)>=0?"up":"down");
       document.getElementById("tradePositions").textContent=data.account_ok?(data.positions||[]).length:"--";
       const log=document.getElementById("tradeLog");
-      const events=(data.events||[]).slice(0,8);
-      log.innerHTML=events.length?events.map(e=>`<div class="${e.level==="error"?"down":e.level==="warn"?"":"up"}">${new Date(e.ts).toLocaleTimeString()} · ${esc(e.message)}</div>`).join(""):`<div>${esc(data.message||"等待模拟盘连接。")}</div>`;
+      const events=(data.events||[]).slice(0,80);
+      log.innerHTML=events.length?events.map(renderTradeEvent).join(""):`<div class="trade-log-row"><div></div><div></div><div class="trade-log-main">${esc(data.message||"等待模拟盘连接。")}</div><div></div></div>`;
       const stats=data.trade_stats||{};
       document.getElementById("statTrades").textContent=stats.count||0;
       document.getElementById("statNet").textContent=(Number(stats.net||0)>=0?"+":"")+usdt(stats.net||0);
