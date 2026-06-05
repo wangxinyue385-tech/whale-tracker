@@ -1338,6 +1338,7 @@ HTML = r"""
     };
     const MICRO = {
       enableMomentum:true,
+      invertFollow:true,
       minLiqX:2.5,
       strongLiqX:6.0,
       washoutP5:0.55,
@@ -1468,6 +1469,19 @@ HTML = r"""
         if(members.includes(symbol))return {name,members};
       }
       return null;
+    }
+    function applyFollowInversion(follow,label,strategyLabel,forecast){
+      if(!MICRO.invertFollow||follow!=="FOLLOW_LONG"&&follow!=="FOLLOW_SHORT")return {follow,label,strategyLabel,forecast};
+      const nextFollow=follow==="FOLLOW_LONG"?"FOLLOW_SHORT":"FOLLOW_LONG";
+      const nextForecast={...forecast};
+      nextForecast.side=nextFollow==="FOLLOW_LONG"?"LONG":"SHORT";
+      nextForecast.expected5Pct=Math.abs(Number(nextForecast.expected5Pct||0))*(nextFollow==="FOLLOW_LONG"?1:-1);
+      return {
+        follow:nextFollow,
+        label:nextFollow==="FOLLOW_LONG"?"反向做多":"反向做空",
+        strategyLabel:(strategyLabel||"策略")+"反向",
+        forecast:nextForecast,
+      };
     }
     function liquidationReversalSetup(symbol,p1,p5,f60,l5,cm,d,mb,threshold){
       const closeLocation=isNum(cm.closeLocation)?cm.closeLocation:0.5;
@@ -1779,6 +1793,11 @@ HTML = r"""
       if(isNum(d.oi5Pct)&&Math.abs(d.oi5Pct)>=0.08)reasons.push("OI5m "+(d.oi5Pct>0?"+":"")+d.oi5Pct.toFixed(2)+"%");
       if(isNum(d.takerRatio)&&(d.takerRatio>=1.12||d.takerRatio<=0.9))reasons.push("Taker "+d.takerRatio.toFixed(2));
       if(!reasons.length)reasons.push("等待大额资金流");
+      const inverted=applyFollowInversion(follow,label,strategyLabel,forecast);
+      follow=inverted.follow;
+      label=inverted.label;
+      strategyLabel=inverted.strategyLabel;
+      forecast=inverted.forecast;
       if(!follow){ follow=signal==="LONG"?"WATCH_LONG":signal==="SHORT"?"WATCH_SHORT":"WAIT"; label=follow==="WATCH_LONG"?"多头异动":follow==="WATCH_SHORT"?"空头异动":"观察"; }
       return {symbol,base:base(symbol),price:state.prices.get(symbol)||0,p1,p3,p5,f60,f5,l5,d,m:meta(symbol),cm,mb,threshold,signal,score,follow,label,strategy,strategyLabel,forecast,cost,risks,reasons};
     }
