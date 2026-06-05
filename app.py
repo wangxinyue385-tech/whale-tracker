@@ -13,7 +13,17 @@ from decimal import Decimal, ROUND_DOWN
 from urllib.parse import urlencode
 
 from flask import Flask, jsonify, render_template_string, request
-from signal_logger import fill_prices, get_recent, get_stats, init_db, log_signal
+from signal_logger import (
+    fill_prices,
+    get_recent,
+    get_stats,
+    get_trade_closes,
+    get_trade_events,
+    init_db,
+    log_signal,
+    log_trade_close,
+    log_trade_event,
+)
 
 
 app = Flask(__name__)
@@ -198,6 +208,10 @@ def _event(message: str, level: str = "info", **extra) -> None:
     item = {"ts": int(time.time() * 1000), "message": message, "level": level, **extra}
     _trade_events.insert(0, item)
     del _trade_events[80:]
+    try:
+        log_trade_event(item)
+    except Exception:
+        pass
 
 
 def _exchange_filters(symbol: str) -> dict:
@@ -306,6 +320,10 @@ def _update_market_snapshots(rows: list[dict] | None) -> None:
             "take_profit_pct": _safe_float(row.get("take_profit_pct")),
             "trail_arm_pct": _safe_float(row.get("trail_arm_pct")),
             "funding_rate": _safe_float(row.get("funding_rate")),
+            "book_spread_pct": _safe_float(row.get("book_spread_pct")),
+            "book_imbalance": _safe_float(row.get("book_imbalance")),
+            "bid_depth_usd": _safe_float(row.get("bid_depth_usd")),
+            "ask_depth_usd": _safe_float(row.get("ask_depth_usd")),
             "risks": row.get("risks") or [],
         }
     cutoff = now_ms - 10 * 60 * 1000
@@ -837,7 +855,19 @@ def _close_due_positions(account: dict | None = None) -> None:
                 meta["notional"] = _safe_float(meta.get("notional")) + _order_notional_usdt(add_margin)
                 meta["entry_cost"] = _safe_float(meta.get("entry_cost")) + (_safe_float(order.get("entryCost")) if isinstance(order, dict) else 0.0)
                 meta["invalid_snapshots"] = 0
-                _event(f"{symbol} 仍触发开仓且浮亏，加仓 · {add_grade}级 {add_margin:.2f}U保证金 · 浮亏 {gross_pnl:+.2f} USDT", "info", symbol=symbol, order=order)
+                _event(
+                    f"{symbol} 仍触发开仓且浮亏，加仓 · {add_grade}级 {add_margin:.2f}U保证金 · 浮亏 {gross_pnl:+.2f} USDT",
+                    "info",
+                    symbol=symbol,
+                    order=order,
+                    event_type="add",
+                    strategy=meta.get("strategy"),
+                    strategy_label=meta.get("strategy_label"),
+                    main_signal=meta.get("main_signal"),
+                    signal_variant=meta.get("signal_variant"),
+                    grade=add_grade,
+                    margin=add_margin,
+                )
                 continue
             except Exception as exc:  # noqa: BLE001
                 _event(f"{symbol} 自动加仓失败：{exc}", "warn", symbol=symbol)
@@ -864,8 +894,25 @@ def _close_due_positions(account: dict | None = None) -> None:
             }
             _trade_closes.append(close_item)
             del _trade_closes[:-400]
+            try:
+                log_trade_close(close_item)
+            except Exception:
+                pass
             extra = f" · 已实现 {realized:+.2f} USDT" if realized else ""
-            _event(f"{symbol} {reason}{extra}", "info", symbol=symbol, order=order)
+            _event(
+                f"{symbol} {reason}{extra}",
+                "info",
+                symbol=symbol,
+                order=order,
+                close=close_item,
+                event_type="close",
+                strategy=meta.get("strategy"),
+                strategy_label=meta.get("strategy_label"),
+                main_signal=meta.get("main_signal"),
+                signal_variant=meta.get("signal_variant"),
+                grade=meta.get("opportunity_grade"),
+                margin=meta.get("margin"),
+            )
             _auto_positions.pop(symbol, None)
         except Exception as exc:  # noqa: BLE001
             _event(f"{symbol} 自动平仓失败：{exc}", "error", symbol=symbol)
@@ -941,14 +988,36 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                 }
                 open_count += 1
                 mode = "本地模拟盘" if _is_paper_mode() else "Binance Testnet"
-                _event(f"{symbol} {('做多' if follow == 'FOLLOW_LONG' else '做空')} {strategy_label} {mode}自动下单 · {opportunity_grade}级 {order_margin:.2f}U保证金", "info", symbol=symbol, order=order)
+                _event(
+                    f"{symbol} {('做多' if follow == 'FOLLOW_LONG' else '做空')} {strategy_label} {mode}自动下单 · {opportunity_grade}级 {order_margin:.2f}U保证金",
+                    "info",
+                    symbol=symbol,
+                    order=order,
+                    event_type="open",
+                    strategy=strategy,
+                    strategy_label=strategy_label,
+                    main_signal=row.get("main_signal") or strategy,
+                    signal_variant=row.get("signal_variant") or "primary",
+                    grade=opportunity_grade,
+                    margin=order_margin,
+                )
             except Exception as exc:  # noqa: BLE001
                 _event(f"{symbol} 自动下单失败：{exc}", "error", symbol=symbol)
 
 
 def _public_testnet_status() -> dict:
     cfg = _testnet_config
-    closes = _trade_closes[-200:]
+    try:
+        closes = get_trade_closes(200)
+    except Exception:
+        closes = []
+    if not closes:
+        closes = _trade_closes[-200:]
+    try:
+        persisted_events = get_trade_events(80)
+    except Exception:
+        persisted_events = []
+    events = persisted_events or _trade_events[:80]
     wins = [item for item in closes if _safe_float(item.get("realized")) > 0]
     losses = [item for item in closes if _safe_float(item.get("realized")) < 0]
     gross_win = sum(_safe_float(item.get("realized")) for item in wins)
@@ -976,7 +1045,7 @@ def _public_testnet_status() -> dict:
         "max_positions": cfg.get("max_positions"),
         "cooldown_seconds": cfg.get("cooldown_seconds"),
         "auto_close_minutes": cfg.get("auto_close_minutes"),
-        "events": _trade_events[:20],
+        "events": events[:20],
         "equity_curve": _equity_curve[-120:],
         "trade_stats": trade_stats,
     }
@@ -990,7 +1059,7 @@ def _public_testnet_status() -> dict:
             "account_ok": True,
             "message": "本地模拟盘已启用，无需 API Key",
             **account,
-            "events": _trade_events[:20],
+            "events": events[:20],
             "equity_curve": _equity_curve[-120:],
         }
     if cfg.get("api_key") and not cfg.get("api_secret"):
@@ -1003,7 +1072,7 @@ def _public_testnet_status() -> dict:
         with _trade_lock:
             account = _account_snapshot()
             _close_due_positions(account)
-        return {**base, "account_ok": True, **account, "events": _trade_events[:20], "equity_curve": _equity_curve[-120:]}
+        return {**base, "account_ok": True, **account, "events": events[:20], "equity_curve": _equity_curve[-120:]}
     except Exception as exc:  # noqa: BLE001
         return {**base, "account_ok": False, "message": str(exc)}
 
@@ -1635,6 +1704,8 @@ HTML = r"""
       if(isNum(cm.ret15))probUp += cm.ret15*0.35;
       if(isNum(cm.closeLocation))probUp += (cm.closeLocation-0.5)*4;
       if(isNum(d.oi15Pct)&&d.oi15Pct<-2.5)probUp += p5>=0 ? -3 : 3;
+      if(isNum(d.bookImbalance))probUp += d.bookImbalance*3.5;
+      if(isNum(d.bookSpreadPct)&&d.bookSpreadPct>(MAJORS.has(symbol)?0.035:0.10))probUp += edge>=0 ? -2.5 : 2.5;
       const tooLateLong=p1>ALPHA.altMaxP1&&p5>ALPHA.altMaxP5;
       const tooLateShort=p1<-ALPHA.altMaxP1&&p5<-ALPHA.altMaxP5;
       if(tooLateLong)probUp-=5;
@@ -1710,6 +1781,23 @@ HTML = r"""
         const taker=await fetchJson(`/futures/data/takerlongshortRatio?symbol=${encodeURIComponent(symbol)}&period=5m&limit=1`);
         if(Array.isArray(taker)&&taker.length) next.takerRatio=Number(taker[taker.length-1].buySellRatio||1);
       }catch(_){}
+      try{
+        const depth=await fetchJson(`/fapi/v1/depth?symbol=${encodeURIComponent(symbol)}&limit=20`);
+        const bids=(depth.bids||[]).map(row=>({price:Number(row[0]||0),qty:Number(row[1]||0)})).filter(row=>row.price>0&&row.qty>0);
+        const asks=(depth.asks||[]).map(row=>({price:Number(row[0]||0),qty:Number(row[1]||0)})).filter(row=>row.price>0&&row.qty>0);
+        if(bids.length&&asks.length){
+          const bestBid=bids[0].price, bestAsk=asks[0].price, mid=(bestBid+bestAsk)/2;
+          const band=MAJORS.has(symbol)?0.0015:0.0030;
+          const bidDepth=bids.filter(row=>row.price>=mid*(1-band)).reduce((sum,row)=>sum+row.price*row.qty,0);
+          const askDepth=asks.filter(row=>row.price<=mid*(1+band)).reduce((sum,row)=>sum+row.price*row.qty,0);
+          const totalDepth=bidDepth+askDepth;
+          next.bookSpreadPct=mid?(bestAsk-bestBid)/mid*100:null;
+          next.bookImbalance=totalDepth?(bidDepth-askDepth)/totalDepth:null;
+          next.bidDepthUsd=Math.round(bidDepth);
+          next.askDepthUsd=Math.round(askDepth);
+          next.bookUpdatedAt=Date.now();
+        }
+      }catch(_){}
       state.derivatives.set(symbol,next);
     }
     async function fetchKlineSymbol(symbol){
@@ -1730,7 +1818,7 @@ HTML = r"""
 
     function flow(symbol, ms){ const rows=cutoff(state.trades.get(symbol)||[],ms); let buy=0,sell=0,largest=0,buyCount=0,sellCount=0,lastSide="",streak=0; for(const row of rows){ if(row.side==="BUY"){buy+=row.notional; buyCount++;} else {sell+=row.notional; sellCount++;} largest=Math.max(largest,row.notional); } for(let i=rows.length-1;i>=0;i--){ if(!lastSide)lastSide=rows[i].side; if(rows[i].side!==lastSide)break; streak++; } return {buy,sell,net:buy-sell,total:buy+sell,largest,buyCount,sellCount,count:rows.length,lastSide,streak,imbalance:buy+sell?(buy-sell)/(buy+sell):0}; }
     function liq(symbol, ms){ const rows=cutoff(state.liquidations.get(symbol)||[],ms); let longLiq=0,shortLiq=0; for(const row of rows){ if(row.side==="SELL")longLiq+=row.notional; else shortLiq+=row.notional; } return {longLiq,shortLiq,total:longLiq+shortLiq}; }
-    function derivative(symbol){ return {oi15Pct:null,oi5Pct:null,takerRatio:null,fundingRate:null,nextFundingTime:0,...(state.derivatives.get(symbol)||{})}; }
+    function derivative(symbol){ return {oi15Pct:null,oi5Pct:null,takerRatio:null,fundingRate:null,nextFundingTime:0,bookSpreadPct:null,bookImbalance:null,bidDepthUsd:null,askDepthUsd:null,bookUpdatedAt:0,...(state.derivatives.get(symbol)||{})}; }
     function meta(symbol){ return state.marketMeta.get(symbol)||{}; }
 
     function scoreRow(symbol){
@@ -1782,8 +1870,17 @@ HTML = r"""
       const candleOkShort=!isNum(cm.closeLocation)||cm.closeLocation<=0.42;
       const btcOkLong=MAJORS.has(symbol)||mb.btc>=-0.08&&mb.eth>=-0.12;
       const btcOkShort=MAJORS.has(symbol)||mb.btc<=0.08&&mb.eth<=0.12;
-      const alignedLong=MICRO.enableMomentum&&signal==="LONG"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastLong&&profitOk&&flowLong&&flowStrong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&btcOkLong&&oiLongOk&&candleOkLong&&!oiFallingHard&&f60.largest>=threshold&&!chaseLong;
-      const alignedShort=MICRO.enableMomentum&&signal==="SHORT"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastShort&&profitOk&&flowShort&&flowStrong&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&btcOkShort&&oiShortOk&&candleOkShort&&!oiFallingHard&&f60.largest>=threshold&&!chaseShort;
+      const bookKnown=isNum(d.bookSpreadPct)&&isNum(d.bookImbalance);
+      const maxSpreadPct=MAJORS.has(symbol)?0.035:0.10;
+      const spreadOk=!bookKnown||d.bookSpreadPct<=maxSpreadPct;
+      const bookLongOk=!bookKnown||d.bookImbalance>=-0.18;
+      const bookShortOk=!bookKnown||d.bookImbalance<=0.18;
+      const depthLongRatio=isNum(d.askDepthUsd)&&d.askDepthUsd>0?Math.abs(f60.net)/d.askDepthUsd:null;
+      const depthShortRatio=isNum(d.bidDepthUsd)&&d.bidDepthUsd>0?Math.abs(f60.net)/d.bidDepthUsd:null;
+      const depthLongOk=!isNum(depthLongRatio)||depthLongRatio>=0.03;
+      const depthShortOk=!isNum(depthShortRatio)||depthShortRatio>=0.03;
+      const alignedLong=MICRO.enableMomentum&&signal==="LONG"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastLong&&profitOk&&flowLong&&flowStrong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&btcOkLong&&oiLongOk&&candleOkLong&&spreadOk&&bookLongOk&&depthLongOk&&!oiFallingHard&&f60.largest>=threshold&&!chaseLong;
+      const alignedShort=MICRO.enableMomentum&&signal==="SHORT"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastShort&&profitOk&&flowShort&&flowStrong&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&btcOkShort&&oiShortOk&&candleOkShort&&spreadOk&&bookShortOk&&depthShortOk&&!oiFallingHard&&f60.largest>=threshold&&!chaseShort;
       const liquidationSetup=liquidationReversalSetup(symbol,p1,p5,f60,l5,cm,d,mb,threshold);
       const leadLagSetup=sectorLeadLagSetup(symbol,p1,p5,f60,f5,cm,mb,threshold);
       const exhaustionSetup=flowExhaustionSetup(symbol,p1,p5,f60,f5,cm,d,mb,threshold);
@@ -1861,6 +1958,11 @@ HTML = r"""
         if(signal==="LONG"&&!marketOkLong)risks.push("大盘反向"); if(signal==="SHORT"&&!marketOkShort)risks.push("大盘反向");
         if(signal==="LONG"&&!btcOkLong)risks.push("BTC/ETH压制"); if(signal==="SHORT"&&!btcOkShort)risks.push("BTC/ETH反抽");
         if(signal==="LONG"&&!oiLongOk)risks.push("OI不支持多"); if(signal==="SHORT"&&!oiShortOk)risks.push("OI不支持空");
+        if(!spreadOk)risks.push("点差过宽");
+        if(signal==="LONG"&&!bookLongOk)risks.push("盘口不支持多");
+        if(signal==="SHORT"&&!bookShortOk)risks.push("盘口不支持空");
+        if(signal==="LONG"&&!depthLongOk)risks.push("主动买流弱于盘口");
+        if(signal==="SHORT"&&!depthShortOk)risks.push("主动卖流弱于盘口");
         if(oiFallingHard)risks.push("OI下降");
       }
       const reasons=[];
@@ -1876,6 +1978,8 @@ HTML = r"""
       if(isNum(d.oi15Pct)&&Math.abs(d.oi15Pct)>=1.2)reasons.push("OI15m "+(d.oi15Pct>0?"+":"")+d.oi15Pct.toFixed(2)+"%");
       if(isNum(d.oi5Pct)&&Math.abs(d.oi5Pct)>=0.08)reasons.push("OI5m "+(d.oi5Pct>0?"+":"")+d.oi5Pct.toFixed(2)+"%");
       if(isNum(d.takerRatio)&&(d.takerRatio>=1.12||d.takerRatio<=0.9))reasons.push("Taker "+d.takerRatio.toFixed(2));
+      if(isNum(d.bookImbalance))reasons.push("盘口失衡 "+d.bookImbalance.toFixed(2));
+      if(isNum(d.bookSpreadPct))reasons.push("点差 "+d.bookSpreadPct.toFixed(3)+"%");
       if(!reasons.length)reasons.push("等待大额资金流");
       const rawFollow=follow;
       const rawLabel=label;
@@ -1906,11 +2010,13 @@ HTML = r"""
       const streak=row.f60.lastSide?(row.f60.lastSide==="BUY"?"买":"卖")+row.f60.streak:"--";
       const closeLoc=isNum(row.cm.closeLocation)?Math.round(row.cm.closeLocation*100)+"%":"--";
       const flowText=`60s ${money(row.f60.net)} / 5m ${money(row.f5.net)} / 最大 ${money(row.f60.largest||row.f5.largest)}`;
+      const bookText=`点差 ${isNum(row.d.bookSpreadPct)?row.d.bookSpreadPct.toFixed(3)+"%":"--"} / 失衡 ${isNum(row.d.bookImbalance)?row.d.bookImbalance.toFixed(2):"--"} / 买卖盘 ${money(row.d.bidDepthUsd||0)} / ${money(row.d.askDepthUsd||0)}`;
       const marketText=`BTC ${signedPlain(row.mb.btc,2)} / ETH ${signedPlain(row.mb.eth,2)} / bias ${row.mb.bias}`;
       return `<tr class="detail-row"><td colspan="10"><div class="detail-box">
         ${detailItem("依据",`<div class="reason">${reasons}</div>`)}
         ${detailItem("风险",`<div class="reason">${risks}</div>`)}
         ${detailItem("资金流",flowText)}
+        ${detailItem("盘口",bookText)}
         ${detailItem("连续",streak)}
         ${detailItem("OI / Taker",`${pctOrDash(row.d.oi15Pct)} / ${ratioOrDash(row.d.takerRatio)}`)}
         ${detailItem("量能 / 收盘位置",`${isNum(row.cm.volSpike)?row.cm.volSpike.toFixed(1)+"x":"--"} / ${closeLoc}`)}
@@ -1990,7 +2096,7 @@ HTML = r"""
       board.innerHTML=cards.map(renderStrategyCard).join("");
     }
     function renderEvents(){ const list=document.getElementById("eventList"); if(!list)return; const text=[`价格流 ${state.priceConnected?"正常":"异常"}`,`大单流 ${state.tradeConnected?"正常":"异常"}`,`爆仓流 ${state.liqConnected?"正常":"异常"}`,`事件 ${state.events.length}`]; const latest=state.events.slice(0,4).map(ev=>{ const cls=ev.side==="BUY"?"buy":"sell"; return `<div class="event"><div class="event-side ${cls}">${ev.label}</div><div><div class="event-title"><span>${base(ev.symbol)}</span><span>${money(ev.notional)}</span></div><div class="event-meta">${new Date(ev.ts).toLocaleTimeString()} · 后台记录</div></div></div>`; }).join(""); list.innerHTML=`<div class="event"><div></div><div><div class="event-title">后台监控状态</div><div class="event-meta">${text.join(" · ")}</div></div></div>${latest}`; }
-    function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,price:r.price,forecast_side:r.forecast.side,forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),forecast_5m_expected_pct:Number(r.forecast.expected5Pct.toFixed(3)),required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),take_profit_pct:r.forecast.targets?Number(r.forecast.targets.takeProfit.toFixed(3)):null,trail_arm_pct:r.forecast.targets?Number(r.forecast.targets.trailArm.toFixed(3)):null,funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),price_1m_pct:Number(r.p1.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,atr_pct:r.cm.atrPct,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_5m_pct:r.d.oi5Pct,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,risks:r.risks,reasons:r.reasons})); }
+    function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,price:r.price,forecast_side:r.forecast.side,forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),forecast_5m_expected_pct:Number(r.forecast.expected5Pct.toFixed(3)),required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),take_profit_pct:r.forecast.targets?Number(r.forecast.targets.takeProfit.toFixed(3)):null,trail_arm_pct:r.forecast.targets?Number(r.forecast.targets.trailArm.toFixed(3)):null,funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),price_1m_pct:Number(r.p1.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,atr_pct:r.cm.atrPct,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_5m_pct:r.d.oi5Pct,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,book_spread_pct:r.d.bookSpreadPct,book_imbalance:r.d.bookImbalance,bid_depth_usd:r.d.bidDepthUsd,ask_depth_usd:r.d.askDepthUsd,risks:r.risks,reasons:r.reasons})); }
     function compactEvents(){ return state.events.slice(0,40).map(e=>({symbol:e.symbol,base:base(e.symbol),label:e.label,side:e.side,price:e.price,notional:Math.round(e.notional),time:new Date(e.ts).toLocaleTimeString()})); }
     function trimOld(){ const cut=now()-6*60*1000; for(const map of [state.trades,state.liquidations]){ for(const [sym,list] of map){ while(list.length&&list[0].ts<cut)list.shift(); if(!list.length)map.delete(sym); } } }
 
@@ -2021,6 +2127,10 @@ HTML = r"""
         take_profit_pct:r.forecast.targets?Number(r.forecast.targets.takeProfit.toFixed(3)):null,
         trail_arm_pct:r.forecast.targets?Number(r.forecast.targets.trailArm.toFixed(3)):null,
         funding_rate:r.d.fundingRate,
+        book_spread_pct:r.d.bookSpreadPct,
+        book_imbalance:r.d.bookImbalance,
+        bid_depth_usd:r.d.bidDepthUsd,
+        ask_depth_usd:r.d.askDepthUsd,
         risks:r.risks,
       }));
       const payload=toLog.map(r=>({
@@ -2044,6 +2154,10 @@ HTML = r"""
         upper_wick_pct:isNum(r.cm.upperWickPct)?Number(r.cm.upperWickPct.toFixed(4)):null,
         lower_wick_pct:isNum(r.cm.lowerWickPct)?Number(r.cm.lowerWickPct.toFixed(4)):null,
         oi_15m_pct:r.d.oi15Pct, taker_ratio:r.d.takerRatio, funding_rate:r.d.fundingRate,
+        book_spread_pct:r.d.bookSpreadPct,
+        book_imbalance:r.d.bookImbalance,
+        bid_depth_usd:r.d.bidDepthUsd,
+        ask_depth_usd:r.d.askDepthUsd,
         market_bias:r.mb.bias,
         btc_5m_pct:Number(r.mb.btc.toFixed(4)),
         eth_5m_pct:Number(r.mb.eth.toFixed(4)),
@@ -2338,6 +2452,18 @@ def signal_recent():
 @app.get("/api/testnet/status")
 def testnet_status():
     return jsonify(_public_testnet_status())
+
+
+@app.get("/api/testnet/events")
+def testnet_events():
+    limit = min(int(request.args.get("limit", 500)), 5000)
+    return jsonify(get_trade_events(limit))
+
+
+@app.get("/api/testnet/closes")
+def testnet_closes():
+    limit = min(int(request.args.get("limit", 500)), 5000)
+    return jsonify(get_trade_closes(limit))
 
 
 @app.post("/api/testnet/config")
