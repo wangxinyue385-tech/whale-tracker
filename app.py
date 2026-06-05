@@ -99,6 +99,7 @@ EXIT_PROGRESS_EPS_PCT = float(os.environ.get("EXIT_PROGRESS_EPS_PCT", "0.03"))
 EXIT_MAX_HOLD_SECONDS = int(os.environ.get("EXIT_MAX_HOLD_SECONDS", "300"))
 EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT = float(os.environ.get("EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT", "0.05"))
 FUNDING_EXIT_TAKE_PROFIT_PCT = float(os.environ.get("FUNDING_EXIT_TAKE_PROFIT_PCT", "0.45"))
+FUNDING_EXIT_HARD_STOP_PCT = float(os.environ.get("FUNDING_EXIT_HARD_STOP_PCT", "-1.35"))
 FUNDING_EXIT_NORMAL_RATE_PCT = float(os.environ.get("FUNDING_EXIT_NORMAL_RATE_PCT", "0.035"))
 FUNDING_EXIT_MAX_HOLD_SECONDS = int(os.environ.get("FUNDING_EXIT_MAX_HOLD_SECONDS", "900"))
 EXIT_REVERSE_SCORE = float(os.environ.get("EXIT_REVERSE_SCORE", "70"))
@@ -561,10 +562,11 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
         meta["last_favorable_pct"] = pnl_pct
         meta["last_favorable_at"] = now_ms
 
-    if pnl_pct <= EXIT_HARD_STOP_PCT:
+    strategy = str(meta.get("strategy") or "flow_momentum")
+    hard_stop_pct = FUNDING_EXIT_HARD_STOP_PCT if strategy == "funding_reversion" else EXIT_HARD_STOP_PCT
+    if pnl_pct <= hard_stop_pct:
         return f"止损平仓 {pnl_pct:.2f}%"
 
-    strategy = str(meta.get("strategy") or "flow_momentum")
     if strategy == "funding_reversion" and pnl_pct >= FUNDING_EXIT_TAKE_PROFIT_PCT:
         return f"费率回归止盈 {pnl_pct:.2f}%"
 
@@ -1133,10 +1135,10 @@ HTML = r"""
       majorMaxP1:0.45, altMaxP1:0.75, majorMaxP5:1.20, altMaxP5:2.00,
     };
     const FUNDING = {
-      extremePct:0.08, normalPct:0.035,
-      minVolume24hUsd:20000000,
-      maxAgainstP1:0.35, coolP1:0.12,
-      minP5Stretch:0.15,
+      extremePct:0.10, normalPct:0.035,
+      minVolume24hUsd:80000000,
+      maxAgainstP1:0.20, coolP1:0.03,
+      minP5Stretch:0.35,
     };
 
     const state = {
@@ -1236,16 +1238,16 @@ HTML = r"""
       const oiOk=!isNum(d.oi15Pct)||d.oi15Pct>-4.0;
       if(!oiOk)return null;
       if(rate>0){
-        const crowded=p5>=FUNDING.minP5Stretch||closeLocation>=0.68||taker>=1.15;
-        const cooling=p1<=FUNDING.coolP1||f60.net<0||closeLocation<=0.55;
+        const crowded=p5>=FUNDING.minP5Stretch&&(closeLocation>=0.62||taker>=1.10);
+        const cooling=p1<=FUNDING.coolP1&&(f60.net<0||closeLocation<=0.55);
         const fightingPump=p1>FUNDING.maxAgainstP1||(signal==="LONG"&&score>=85&&f60.net>threshold);
         const marketOk=MAJORS.has(symbol)||mb.bias<=1;
         if(crowded&&cooling&&!fightingPump&&marketOk){
           return {follow:"FOLLOW_SHORT", side:"SHORT", label:"费率空", strategy:"funding_reversion", strategyLabel:"费率回归", score:Math.min(96,Math.round(72+absRate*100)), reason:`正资金费 ${rate.toFixed(4)}% 拥挤回归`};
         }
       }else{
-        const crowded=p5<=-FUNDING.minP5Stretch||closeLocation<=0.32||taker<=0.88;
-        const cooling=p1>=-FUNDING.coolP1||f60.net>0||closeLocation>=0.45;
+        const crowded=p5<=-FUNDING.minP5Stretch&&(closeLocation<=0.38||taker<=0.92);
+        const cooling=p1>=-FUNDING.coolP1&&(f60.net>0||closeLocation>=0.45);
         const fightingDump=p1<-FUNDING.maxAgainstP1||(signal==="SHORT"&&score>=85&&f60.net<-threshold);
         const marketOk=MAJORS.has(symbol)||mb.bias>=-1;
         if(crowded&&cooling&&!fightingDump&&marketOk){
