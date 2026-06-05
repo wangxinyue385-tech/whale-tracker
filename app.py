@@ -44,7 +44,7 @@ SEED_SYMBOLS = [
     if symbol.strip()
 ]
 
-MAX_STREAM_SYMBOLS = int(os.environ.get("MAX_STREAM_SYMBOLS", "180"))
+MAX_STREAM_SYMBOLS = int(os.environ.get("MAX_STREAM_SYMBOLS", "220"))
 TRADE_STREAM_CHUNK_SIZE = int(os.environ.get("TRADE_STREAM_CHUNK_SIZE", "60"))
 LARGE_TRADE_USD = float(os.environ.get("LARGE_TRADE_USD", "50000"))
 MIN_DYNAMIC_TRADE_USD = float(os.environ.get("MIN_DYNAMIC_TRADE_USD", "10000"))
@@ -91,7 +91,7 @@ TESTNET_AUTO_CLOSE_MINUTES = float(os.environ.get("TESTNET_AUTO_CLOSE_MINUTES", 
 TESTNET_ORDER_USDT = float(os.environ.get("TESTNET_ORDER_USDT", "10"))
 TESTNET_LEVERAGE = int(os.environ.get("TESTNET_LEVERAGE", "4"))
 TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "10"))
-TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "300"))
+TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "180"))
 PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "100"))
 ENTRY_CONFIRM_SNAPSHOTS = int(os.environ.get("ENTRY_CONFIRM_SNAPSHOTS", "1"))
 ENTRY_CONFIRM_MAX_GAP_SECONDS = int(os.environ.get("ENTRY_CONFIRM_MAX_GAP_SECONDS", "8"))
@@ -1513,21 +1513,21 @@ HTML = r"""
     const STABLE_SYMBOLS = new Set(["USDCUSDT","BUSDUSDT","FDUSDUSDT","TUSDUSDT","USDPUSDT","DAIUSDT"]);
     const MAJORS = new Set(["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]);
     const ALPHA = {
-      minScore:70, minProb:62, minEdgePct:0.12,
-      minTotal5x:5.0, minDirectionGap:12,
+      minScore:68, minProb:60, minEdgePct:0.09,
+      minTotal5x:4.2, minDirectionGap:10,
       majorMaxP1:0.32, altMaxP1:0.45, majorMaxP5:0.85, altMaxP5:1.20,
     };
     const MICRO = {
       enableMomentum:true,
       invertFollow:false,
       enableExhaustionReversal:true,
-      minLiqX:2.5,
-      strongLiqX:6.0,
-      washoutP5:0.55,
-      reversalP1:0.04,
-      minAbsorbX:0.8,
-      leadMovePct:1.2,
-      lagMaxMovePct:0.45,
+      minLiqX:2.2,
+      strongLiqX:5.2,
+      washoutP5:0.45,
+      reversalP1:0.025,
+      minAbsorbX:0.65,
+      leadMovePct:1.0,
+      lagMaxMovePct:0.55,
     };
     const FUNDING = {
       enabled:false,
@@ -1943,12 +1943,12 @@ HTML = r"""
       const depthShortRatio=isNum(d.bidDepthUsd)&&d.bidDepthUsd>0?Math.abs(f60.net)/d.bidDepthUsd:null;
       const depthLongOk=!isNum(depthLongRatio)||depthLongRatio>=0.03;
       const depthShortOk=!isNum(depthShortRatio)||depthShortRatio>=0.03;
-      const momentumImpulseLong=p1>=0.03&&p3>=0.08&&p5>=0.12&&closeLocation>=0.62;
-      const momentumImpulseShort=p1<=-0.03&&p3<=-0.08&&p5<=-0.12&&closeLocation<=0.38;
-      const momentumBookLong=!bookKnown||d.bookImbalance>=0.08;
-      const momentumBookShort=!bookKnown||d.bookImbalance<=-0.08;
-      const momentumDepthLong=!isNum(depthLongRatio)||depthLongRatio>=0.08;
-      const momentumDepthShort=!isNum(depthShortRatio)||depthShortRatio>=0.08;
+      const momentumImpulseLong=p1>=0.02&&p3>=0.06&&p5>=0.10&&closeLocation>=0.58;
+      const momentumImpulseShort=p1<=-0.02&&p3<=-0.06&&p5<=-0.10&&closeLocation<=0.42;
+      const momentumBookLong=!bookKnown||d.bookImbalance>=0.04;
+      const momentumBookShort=!bookKnown||d.bookImbalance<=-0.04;
+      const momentumDepthLong=!isNum(depthLongRatio)||depthLongRatio>=0.06;
+      const momentumDepthShort=!isNum(depthShortRatio)||depthShortRatio>=0.06;
       const alignedLong=MICRO.enableMomentum&&signal==="LONG"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastLong&&profitOk&&flowLong&&flowStrong&&priceLong&&momentumImpulseLong&&repeatLong&&volumeOk&&marketOkLong&&btcOkLong&&oiLongOk&&candleOkLong&&spreadOk&&bookLongOk&&momentumBookLong&&depthLongOk&&momentumDepthLong&&!oiFallingHard&&f60.largest>=threshold&&!chaseLong;
       const alignedShort=MICRO.enableMomentum&&signal==="SHORT"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastShort&&profitOk&&flowShort&&flowStrong&&priceShort&&momentumImpulseShort&&repeatShort&&volumeOk&&marketOkShort&&btcOkShort&&oiShortOk&&candleOkShort&&spreadOk&&bookShortOk&&momentumBookShort&&depthShortOk&&momentumDepthShort&&!oiFallingHard&&f60.largest>=threshold&&!chaseShort;
       const liquidationSetup=liquidationReversalSetup(symbol,p1,p5,f60,l5,cm,d,mb,threshold);
