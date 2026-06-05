@@ -1160,12 +1160,29 @@ HTML = r"""
       minTotal5x:8.0, minDirectionGap:18,
       majorMaxP1:0.32, altMaxP1:0.45, majorMaxP5:0.85, altMaxP5:1.20,
     };
+    const MICRO = {
+      enableMomentum:false,
+      minLiqX:2.5,
+      strongLiqX:6.0,
+      washoutP5:0.35,
+      leadMovePct:1.2,
+      lagMaxMovePct:0.45,
+    };
     const FUNDING = {
       enabled:false,
       extremePct:0.10, normalPct:0.035,
       minVolume24hUsd:80000000,
       maxAgainstP1:0.20, coolP1:0.03,
       minP5Stretch:0.35,
+    };
+    const SECTOR_GROUPS = {
+      meme:["DOGEUSDT","1000PEPEUSDT","1000SHIBUSDT","1000BONKUSDT","WIFUSDT","FLOKIUSDT","MEMEUSDT","TURBOUSDT","PNUTUSDT"],
+      ai:["FETUSDT","AGIXUSDT","OCEANUSDT","WLDUSDT","ARKMUSDT","AIUSDT","TAOUSDT","RENDERUSDT","NFPUSDT","PHBUSDT"],
+      l1:["SOLUSDT","SUIUSDT","APTUSDT","SEIUSDT","AVAXUSDT","NEARUSDT","INJUSDT","TONUSDT"],
+      l2:["OPUSDT","ARBUSDT","STRKUSDT","MANTAUSDT","METISUSDT","ZKUSDT"],
+      defi:["UNIUSDT","AAVEUSDT","SUSHIUSDT","CRVUSDT","COMPUSDT","MKRUSDT","LDOUSDT","PENDLEUSDT"],
+      gaming:["GALAUSDT","SANDUSDT","MANAUSDT","AXSUSDT","GMTUSDT","MAGICUSDT","PIXELUSDT"],
+      payment:["XRPUSDT","XLMUSDT","HBARUSDT","ADAUSDT","TRXUSDT","ALGOUSDT"],
     };
 
     const state = {
@@ -1254,6 +1271,53 @@ HTML = r"""
       if(btc>0.18)bias++; if(btc<-0.18)bias--;
       if(eth>0.22)bias++; if(eth<-0.22)bias--;
       return {bias, btc, eth};
+    }
+    function sectorFor(symbol){
+      for(const [name,members] of Object.entries(SECTOR_GROUPS)){
+        if(members.includes(symbol))return {name,members};
+      }
+      return null;
+    }
+    function liquidationReversalSetup(symbol,p1,p5,f60,l5,cm,d,mb,threshold){
+      const closeLocation=isNum(cm.closeLocation)?cm.closeLocation:0.5;
+      const oiDrop=(isNum(d.oi5Pct)&&d.oi5Pct<=-0.45)||(isNum(d.oi15Pct)&&d.oi15Pct<=-1.2);
+      const longWashout=l5.longLiq>=threshold*MICRO.minLiqX&&p5<=-MICRO.washoutP5&&(p1>=-0.20||closeLocation>=0.45);
+      const longAbsorbed=f60.net>0||f60.buyCount>=2||closeLocation>=0.52;
+      if(longWashout&&longAbsorbed&&(oiDrop||l5.longLiq>=threshold*MICRO.strongLiqX)&&mb.bias>=-1){
+        const strength=Math.min(18,l5.longLiq/Math.max(threshold,1)*1.8)+Math.max(0,(closeLocation-0.45)*24);
+        return {follow:"FOLLOW_LONG", side:"LONG", label:"爆仓反弹", strategy:"liquidation_reversal", strategyLabel:"爆仓反弹", score:Math.min(96,Math.round(76+strength)), reason:`多头爆仓 ${money(l5.longLiq)} 后承接`};
+      }
+      const shortWashout=l5.shortLiq>=threshold*MICRO.minLiqX&&p5>=MICRO.washoutP5&&(p1<=0.20||closeLocation<=0.55);
+      const shortAbsorbed=f60.net<0||f60.sellCount>=2||closeLocation<=0.48;
+      if(shortWashout&&shortAbsorbed&&(oiDrop||l5.shortLiq>=threshold*MICRO.strongLiqX)&&mb.bias<=1){
+        const strength=Math.min(18,l5.shortLiq/Math.max(threshold,1)*1.8)+Math.max(0,(0.55-closeLocation)*24);
+        return {follow:"FOLLOW_SHORT", side:"SHORT", label:"爆仓回落", strategy:"liquidation_reversal", strategyLabel:"爆仓反弹", score:Math.min(96,Math.round(76+strength)), reason:`空头爆仓 ${money(l5.shortLiq)} 后压回`};
+      }
+      return null;
+    }
+    function sectorLeadLagSetup(symbol,p1,p5,f60,f5,cm,mb,threshold){
+      const sector=sectorFor(symbol);
+      if(!sector)return null;
+      const peers=sector.members.filter(sym=>sym!==symbol&&activeSet().has(sym)&&state.prices.has(sym));
+      if(!peers.length)return null;
+      let leader=null, leaderP5=0;
+      for(const peer of peers){
+        const ret=price5m(peer);
+        if(Math.abs(ret)>Math.abs(leaderP5)){ leader=peer; leaderP5=ret; }
+      }
+      if(!leader)return null;
+      const closeLocation=isNum(cm.closeLocation)?cm.closeLocation:0.5;
+      const laggingLong=leaderP5>=MICRO.leadMovePct&&p5>=-0.12&&p5<=MICRO.lagMaxMovePct&&p1>=-0.05;
+      const longFlow=f60.net>0&&f5.net>0&&f60.largest>=threshold&&f5.total>=threshold*3;
+      if(laggingLong&&longFlow&&closeLocation>=0.52&&mb.bias>=-1){
+        return {follow:"FOLLOW_LONG", side:"LONG", label:"板块补涨", strategy:"sector_lead_lag", strategyLabel:"板块滞后", score:88, reason:`${base(leader)} 5m +${leaderP5.toFixed(2)}%，${sector.name} 补涨`};
+      }
+      const laggingShort=leaderP5<=-MICRO.leadMovePct&&p5<=0.12&&p5>=-MICRO.lagMaxMovePct&&p1<=0.05;
+      const shortFlow=f60.net<0&&f5.net<0&&f60.largest>=threshold&&f5.total>=threshold*3;
+      if(laggingShort&&shortFlow&&closeLocation<=0.48&&mb.bias<=1){
+        return {follow:"FOLLOW_SHORT", side:"SHORT", label:"板块补跌", strategy:"sector_lead_lag", strategyLabel:"板块滞后", score:88, reason:`${base(leader)} 5m ${leaderP5.toFixed(2)}%，${sector.name} 补跌`};
+      }
+      return null;
     }
     function fundingReversionSetup(symbol,p1,p5,f60,cm,d,mb,signal,score,threshold){
       if(!FUNDING.enabled)return null;
@@ -1430,13 +1494,27 @@ HTML = r"""
       const flowStrong=f5.total>=threshold*ALPHA.minTotal5x&&Math.abs(f5.imbalance)>=0.18;
       const candleOkLong=!isNum(cm.closeLocation)||cm.closeLocation>=0.58;
       const candleOkShort=!isNum(cm.closeLocation)||cm.closeLocation<=0.42;
-      const alignedLong=signal==="LONG"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastLong&&profitOk&&flowLong&&flowStrong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&candleOkLong&&!oiFallingHard&&f60.largest>=threshold&&!chaseLong;
-      const alignedShort=signal==="SHORT"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastShort&&profitOk&&flowShort&&flowStrong&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&candleOkShort&&!oiFallingHard&&f60.largest>=threshold&&!chaseShort;
+      const alignedLong=MICRO.enableMomentum&&signal==="LONG"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastLong&&profitOk&&flowLong&&flowStrong&&priceLong&&repeatLong&&volumeOk&&marketOkLong&&candleOkLong&&!oiFallingHard&&f60.largest>=threshold&&!chaseLong;
+      const alignedShort=MICRO.enableMomentum&&signal==="SHORT"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastShort&&profitOk&&flowShort&&flowStrong&&priceShort&&repeatShort&&volumeOk&&marketOkShort&&candleOkShort&&!oiFallingHard&&f60.largest>=threshold&&!chaseShort;
+      const liquidationSetup=liquidationReversalSetup(symbol,p1,p5,f60,l5,cm,d,mb,threshold);
+      const leadLagSetup=sectorLeadLagSetup(symbol,p1,p5,f60,f5,cm,mb,threshold);
       const fundingSetup=fundingReversionSetup(symbol,p1,p5,f60,cm,d,mb,signal,score,threshold);
-      let follow=alignedLong?"FOLLOW_LONG":alignedShort?"FOLLOW_SHORT":"";
-      let label=alignedLong?"策略多":alignedShort?"策略空":"";
-      let strategy=follow?"flow_momentum":"none";
-      let strategyLabel=follow?"大单动量":"";
+      let follow=liquidationSetup?liquidationSetup.follow:(leadLagSetup?leadLagSetup.follow:(alignedLong?"FOLLOW_LONG":alignedShort?"FOLLOW_SHORT":""));
+      let label=liquidationSetup?liquidationSetup.label:(leadLagSetup?leadLagSetup.label:(alignedLong?"策略多":alignedShort?"策略空":""));
+      let strategy=liquidationSetup?liquidationSetup.strategy:(leadLagSetup?leadLagSetup.strategy:(follow?"flow_momentum":"none"));
+      let strategyLabel=liquidationSetup?liquidationSetup.strategyLabel:(leadLagSetup?leadLagSetup.strategyLabel:(follow?"大单动量":""));
+      const microSetup=liquidationSetup||leadLagSetup;
+      if(microSetup){
+        signal=microSetup.side;
+        score=Math.max(score,microSetup.score);
+        forecast.side=microSetup.side;
+        forecast.prob5=Math.max(forecast.prob5, strategy==="liquidation_reversal"?68:64);
+        const microExpected=strategy==="liquidation_reversal"?Math.max(Math.abs(forecast.expected5Pct),0.55):Math.max(Math.abs(forecast.expected5Pct),0.42);
+        forecast.expected5Pct=microSetup.side==="LONG"?microExpected:-microExpected;
+        cost=costModel(d,forecast.side);
+        forecast.cost=cost;
+        forecast.netEdgePct=Math.abs(forecast.expected5Pct)-cost.requiredPct;
+      }
       if(!follow&&fundingSetup){
         follow=fundingSetup.follow;
         label=fundingSetup.label;
@@ -1457,6 +1535,15 @@ HTML = r"""
         if(follow==="FOLLOW_LONG"&&f60.net<0&&Math.abs(f60.net)>=threshold)risks.push("短流反向");
         if(follow==="FOLLOW_SHORT"&&f60.net>0&&Math.abs(f60.net)>=threshold)risks.push("短流反向");
         if(cost.fundingPct>0)risks.push("资金费成本");
+      }else if(strategy==="liquidation_reversal"){
+        if(follow==="FOLLOW_LONG"&&f60.net<0)risks.push("承接不足");
+        if(follow==="FOLLOW_SHORT"&&f60.net>0)risks.push("压回不足");
+        if(!isNum(d.oi5Pct)&&!isNum(d.oi15Pct))risks.push("OI缺失");
+        if(cost.fundingPct>0)risks.push("资金费成本");
+      }else if(strategy==="sector_lead_lag"){
+        if(follow==="FOLLOW_LONG"&&!flowLong)risks.push("补涨资金未跟上");
+        if(follow==="FOLLOW_SHORT"&&!flowShort)risks.push("补跌资金未跟上");
+        if(cost.fundingPct>0)risks.push("资金费成本");
       }else{
         if(signal!=="WATCH"&&!profitOk)risks.push("成本不过");
         if(cost.fundingPct>0)risks.push("资金费成本");
@@ -1471,6 +1558,7 @@ HTML = r"""
         if(oiFallingHard)risks.push("OI下降");
       }
       const reasons=[];
+      if(microSetup)reasons.push(microSetup.reason);
       if(strategy==="flow_momentum")reasons.push("Alpha过滤通过");
       if(strategy==="funding_reversion"&&fundingSetup)reasons.push(fundingSetup.reason);
       if(Math.abs(f60.net)>=threshold)reasons.push((f60.net>0?"主动买净流 ":"主动卖净流 ")+money(Math.abs(f60.net)));
@@ -1521,8 +1609,14 @@ HTML = r"""
       return expanded ? main + renderDetail(row) : main;
     }
     function strategyAction(row){
-      if(row.follow==="FOLLOW_LONG")return {text:row.strategy==="funding_reversion"?"自动测试费率多":"自动测试做多", cls:"long", order:"模拟盘将市价 BUY"};
-      if(row.follow==="FOLLOW_SHORT")return {text:row.strategy==="funding_reversion"?"自动测试费率空":"自动测试做空", cls:"short", order:"模拟盘将市价 SELL"};
+      if(row.follow==="FOLLOW_LONG"){
+        const text=row.strategy==="funding_reversion"?"自动测试费率多":(row.strategy==="liquidation_reversal"?"自动测爆仓反弹":(row.strategy==="sector_lead_lag"?"自动测板块补涨":"自动测试做多"));
+        return {text, cls:"long", order:"模拟盘将市价 BUY"};
+      }
+      if(row.follow==="FOLLOW_SHORT"){
+        const text=row.strategy==="funding_reversion"?"自动测试费率空":(row.strategy==="liquidation_reversal"?"自动测爆仓回落":(row.strategy==="sector_lead_lag"?"自动测板块补跌":"自动测试做空"));
+        return {text, cls:"short", order:"模拟盘将市价 SELL"};
+      }
       if(row.follow==="WATCH_LONG")return {text:"观察多头", cls:"wait", order:"条件未齐，不下单"};
       if(row.follow==="WATCH_SHORT")return {text:"观察空头", cls:"wait", order:"条件未齐，不下单"};
       return {text:"不交易", cls:"wait", order:"等待下一轮信号"};
