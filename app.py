@@ -105,6 +105,8 @@ FUNDING_EXIT_MAX_HOLD_SECONDS = int(os.environ.get("FUNDING_EXIT_MAX_HOLD_SECOND
 EXIT_REVERSE_SCORE = float(os.environ.get("EXIT_REVERSE_SCORE", "70"))
 EXIT_HOLD_MIN_SCORE = float(os.environ.get("EXIT_HOLD_MIN_SCORE", "65"))
 EXIT_INVALID_SNAPSHOTS = int(os.environ.get("EXIT_INVALID_SNAPSHOTS", "8"))
+LOW_CONFIDENCE_PROB = float(os.environ.get("LOW_CONFIDENCE_PROB", "68"))
+LOW_CONFIDENCE_TAKE_PROFIT_USDT = float(os.environ.get("LOW_CONFIDENCE_TAKE_PROFIT_USDT", "0.01"))
 
 _trade_lock = threading.Lock()
 _testnet_config = {
@@ -588,6 +590,14 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     if pnl_pct <= hard_stop_pct:
         return f"止损平仓 {pnl_pct:.2f}%"
 
+    entry_prob = _safe_float(meta.get("forecast_prob"))
+    if (
+        entry_prob > 0
+        and entry_prob <= LOW_CONFIDENCE_PROB
+        and pnl >= LOW_CONFIDENCE_TAKE_PROFIT_USDT
+    ):
+        return f"低置信微利平仓，预测 {entry_prob:.1f}% · 净利 {pnl:+.2f} USDT"
+
     if strategy == "funding_reversion" and pnl_pct >= FUNDING_EXIT_TAKE_PROFIT_PCT:
         return f"费率回归止盈 {pnl_pct:.2f}%"
 
@@ -735,6 +745,8 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                     "margin": _order_margin_usdt(),
                     "notional": _order_notional_usdt(),
                     "entry_cost": _safe_float(order.get("entryCost")) if isinstance(order, dict) else 0.0,
+                    "forecast_prob": _safe_float(row.get("forecast_5m_prob") or row.get("forecast_prob")),
+                    "net_edge_pct": _safe_float(row.get("net_edge_pct")),
                     "peak_pnl": 0.0,
                     "peak_pnl_pct": 0.0,
                     "last_favorable_pct": 0.0,
@@ -1694,6 +1706,8 @@ HTML = r"""
         symbol:r.symbol, follow:r.follow, signal:r.signal, score:r.score, strategy:r.strategy, strategy_label:r.strategyLabel, price:r.price,
         price_1m_pct:r.p1, price_5m_pct:r.p5,
         net_60s_usd:Math.round(r.f60.net), net_5m_usd:Math.round(r.f5.net),
+        forecast_side:r.forecast.side, forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),
+        net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),
         funding_rate:r.d.fundingRate,
         risks:r.risks,
       }));
