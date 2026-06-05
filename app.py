@@ -1332,7 +1332,7 @@ HTML = r"""
     const STABLE_SYMBOLS = new Set(["USDCUSDT","BUSDUSDT","FDUSDUSDT","TUSDUSDT","USDPUSDT","DAIUSDT"]);
     const MAJORS = new Set(["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]);
     const ALPHA = {
-      minScore:82, minProb:62, minEdgePct:0.12,
+      minScore:70, minProb:62, minEdgePct:0.12,
       minTotal5x:5.0, minDirectionGap:12,
       majorMaxP1:0.32, altMaxP1:0.45, majorMaxP5:0.85, altMaxP5:1.20,
     };
@@ -1672,7 +1672,7 @@ HTML = r"""
       forecast.cost=cost;
       forecast.targets=dynamicTargets(cm,cost);
       const repeatLong=f60.buyCount>=2||f60.lastSide==="BUY"&&f60.streak>=2, repeatShort=f60.sellCount>=2||f60.lastSide==="SELL"&&f60.streak>=2;
-      const volumeOk=isNum(cm.volSpike)?cm.volSpike>=1.2:f5.total>=threshold*ALPHA.minTotal5x;
+      const volumeOk=isNum(cm.volSpike)?cm.volSpike>=0.5:f5.total>=threshold*ALPHA.minTotal5x;
       const marketOkLong=MAJORS.has(symbol)||mb.bias>=-1, marketOkShort=MAJORS.has(symbol)||mb.bias<=1;
       const oiFallingHard=isNum(d.oi15Pct)&&d.oi15Pct<-2.5;
       const oiExpanding=isNum(d.oi5Pct)?d.oi5Pct>=0.08:(isNum(d.oi15Pct)?d.oi15Pct>=0.35:false);
