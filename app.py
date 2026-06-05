@@ -590,14 +590,6 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     if pnl_pct <= hard_stop_pct:
         return f"止损平仓 {pnl_pct:.2f}%"
 
-    entry_prob = _safe_float(meta.get("forecast_prob"))
-    if (
-        entry_prob > 0
-        and entry_prob <= LOW_CONFIDENCE_PROB
-        and pnl >= LOW_CONFIDENCE_TAKE_PROFIT_USDT
-    ):
-        return f"低置信微利平仓，预测 {entry_prob:.1f}% · 净利 {pnl:+.2f} USDT"
-
     if strategy == "funding_reversion" and pnl_pct >= FUNDING_EXIT_TAKE_PROFIT_PCT:
         return f"费率回归止盈 {pnl_pct:.2f}%"
 
@@ -618,6 +610,15 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
 
     if age_ms < EXIT_MIN_HOLD_SECONDS * 1000:
         return None
+
+    entry_prob = _safe_float(meta.get("forecast_prob"))
+    if (
+        entry_prob > 0
+        and entry_prob <= LOW_CONFIDENCE_PROB
+        and pnl >= LOW_CONFIDENCE_TAKE_PROFIT_USDT
+        and (not snap_fresh or reverse or not supported)
+    ):
+        return f"低置信微利平仓，预测 {entry_prob:.1f}% · 净利 {pnl:+.2f} USDT"
 
     if strategy == "funding_reversion" and snap_fresh:
         funding_rate = _safe_float(snap.get("funding_rate"))
@@ -1176,7 +1177,9 @@ HTML = r"""
       enableMomentum:false,
       minLiqX:2.5,
       strongLiqX:6.0,
-      washoutP5:0.35,
+      washoutP5:0.55,
+      reversalP1:0.04,
+      minAbsorbX:0.8,
       leadMovePct:1.2,
       lagMaxMovePct:0.45,
     };
@@ -1293,17 +1296,19 @@ HTML = r"""
     function liquidationReversalSetup(symbol,p1,p5,f60,l5,cm,d,mb,threshold){
       const closeLocation=isNum(cm.closeLocation)?cm.closeLocation:0.5;
       const oiDrop=(isNum(d.oi5Pct)&&d.oi5Pct<=-0.45)||(isNum(d.oi15Pct)&&d.oi15Pct<=-1.2);
-      const longWashout=l5.longLiq>=threshold*MICRO.minLiqX&&p5<=-MICRO.washoutP5&&(p1>=-0.20||closeLocation>=0.45);
-      const longAbsorbed=f60.net>0||f60.buyCount>=2||closeLocation>=0.52;
-      if(longWashout&&longAbsorbed&&(oiDrop||l5.longLiq>=threshold*MICRO.strongLiqX)&&mb.bias>=-1){
+      const longWashout=l5.longLiq>=threshold*MICRO.minLiqX&&p5<=-MICRO.washoutP5;
+      const longReclaimed=p1>=MICRO.reversalP1&&closeLocation>=0.58;
+      const longAbsorbed=f60.net>=threshold*MICRO.minAbsorbX&&f60.buyCount>=2;
+      if(longWashout&&longReclaimed&&longAbsorbed&&(oiDrop||l5.longLiq>=threshold*MICRO.strongLiqX)&&mb.bias>=0){
         const strength=Math.min(18,l5.longLiq/Math.max(threshold,1)*1.8)+Math.max(0,(closeLocation-0.45)*24);
-        return {follow:"FOLLOW_LONG", side:"LONG", label:"爆仓反弹", strategy:"liquidation_reversal", strategyLabel:"爆仓反弹", score:Math.min(96,Math.round(76+strength)), reason:`多头爆仓 ${money(l5.longLiq)} 后承接`};
+        return {follow:"FOLLOW_LONG", side:"LONG", label:"爆仓反弹", strategy:"liquidation_reversal", strategyLabel:"爆仓反弹", score:Math.min(96,Math.round(76+strength)), reason:`多头爆仓 ${money(l5.longLiq)} 后 1m 收回`};
       }
-      const shortWashout=l5.shortLiq>=threshold*MICRO.minLiqX&&p5>=MICRO.washoutP5&&(p1<=0.20||closeLocation<=0.55);
-      const shortAbsorbed=f60.net<0||f60.sellCount>=2||closeLocation<=0.48;
-      if(shortWashout&&shortAbsorbed&&(oiDrop||l5.shortLiq>=threshold*MICRO.strongLiqX)&&mb.bias<=1){
+      const shortWashout=l5.shortLiq>=threshold*MICRO.minLiqX&&p5>=MICRO.washoutP5;
+      const shortRejected=p1<=-MICRO.reversalP1&&closeLocation<=0.42;
+      const shortAbsorbed=f60.net<=-threshold*MICRO.minAbsorbX&&f60.sellCount>=2;
+      if(shortWashout&&shortRejected&&shortAbsorbed&&(oiDrop||l5.shortLiq>=threshold*MICRO.strongLiqX)&&mb.bias<=0){
         const strength=Math.min(18,l5.shortLiq/Math.max(threshold,1)*1.8)+Math.max(0,(0.55-closeLocation)*24);
-        return {follow:"FOLLOW_SHORT", side:"SHORT", label:"爆仓回落", strategy:"liquidation_reversal", strategyLabel:"爆仓反弹", score:Math.min(96,Math.round(76+strength)), reason:`空头爆仓 ${money(l5.shortLiq)} 后压回`};
+        return {follow:"FOLLOW_SHORT", side:"SHORT", label:"爆仓回落", strategy:"liquidation_reversal", strategyLabel:"爆仓反弹", score:Math.min(96,Math.round(76+strength)), reason:`空头爆仓 ${money(l5.shortLiq)} 后 1m 压回`};
       }
       return null;
     }
@@ -1550,6 +1555,10 @@ HTML = r"""
       }else if(strategy==="liquidation_reversal"){
         if(follow==="FOLLOW_LONG"&&f60.net<0)risks.push("承接不足");
         if(follow==="FOLLOW_SHORT"&&f60.net>0)risks.push("压回不足");
+        if(follow==="FOLLOW_LONG"&&p1<MICRO.reversalP1)risks.push("1m未收回");
+        if(follow==="FOLLOW_SHORT"&&p1>-MICRO.reversalP1)risks.push("1m未压回");
+        if(follow==="FOLLOW_LONG"&&mb.bias<0)risks.push("大盘仍弱");
+        if(follow==="FOLLOW_SHORT"&&mb.bias>0)risks.push("大盘仍强");
         if(!isNum(d.oi5Pct)&&!isNum(d.oi15Pct))risks.push("OI缺失");
         if(cost.fundingPct>0)risks.push("资金费成本");
       }else if(strategy==="sector_lead_lag"){
