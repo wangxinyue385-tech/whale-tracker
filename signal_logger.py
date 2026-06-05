@@ -49,6 +49,52 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_follow ON signals(follow)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_events (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts             INTEGER NOT NULL,
+                level          TEXT,
+                symbol         TEXT,
+                message        TEXT NOT NULL,
+                event_type     TEXT,
+                order_id       TEXT,
+                realized       REAL,
+                strategy       TEXT,
+                strategy_label TEXT,
+                main_signal    TEXT,
+                signal_variant TEXT,
+                grade          TEXT,
+                margin         REAL,
+                order_json     TEXT,
+                extra_json     TEXT,
+                created_at     TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_closes (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts             INTEGER NOT NULL,
+                symbol         TEXT NOT NULL,
+                realized       REAL,
+                strategy       TEXT,
+                strategy_label TEXT,
+                main_signal    TEXT,
+                signal_variant TEXT,
+                grade          TEXT,
+                reason         TEXT,
+                margin         REAL,
+                created_at     TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_events_ts ON trade_events(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_events_symbol ON trade_events(symbol)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_events_type ON trade_events(event_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_closes_ts ON trade_closes(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_closes_symbol ON trade_closes(symbol)")
         conn.commit()
 
 
@@ -88,6 +134,10 @@ def log_signal(row: dict) -> None:
         "oi_15m_pct": row.get("oi_15m_pct"),
         "taker_ratio": row.get("taker_ratio"),
         "funding_rate": row.get("funding_rate"),
+        "book_spread_pct": row.get("book_spread_pct"),
+        "book_imbalance": row.get("book_imbalance"),
+        "bid_depth_usd": row.get("bid_depth_usd"),
+        "ask_depth_usd": row.get("ask_depth_usd"),
         "market_bias": row.get("market_bias"),
         "btc_5m_pct": row.get("btc_5m_pct"),
         "eth_5m_pct": row.get("eth_5m_pct"),
@@ -141,6 +191,140 @@ def _directional_ret(follow: str, ret_pct: float | None) -> float | None:
     if ret_pct is None:
         return None
     return ret_pct if follow == "FOLLOW_LONG" else -ret_pct
+
+
+def _json_dumps(value) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _num(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _infer_event_type(item: dict) -> str:
+    explicit = item.get("event_type")
+    if explicit:
+        return str(explicit)
+    message = str(item.get("message") or "")
+    if "自动下单失败" in message or "自动平仓失败" in message or item.get("level") == "error":
+        return "error"
+    if "跳过" in message:
+        return "skip"
+    if "加仓" in message:
+        return "add"
+    if "平仓" in message or "已实现" in message:
+        return "close"
+    if "自动下单" in message:
+        return "open"
+    return "info"
+
+
+def log_trade_event(item: dict) -> None:
+    order = item.get("order") if isinstance(item.get("order"), dict) else {}
+    close = item.get("close") if isinstance(item.get("close"), dict) else {}
+    symbol = item.get("symbol") or order.get("symbol") or close.get("symbol")
+    realized = close.get("realized") if close else order.get("realizedPnl")
+    with _get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO trade_events (
+                ts, level, symbol, message, event_type, order_id, realized,
+                strategy, strategy_label, main_signal, signal_variant, grade,
+                margin, order_json, extra_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(item.get("ts") or time.time() * 1000),
+                item.get("level"),
+                symbol,
+                str(item.get("message") or ""),
+                _infer_event_type(item),
+                order.get("orderId"),
+                _num(realized) if realized is not None else None,
+                item.get("strategy") or close.get("strategy"),
+                item.get("strategy_label") or close.get("strategy_label"),
+                item.get("main_signal") or close.get("main_signal"),
+                item.get("signal_variant") or close.get("signal_variant"),
+                item.get("grade") or close.get("grade"),
+                _num(item.get("margin") or close.get("margin")) if (item.get("margin") or close.get("margin")) is not None else None,
+                _json_dumps(order) if order else None,
+                _json_dumps({k: v for k, v in item.items() if k != "order"}),
+            ),
+        )
+        conn.commit()
+
+
+def log_trade_close(item: dict) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO trade_closes (
+                ts, symbol, realized, strategy, strategy_label, main_signal,
+                signal_variant, grade, reason, margin
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(item.get("ts") or time.time() * 1000),
+                str(item.get("symbol") or ""),
+                _num(item.get("realized")),
+                item.get("strategy"),
+                item.get("strategy_label"),
+                item.get("main_signal"),
+                item.get("signal_variant"),
+                item.get("grade"),
+                item.get("reason"),
+                _num(item.get("margin")) if item.get("margin") is not None else None,
+            ),
+        )
+        conn.commit()
+
+
+def get_trade_events(limit: int = 200) -> list[dict]:
+    limit = max(1, min(int(limit), 5000))
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT ts, level, symbol, message, event_type, order_id, realized,
+                   strategy, strategy_label, main_signal, signal_variant,
+                   grade, margin, order_json, extra_json
+            FROM trade_events
+            ORDER BY ts DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        for key in ("order_json", "extra_json"):
+            if item.get(key):
+                try:
+                    item[key] = json.loads(item[key])
+                except json.JSONDecodeError:
+                    pass
+        result.append(item)
+    return result
+
+
+def get_trade_closes(limit: int = 400) -> list[dict]:
+    limit = max(1, min(int(limit), 5000))
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT ts, symbol, realized, strategy, strategy_label, main_signal,
+                   signal_variant, grade, reason, margin
+            FROM trade_closes
+            ORDER BY ts DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return list(reversed([dict(row) for row in rows]))
 
 
 def _insert_signal(conn: sqlite3.Connection, row: dict, follow: str, features: dict, ts_ms: int) -> None:
