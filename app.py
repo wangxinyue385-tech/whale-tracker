@@ -157,6 +157,8 @@ _market_snapshots: dict[str, dict] = {}
 _market_snapshot_version = 0
 _paper_cash = PAPER_STARTING_BALANCE
 _paper_positions: dict[str, dict] = {}
+_loss_cooldowns: dict[str, int] = {}
+_strategy_cooldowns: dict[str, int] = {}
 BANNED_LOW_LIQUIDITY = {
     "CLOUSDT", "BABYUSDT", "BZUSDT", "HOMEUSDT",
     "XAGUSDT", "PORTALUSDT", "0GUSDT",
@@ -169,7 +171,6 @@ TEST_MORE_AUTO_STRATEGIES = {
     "liquidation_reversal",
     "sector_lead_lag",
     "flow_exhaustion_reversal",
-    "flow_momentum",
     "funding_reversion",
 }
 STRATEGY_MODE_MAP = {
@@ -442,20 +443,19 @@ def _market_quality_allows_auto(row: dict) -> bool:
 
 def _auto_signal_allowed_for_trade(row: dict) -> bool:
     strategy = str(row.get("strategy") or "").strip()
+    now_ms = int(time.time() * 1000)
     if not _strategy_allowed_for_auto(strategy):
+        return False
+    symbol = str(row.get("symbol") or "")
+    if now_ms < int(_loss_cooldowns.get(symbol, 0) or 0):
+        return False
+    if now_ms < int(_strategy_cooldowns.get(strategy, 0) or 0):
         return False
     if not _market_quality_allows_auto(row):
         return False
     prob = _safe_float(row.get("forecast_5m_prob") or row.get("forecast_prob"))
     edge = _safe_float(row.get("net_edge_pct"))
-    score = _safe_float(row.get("score"))
-    symbol = str(row.get("symbol") or "")
     volume_24h = _safe_float(row.get("volume_24h_usd") or row.get("volume_24h"))
-    if strategy == "flow_momentum":
-        if prob < 70 or edge < 0.18 or score < 74:
-            return False
-        if symbol not in MAJOR_SYMBOLS and volume_24h and volume_24h < 150_000_000:
-            return False
     if strategy == "funding_reversion":
         if prob < 62 or edge < 0.06:
             return False
@@ -929,6 +929,20 @@ def _strategy_unsupported_grace_seconds(strategy: str) -> int:
     return POSITION_UNSUPPORTED_GRACE_SECONDS
 
 
+def _register_close_cooldown(symbol: str, strategy: str, realized: float, now_ms: int) -> None:
+    if realized >= 0:
+        return
+    _loss_cooldowns[symbol] = now_ms + 3 * 60 * 1000
+    recent = [
+        item for item in _trade_closes[-20:]
+        if str(item.get("strategy") or "") == strategy
+    ]
+    losses = [item for item in recent[-6:] if _safe_float(item.get("realized")) < 0]
+    if len(losses) >= 3:
+        _strategy_cooldowns[strategy] = now_ms + 5 * 60 * 1000
+        _event(f"{strategy} 近期连续亏损，自动冷却 5 分钟", "warn", event_type="skip", strategy=strategy)
+
+
 def _track_hold_support(meta: dict, supported: bool, reverse: bool, snap_version: int) -> int:
     if snap_version and int(meta.get("last_hold_snapshot_version") or 0) == snap_version:
         return int(meta.get("invalid_snapshots") or 0)
@@ -1281,6 +1295,7 @@ def _close_due_positions(account: dict | None = None) -> None:
             }
             _trade_closes.append(close_item)
             del _trade_closes[:-400]
+            _register_close_cooldown(symbol, str(meta.get("strategy") or ""), realized, now_ms)
             try:
                 log_trade_close(close_item)
             except Exception:
