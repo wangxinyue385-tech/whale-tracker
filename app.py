@@ -123,7 +123,7 @@ EXIT_INVALID_SNAPSHOTS = int(os.environ.get("EXIT_INVALID_SNAPSHOTS", "1"))
 LOW_CONFIDENCE_PROB = float(os.environ.get("LOW_CONFIDENCE_PROB", "68"))
 LOW_CONFIDENCE_TAKE_PROFIT_USDT = float(os.environ.get("LOW_CONFIDENCE_TAKE_PROFIT_USDT", "0.01"))
 POSITION_ADD_COOLDOWN_SECONDS = int(os.environ.get("POSITION_ADD_COOLDOWN_SECONDS", "45"))
-POSITION_MAX_ADDS = int(os.environ.get("POSITION_MAX_ADDS", "2"))
+POSITION_MAX_ADDS = int(os.environ.get("POSITION_MAX_ADDS", "0"))
 POSITION_ADD_GROSS_LOSS_USDT = float(os.environ.get("POSITION_ADD_GROSS_LOSS_USDT", "0.03"))
 POSITION_PROFIT_FLOOR_USDT = float(os.environ.get("POSITION_PROFIT_FLOOR_USDT", "0.01"))
 POSITION_PROFIT_PULLBACK_USDT = float(os.environ.get("POSITION_PROFIT_PULLBACK_USDT", "0.02"))
@@ -168,12 +168,12 @@ STRATEGY_MODE_MAP = {
     "liquidation_reversal": {"liquidation_reversal"},
 }
 STRATEGY_MODE_LABELS = {
-    "primary": "三信号组合：耗尽+板块+爆仓",
-    "exhaustion_sector": "两两：耗尽+板块",
+    "primary": "三信号组合：耗尽+跷跷板+爆仓",
+    "exhaustion_sector": "两两：耗尽+跷跷板",
     "exhaustion_liquidation": "两两：耗尽+爆仓",
-    "sector_liquidation": "两两：板块+爆仓",
+    "sector_liquidation": "两两：跷跷板+爆仓",
     "flow_exhaustion_reversal": "单信号：大单耗尽反向",
-    "sector_lead_lag": "单信号：板块滞后",
+    "sector_lead_lag": "单信号：板块跷跷板",
     "liquidation_reversal": "单信号：爆仓反弹",
 }
 
@@ -401,7 +401,7 @@ def _auto_signal_allowed_for_trade(row: dict) -> bool:
     strategy = str(row.get("strategy") or "").strip()
     if not _strategy_allowed_for_auto(strategy):
         return False
-    if strategy == "flow_exhaustion_reversal" and _opportunity_grade(row) == "C":
+    if _opportunity_grade(row) == "C":
         return False
     return True
 
@@ -1148,11 +1148,31 @@ def _public_testnet_status() -> dict:
     gross_win = sum(_safe_float(item.get("realized")) for item in wins)
     gross_loss = abs(sum(_safe_float(item.get("realized")) for item in losses))
     by_strategy = []
+    by_grade = []
+    by_reason = []
     grouped_closes: dict[tuple[str, str], list[dict]] = {}
+    grouped_grades: dict[str, list[dict]] = {}
+    grouped_reasons: dict[str, list[dict]] = {}
+
+    def reason_bucket(reason: str) -> str:
+        if "止损" in reason:
+            return "止损"
+        if "止盈" in reason or "净利落袋" in reason or "微利" in reason:
+            return "止盈/落袋"
+        if "不支持持仓" in reason or "信号衰减" in reason or "不再触发" in reason:
+            return "信号衰减"
+        if "无进展" in reason or "走势转弱" in reason:
+            return "无进展/转弱"
+        if "缺少新策略快照" in reason or "到时" in reason or "持仓" in reason:
+            return "到时/缺快照"
+        return "其他"
+
     for item in closes:
         strategy = str(item.get("strategy") or item.get("main_signal") or "unknown")
         label = str(item.get("strategy_label") or strategy)
         grouped_closes.setdefault((strategy, label), []).append(item)
+        grouped_grades.setdefault(str(item.get("grade") or "--"), []).append(item)
+        grouped_reasons.setdefault(reason_bucket(str(item.get("reason") or "")), []).append(item)
     for (strategy, label), items in grouped_closes.items():
         item_wins = [_safe_float(row.get("realized")) for row in items if _safe_float(row.get("realized")) > 0]
         item_losses = [_safe_float(row.get("realized")) for row in items if _safe_float(row.get("realized")) < 0]
@@ -1168,7 +1188,31 @@ def _public_testnet_status() -> dict:
             "win_rate": (len(item_wins) / len(items) * 100) if items else 0,
             "profit_factor": (item_gross_win / item_gross_loss) if item_gross_loss > 0 else (item_gross_win if item_gross_win > 0 else 0),
         })
+    for grade, items in grouped_grades.items():
+        item_wins = [_safe_float(row.get("realized")) for row in items if _safe_float(row.get("realized")) > 0]
+        item_losses = [_safe_float(row.get("realized")) for row in items if _safe_float(row.get("realized")) < 0]
+        by_grade.append({
+            "grade": grade,
+            "count": len(items),
+            "net": sum(_safe_float(row.get("realized")) for row in items),
+            "wins": len(item_wins),
+            "losses": len(item_losses),
+            "win_rate": (len(item_wins) / len(items) * 100) if items else 0,
+        })
+    for reason, items in grouped_reasons.items():
+        item_wins = [_safe_float(row.get("realized")) for row in items if _safe_float(row.get("realized")) > 0]
+        item_losses = [_safe_float(row.get("realized")) for row in items if _safe_float(row.get("realized")) < 0]
+        by_reason.append({
+            "reason": reason,
+            "count": len(items),
+            "net": sum(_safe_float(row.get("realized")) for row in items),
+            "wins": len(item_wins),
+            "losses": len(item_losses),
+            "win_rate": (len(item_wins) / len(items) * 100) if items else 0,
+        })
     by_strategy.sort(key=lambda row: _safe_float(row.get("net")), reverse=True)
+    by_grade.sort(key=lambda row: _safe_float(row.get("net")))
+    by_reason.sort(key=lambda row: _safe_float(row.get("net")))
     trade_stats = {
         "count": len(closes),
         "wins": len(wins),
@@ -1178,8 +1222,10 @@ def _public_testnet_status() -> dict:
         "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else (gross_win if gross_win > 0 else 0),
         "avg_win": (gross_win / len(wins)) if wins else 0,
         "avg_loss": (gross_loss / len(losses)) if losses else 0,
-        "recent": closes[-60:],
+        "recent": closes[-200:],
         "by_strategy": by_strategy,
+        "by_grade": by_grade,
+        "by_reason": by_reason,
     }
     base = {
         "rest": BINANCE_TESTNET_REST,
@@ -1440,6 +1486,25 @@ HTML = r"""
     .stats-strip .mini-stat { min-height:58px; }
     .trade-strategy-stats { padding:8px 12px 0; color:var(--muted); font-size:12px; line-height:1.6; }
     .trade-strategy-stats strong { color:var(--ink); }
+    .full-trade-panel { margin-top:12px; }
+    .trade-breakdown { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; padding:10px 12px; border-bottom:1px solid var(--line); background:#fff; }
+    .trade-breakdown-card { border:1px solid var(--line); border-radius:6px; background:var(--surface2); padding:8px; min-height:58px; }
+    .trade-breakdown-title { color:var(--muted); font-size:11px; font-weight:800; margin-bottom:5px; }
+    .trade-breakdown-main { color:var(--ink); font-size:14px; font-weight:900; }
+    .trade-breakdown-sub { color:var(--muted); font-size:11px; margin-top:3px; }
+    .full-trade-table-wrap { max-height:760px; overflow:auto; background:#fff; }
+    .trade-detail-table { table-layout:fixed; min-width:1180px; }
+    .trade-detail-table th,.trade-detail-table td { padding:8px 9px; white-space:normal; }
+    .trade-detail-table th:nth-child(1){width:56px}
+    .trade-detail-table th:nth-child(2){width:92px}
+    .trade-detail-table th:nth-child(3){width:100px}
+    .trade-detail-table th:nth-child(4){width:116px}
+    .trade-detail-table th:nth-child(5){width:72px}
+    .trade-detail-table th:nth-child(6){width:96px}
+    .trade-detail-table th:nth-child(7){width:86px}
+    .trade-detail-table th:nth-child(8){width:360px}
+    .trade-detail-row.win { background:#f5fbf7; }
+    .trade-detail-row.loss { background:#fff7f7; }
     .api-help { grid-column:1/-1; color:var(--muted); font-size:11px; line-height:1.45; margin-top:-2px; }
     .decision-summary { display:grid; grid-template-columns:1.1fr repeat(3,minmax(0,.7fr)); gap:10px; padding:12px 14px; border-bottom:1px solid var(--line); background:#fbfcfe; }
     .decision-box { border:1px solid var(--line); background:#fff; border-radius:8px; padding:10px; min-height:70px; }
@@ -1542,12 +1607,12 @@ HTML = r"""
             <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="10"></label>
             <label>平仓分钟<input id="autoCloseMinutes" type="number" min="1" step="1" value="5"></label>
             <label class="wide">策略模式<select id="strategyMode">
-              <option value="primary">三信号组合：耗尽+板块+爆仓</option>
-              <option value="exhaustion_sector">两两：耗尽+板块</option>
+              <option value="primary">三信号组合：耗尽+跷跷板+爆仓</option>
+              <option value="exhaustion_sector">两两：耗尽+跷跷板</option>
               <option value="exhaustion_liquidation">两两：耗尽+爆仓</option>
-              <option value="sector_liquidation">两两：板块+爆仓</option>
+              <option value="sector_liquidation">两两：跷跷板+爆仓</option>
               <option value="flow_exhaustion_reversal">单信号：大单耗尽反向</option>
-              <option value="sector_lead_lag">单信号：板块滞后</option>
+              <option value="sector_lead_lag">单信号：板块跷跷板</option>
               <option value="liquidation_reversal">单信号：爆仓反弹</option>
             </select></label>
           </div>
@@ -1603,6 +1668,21 @@ HTML = r"""
           </div>
         </div>
       </aside>
+    </section>
+    <section class="panel full-trade-panel">
+      <div class="panel-head">
+        <div>
+          <div class="panel-title">全部交易明细</div>
+          <div class="panel-note" id="fullTradeNote">最近 200 笔平仓，每一笔都显示</div>
+        </div>
+      </div>
+      <div class="trade-breakdown" id="tradeBreakdown"></div>
+      <div class="full-trade-table-wrap">
+        <table class="trade-detail-table">
+          <thead><tr><th>#</th><th>时间</th><th>币种</th><th>信号</th><th>等级</th><th>保证金</th><th>盈亏</th><th>平仓原因</th></tr></thead>
+          <tbody id="fullTradeBody"><tr><td colspan="8">等待交易明细。</td></tr></tbody>
+        </table>
+      </div>
     </section>
   </main>
   <script>
@@ -1780,18 +1860,18 @@ HTML = r"""
       const taker=isNum(d.takerRatio)?d.takerRatio:1;
       const funding=isNum(d.fundingRate)?d.fundingRate:0;
       const oi5=isNum(d.oi5Pct)?d.oi5Pct:null;
-      const enoughFlow=f5.total>=threshold*3.5&&f60.largest>=threshold;
-      const longCrowded=taker>=1.08||funding>=0.035||(oi5!==null&&oi5>=0.10);
-      const shortCrowded=taker<=0.94||funding<=-0.035||(oi5!==null&&oi5>=0.10);
-      const sellTurn=f60.net<=-threshold*0.55||(f60.lastSide==="SELL"&&f60.streak>=2);
-      const buyTurn=f60.net>=threshold*0.55||(f60.lastSide==="BUY"&&f60.streak>=2);
-      const longExhausted=p5>=0.48&&(p1<=0.06||closeLocation<=0.48||upperWick>=0.08);
-      const shortExhausted=p5<=-0.48&&(p1>=-0.06||closeLocation>=0.52||lowerWick>=0.08);
-      if(enoughFlow&&longExhausted&&sellTurn&&(longCrowded||closeLocation<=0.45)&&mb.bias<=1){
+      const enoughFlow=f5.total>=threshold*4.5&&f60.largest>=threshold*1.2;
+      const longCrowded=taker>=1.10||funding>=0.04||(oi5!==null&&oi5>=0.15);
+      const shortCrowded=taker<=0.92||funding<=-0.04||(oi5!==null&&oi5>=0.15);
+      const sellTurn=f60.net<=-threshold*0.75||(f60.lastSide==="SELL"&&f60.streak>=3);
+      const buyTurn=f60.net>=threshold*0.75||(f60.lastSide==="BUY"&&f60.streak>=3);
+      const longExhausted=p5>=0.58&&(p1<=0.03||closeLocation<=0.45||upperWick>=0.12);
+      const shortExhausted=p5<=-0.58&&(p1>=-0.03||closeLocation>=0.55||lowerWick>=0.12);
+      if(enoughFlow&&longExhausted&&sellTurn&&longCrowded&&mb.bias<=1){
         const score=Math.min(94,Math.round(72+Math.min(14,Math.abs(p5)*8)+Math.min(8,Math.abs(f60.net)/Math.max(threshold,1))));
         return {follow:"FOLLOW_SHORT", side:"SHORT", label:"耗尽空", strategy:"flow_exhaustion_reversal", strategyLabel:"大单耗尽反向", score, reason:`拉升 ${p5.toFixed(2)}% 后主动卖压回`};
       }
-      if(enoughFlow&&shortExhausted&&buyTurn&&(shortCrowded||closeLocation>=0.55)&&mb.bias>=-1){
+      if(enoughFlow&&shortExhausted&&buyTurn&&shortCrowded&&mb.bias>=-1){
         const score=Math.min(94,Math.round(72+Math.min(14,Math.abs(p5)*8)+Math.min(8,Math.abs(f60.net)/Math.max(threshold,1))));
         return {follow:"FOLLOW_LONG", side:"LONG", label:"耗尽多", strategy:"flow_exhaustion_reversal", strategyLabel:"大单耗尽反向", score, reason:`下跌 ${p5.toFixed(2)}% 后主动买收回`};
       }
@@ -1828,15 +1908,16 @@ HTML = r"""
       }
       if(!leader)return null;
       const closeLocation=isNum(cm.closeLocation)?cm.closeLocation:0.5;
-      const laggingLong=leaderP5>=MICRO.leadMovePct&&p5>=-0.12&&p5<=MICRO.lagMaxMovePct&&p1>=-0.05;
-      const longFlow=f60.net>0&&f5.net>0&&f60.largest>=threshold&&f5.total>=threshold*3;
-      if(laggingLong&&longFlow&&closeLocation>=0.52&&mb.bias>=-1){
-        return {follow:"FOLLOW_LONG", side:"LONG", label:"板块补涨", strategy:"sector_lead_lag", strategyLabel:"板块滞后", score:88, reason:`${base(leader)} 5m +${leaderP5.toFixed(2)}%，${sector.name} 补涨`};
+      const leaderUp=leaderP5>=MICRO.leadMovePct;
+      const leaderDown=leaderP5<=-MICRO.leadMovePct;
+      const notAlreadyMovedWithLeader=Math.abs(p5)<=MICRO.lagMaxMovePct&&Math.abs(p1)<=0.18;
+      const contraShortFlow=f60.net<0&&f5.net<0&&f60.sellCount>=2&&f60.largest>=threshold&&f5.total>=threshold*3.5;
+      const contraLongFlow=f60.net>0&&f5.net>0&&f60.buyCount>=2&&f60.largest>=threshold&&f5.total>=threshold*3.5;
+      if(leaderUp&&notAlreadyMovedWithLeader&&contraShortFlow&&closeLocation<=0.48&&mb.bias<=1){
+        return {follow:"FOLLOW_SHORT", side:"SHORT", label:"板块跷跷板空", strategy:"sector_lead_lag", strategyLabel:"板块跷跷板", score:86, reason:`${base(leader)} 5m +${leaderP5.toFixed(2)}%，${sector.name} 跷跷板回落`};
       }
-      const laggingShort=leaderP5<=-MICRO.leadMovePct&&p5<=0.12&&p5>=-MICRO.lagMaxMovePct&&p1<=0.05;
-      const shortFlow=f60.net<0&&f5.net<0&&f60.largest>=threshold&&f5.total>=threshold*3;
-      if(laggingShort&&shortFlow&&closeLocation<=0.48&&mb.bias<=1){
-        return {follow:"FOLLOW_SHORT", side:"SHORT", label:"板块补跌", strategy:"sector_lead_lag", strategyLabel:"板块滞后", score:88, reason:`${base(leader)} 5m ${leaderP5.toFixed(2)}%，${sector.name} 补跌`};
+      if(leaderDown&&notAlreadyMovedWithLeader&&contraLongFlow&&closeLocation>=0.52&&mb.bias>=-1){
+        return {follow:"FOLLOW_LONG", side:"LONG", label:"板块跷跷板多", strategy:"sector_lead_lag", strategyLabel:"板块跷跷板", score:86, reason:`${base(leader)} 5m ${leaderP5.toFixed(2)}%，${sector.name} 跷跷板反弹`};
       }
       return null;
     }
@@ -2071,7 +2152,7 @@ HTML = r"""
         signal=microSetup.side;
         score=Math.max(score,microSetup.score);
         forecast.side=microSetup.side;
-        const minProb=strategy==="liquidation_reversal"?68:(strategy==="flow_exhaustion_reversal"?66:64);
+        const minProb=strategy==="liquidation_reversal"?68:(strategy==="flow_exhaustion_reversal"?66:(strategy==="sector_lead_lag"?70:64));
         forecast.prob5=Math.max(forecast.prob5,minProb);
         const microExpected=strategy==="liquidation_reversal"?Math.max(Math.abs(forecast.expected5Pct),0.55):(strategy==="flow_exhaustion_reversal"?Math.max(Math.abs(forecast.expected5Pct),0.48):Math.max(Math.abs(forecast.expected5Pct),0.42));
         forecast.expected5Pct=microSetup.side==="LONG"?microExpected:-microExpected;
@@ -2195,7 +2276,7 @@ HTML = r"""
     }
     function strategyBlockReason(row){
       if(!row||!row.strategy||!allowedStrategySet().has(row.strategy))return "当前策略模式不下单";
-      if(row.strategy==="flow_exhaustion_reversal"&&estimatedGrade(row)==="C")return "C级耗尽反向不下单";
+      if(estimatedGrade(row)==="C")return "C级信号不下单";
       return "";
     }
     function strategyAllowed(row){ return !strategyBlockReason(row); }
@@ -2240,11 +2321,11 @@ HTML = r"""
     }
     function strategyAction(row){
       if(row.follow==="FOLLOW_LONG"){
-        const text=row.strategy==="funding_reversion"?"自动测试费率多":(row.strategy==="liquidation_reversal"?"自动测爆仓反弹":(row.strategy==="sector_lead_lag"?"自动测板块补涨":"自动测试做多"));
+        const text=row.strategy==="funding_reversion"?"自动测试费率多":(row.strategy==="liquidation_reversal"?"自动测爆仓反弹":(row.strategy==="sector_lead_lag"?"自动测跷跷板多":"自动测试做多"));
         return {text, cls:"long", order:"模拟盘将市价 BUY"};
       }
       if(row.follow==="FOLLOW_SHORT"){
-        const text=row.strategy==="funding_reversion"?"自动测试费率空":(row.strategy==="liquidation_reversal"?"自动测爆仓回落":(row.strategy==="sector_lead_lag"?"自动测板块补跌":"自动测试做空"));
+        const text=row.strategy==="funding_reversion"?"自动测试费率空":(row.strategy==="liquidation_reversal"?"自动测爆仓回落":(row.strategy==="sector_lead_lag"?"自动测跷跷板空":"自动测试做空"));
         return {text, cls:"short", order:"模拟盘将市价 SELL"};
       }
       if(row.follow==="WATCH_LONG")return {text:"观察多头", cls:"wait", order:"条件未齐，不下单"};
@@ -2447,7 +2528,9 @@ HTML = r"""
       ctx.strokeStyle="#162033"; ctx.lineWidth=1.8; ctx.beginPath();
       cum.forEach((v,i)=>{ const xx=x(i), yy=y(v); if(i)ctx.lineTo(xx,yy); else ctx.moveTo(xx,yy); }); ctx.stroke();
       const net=Number(stats.net||0), pf=Number(stats.profit_factor||0);
-      if(left)left.textContent=`最近 ${vals.length} 笔 · 胜 ${stats.wins||0} / 负 ${stats.losses||0}`;
+      const recentWins=recent.filter(x=>Number(x.realized||0)>0).length;
+      const recentLosses=recent.filter(x=>Number(x.realized||0)<0).length;
+      if(left)left.textContent=`最近 ${vals.length} 笔 · 胜 ${recentWins} / 负 ${recentLosses}`;
       if(right){ right.textContent=`净利 ${net>=0?"+":""}${usdt(net)} · PF ${pf?pf.toFixed(2):"--"}`; right.className=net>=0?"up":"down"; }
     }
     function updateExecutionModeUi(mode){
@@ -2499,6 +2582,58 @@ HTML = r"""
         <div class="trade-log-pnl ${pnlCls}">${pnl}</div>
       </div>`;
     }
+    function renderBreakdownCard(title,item,labelKey){
+      if(!item)return `<div class="trade-breakdown-card"><div class="trade-breakdown-title">${esc(title)}</div><div class="trade-breakdown-main">--</div><div class="trade-breakdown-sub">暂无数据</div></div>`;
+      const net=Number(item.net||0), count=Number(item.count||0), wins=Number(item.wins||0), losses=Number(item.losses||0);
+      const label=item[labelKey]||"--";
+      return `<div class="trade-breakdown-card">
+        <div class="trade-breakdown-title">${esc(title)}</div>
+        <div class="trade-breakdown-main">${esc(label)} · <span class="${net>=0?"up":"down"}">${net>=0?"+":""}${usdt(net)}</span></div>
+        <div class="trade-breakdown-sub">${count} 笔 · 胜 ${wins} / 负 ${losses} · 胜率 ${count?Number(item.win_rate||0).toFixed(1):"--"}%</div>
+      </div>`;
+    }
+    function renderTradeBreakdown(stats){
+      const box=document.getElementById("tradeBreakdown");
+      if(!box)return;
+      const byStrategy=(stats.by_strategy||[]).slice().sort((a,b)=>Number(a.net||0)-Number(b.net||0));
+      const byGrade=(stats.by_grade||[]).slice().sort((a,b)=>Number(a.net||0)-Number(b.net||0));
+      const byReason=(stats.by_reason||[]).slice().sort((a,b)=>Number(a.net||0)-Number(b.net||0));
+      box.innerHTML=[
+        renderBreakdownCard("亏损最大信号",byStrategy[0],"label"),
+        renderBreakdownCard("亏损最大等级",byGrade[0],"grade"),
+        renderBreakdownCard("亏损最大原因",byReason[0],"reason"),
+        renderBreakdownCard("最好信号",byStrategy[byStrategy.length-1],"label"),
+      ].join("");
+    }
+    function renderFullTradeTable(stats){
+      const body=document.getElementById("fullTradeBody");
+      const note=document.getElementById("fullTradeNote");
+      if(!body)return;
+      const closes=(stats.recent||[]).slice(-200).reverse();
+      if(note)note.textContent=`显示 ${closes.length} / ${stats.count||0} 笔平仓交易`;
+      if(!closes.length){
+        body.innerHTML='<tr><td colspan="8">等待平仓交易。</td></tr>';
+        renderTradeBreakdown(stats);
+        return;
+      }
+      body.innerHTML=closes.map((item,idx)=>{
+        const realized=Number(item.realized||0);
+        const cls=realized>=0?"win":"loss";
+        const symbol=(item.symbol||"--").replace("USDT","");
+        const margin=item.margin!==null&&item.margin!==undefined?Number(item.margin||0).toFixed(2)+"U":"--";
+        return `<tr class="trade-detail-row ${cls}">
+          <td>${idx+1}</td>
+          <td>${new Date(item.ts).toLocaleTimeString()}</td>
+          <td><strong>${esc(symbol)}</strong><div class="small">${esc(item.symbol||"")}</div></td>
+          <td>${esc(item.strategy_label||item.strategy||"--")}<div class="small">${esc(item.main_signal||"")}</div></td>
+          <td>${esc(item.grade||"--")}</td>
+          <td>${margin}</td>
+          <td class="${realized>=0?"up":"down"}">${realized>=0?"+":""}${usdt(realized)}</td>
+          <td>${esc(item.reason||"--")}</td>
+        </tr>`;
+      }).join("");
+      renderTradeBreakdown(stats);
+    }
     function syncTradeForm(data, force=false){
       const active=document.activeElement;
       const editing=!!(active&&active.closest&&active.closest(".trade-form,.trade-actions"));
@@ -2526,7 +2661,7 @@ HTML = r"""
       document.getElementById("tradePnl").className="value "+(Number(data.unrealized||0)>=0?"up":"down");
       document.getElementById("tradePositions").textContent=data.account_ok?(data.positions||[]).length:"--";
       const log=document.getElementById("tradeLog");
-      const events=(data.events||[]).slice(0,80);
+      const events=(data.events||[]).slice(0,200);
       log.innerHTML=events.length?events.map(renderTradeEvent).join(""):`<div class="trade-log-row"><div></div><div></div><div class="trade-log-main">${esc(data.message||"等待模拟盘连接。")}</div><div></div></div>`;
       const stats=data.trade_stats||{};
       document.getElementById("statTrades").textContent=stats.count||0;
@@ -2544,6 +2679,7 @@ HTML = r"""
       }
       drawPnlChart(data.equity_curve||[]);
       drawTradeStatsChart(stats);
+      renderFullTradeTable(stats);
     }
     async function loadTestnetStatus(){
       try{ const res=await fetch("/api/testnet/status"); renderTestnetStatus(await res.json()); }
