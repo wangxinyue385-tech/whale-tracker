@@ -90,8 +90,8 @@ BINANCE_TESTNET_REST = os.environ.get("BINANCE_TESTNET_REST", "https://demo-fapi
 TESTNET_AUTO_CLOSE_MINUTES = float(os.environ.get("TESTNET_AUTO_CLOSE_MINUTES", "5"))
 TESTNET_ORDER_USDT = float(os.environ.get("TESTNET_ORDER_USDT", "10"))
 TESTNET_LEVERAGE = int(os.environ.get("TESTNET_LEVERAGE", "4"))
-TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "20"))
-TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "45"))
+TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "15"))
+TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "20"))
 TESTNET_STRATEGY_MODE = os.environ.get("TESTNET_STRATEGY_MODE", "test_more")
 PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "100"))
 ENTRY_CONFIRM_SNAPSHOTS = int(os.environ.get("ENTRY_CONFIRM_SNAPSHOTS", "1"))
@@ -102,24 +102,24 @@ EXIT_PROFIT_ARM_PCT = float(os.environ.get("EXIT_PROFIT_ARM_PCT", "0.80"))
 EXIT_TRAIL_KEEP_RATIO = float(os.environ.get("EXIT_TRAIL_KEEP_RATIO", "0.35"))
 EXIT_BREAKEVEN_ARM_PCT = float(os.environ.get("EXIT_BREAKEVEN_ARM_PCT", "0.45"))
 EXIT_BREAKEVEN_FLOOR_PCT = float(os.environ.get("EXIT_BREAKEVEN_FLOOR_PCT", "0.02"))
-EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-2.0"))
-FLOW_EXIT_HARD_STOP_PCT = float(os.environ.get("FLOW_EXIT_HARD_STOP_PCT", "-0.85"))
-EXHAUSTION_EXIT_HARD_STOP_PCT = float(os.environ.get("EXHAUSTION_EXIT_HARD_STOP_PCT", "-0.95"))
-SECTOR_EXIT_HARD_STOP_PCT = float(os.environ.get("SECTOR_EXIT_HARD_STOP_PCT", "-0.75"))
-LIQUIDATION_EXIT_HARD_STOP_PCT = float(os.environ.get("LIQUIDATION_EXIT_HARD_STOP_PCT", "-1.10"))
+EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-0.60"))
+FLOW_EXIT_HARD_STOP_PCT = float(os.environ.get("FLOW_EXIT_HARD_STOP_PCT", "-0.50"))
+EXHAUSTION_EXIT_HARD_STOP_PCT = float(os.environ.get("EXHAUSTION_EXIT_HARD_STOP_PCT", "-0.55"))
+SECTOR_EXIT_HARD_STOP_PCT = float(os.environ.get("SECTOR_EXIT_HARD_STOP_PCT", "-0.45"))
+LIQUIDATION_EXIT_HARD_STOP_PCT = float(os.environ.get("LIQUIDATION_EXIT_HARD_STOP_PCT", "-0.60"))
 EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "90"))
 EXIT_STALL_MIN_PEAK_PCT = float(os.environ.get("EXIT_STALL_MIN_PEAK_PCT", "0.12"))
 EXIT_STALL_LOSS_PCT = float(os.environ.get("EXIT_STALL_LOSS_PCT", "-0.14"))
 EXIT_PROGRESS_EPS_PCT = float(os.environ.get("EXIT_PROGRESS_EPS_PCT", "0.03"))
 EXIT_MAX_HOLD_SECONDS = int(os.environ.get("EXIT_MAX_HOLD_SECONDS", "300"))
 EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT = float(os.environ.get("EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT", "-0.20"))
-FUNDING_EXIT_TAKE_PROFIT_PCT = float(os.environ.get("FUNDING_EXIT_TAKE_PROFIT_PCT", "0.45"))
-FUNDING_EXIT_HARD_STOP_PCT = float(os.environ.get("FUNDING_EXIT_HARD_STOP_PCT", "-1.35"))
+FUNDING_EXIT_TAKE_PROFIT_PCT = float(os.environ.get("FUNDING_EXIT_TAKE_PROFIT_PCT", "0.55"))
+FUNDING_EXIT_HARD_STOP_PCT = float(os.environ.get("FUNDING_EXIT_HARD_STOP_PCT", "-0.35"))
 FUNDING_EXIT_NORMAL_RATE_PCT = float(os.environ.get("FUNDING_EXIT_NORMAL_RATE_PCT", "0.035"))
 FUNDING_EXIT_MAX_HOLD_SECONDS = int(os.environ.get("FUNDING_EXIT_MAX_HOLD_SECONDS", "900"))
 EXIT_REVERSE_SCORE = float(os.environ.get("EXIT_REVERSE_SCORE", "70"))
 EXIT_HOLD_MIN_SCORE = float(os.environ.get("EXIT_HOLD_MIN_SCORE", "65"))
-EXIT_INVALID_SNAPSHOTS = int(os.environ.get("EXIT_INVALID_SNAPSHOTS", "1"))
+EXIT_INVALID_SNAPSHOTS = int(os.environ.get("EXIT_INVALID_SNAPSHOTS", "2"))
 LOW_CONFIDENCE_PROB = float(os.environ.get("LOW_CONFIDENCE_PROB", "68"))
 LOW_CONFIDENCE_TAKE_PROFIT_USDT = float(os.environ.get("LOW_CONFIDENCE_TAKE_PROFIT_USDT", "0.01"))
 POSITION_ADD_COOLDOWN_SECONDS = int(os.environ.get("POSITION_ADD_COOLDOWN_SECONDS", "45"))
@@ -157,6 +157,10 @@ _market_snapshots: dict[str, dict] = {}
 _market_snapshot_version = 0
 _paper_cash = PAPER_STARTING_BALANCE
 _paper_positions: dict[str, dict] = {}
+BANNED_LOW_LIQUIDITY = {
+    "CLOUSDT", "BABYUSDT", "BZUSDT", "HOMEUSDT",
+    "XAGUSDT", "PORTALUSDT", "0GUSDT",
+}
 PRIMARY_AUTO_STRATEGIES = {"liquidity_sweep_reclaim"}
 TEST_MORE_AUTO_STRATEGIES = {
     "liquidity_sweep_reclaim",
@@ -557,14 +561,14 @@ def _opportunity_margin_usdt(row: dict, account: dict, open_count: int) -> tuple
 def _strategy_exit_plan(row: dict, strategy: str) -> dict:
     base_r = abs(_strategy_hard_stop_pct(strategy))
     if strategy == "liquidity_sweep_reclaim":
-        r_pct = max(0.85, min(1.25, base_r))
+        r_pct = max(0.50, min(0.80, base_r))
         return {
             "stop_pct": -r_pct,
             "r_pct": r_pct,
-            "take_profit_pct": max(1.50, r_pct * 1.75),
-            "trail_arm_pct": max(0.80, r_pct * 0.90),
-            "fail_seconds": 45,
-            "timeout_seconds": 120,
+            "take_profit_pct": max(1.20, r_pct * 2.20),
+            "trail_arm_pct": max(0.60, r_pct * 0.80),
+            "fail_seconds": 30,
+            "timeout_seconds": 90,
         }
     if strategy == "flow_exhaustion_reversal":
         r_pct = max(0.85, min(1.25, base_r))
@@ -1292,6 +1296,9 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
             cooldown_key = f"{symbol}|{follow}"
             if now_ms - _trade_cooldown.get(cooldown_key, 0) < int(_testnet_config["cooldown_seconds"]) * 1000:
                 continue
+            if symbol in BANNED_LOW_LIQUIDITY:
+                _event(f"{symbol} 跳过：流动性过低", "warn", symbol=symbol)
+                continue
             if symbol in positions:
                 _event(f"{symbol} 跳过：已有模拟盘持仓", "warn", symbol=symbol)
                 continue
@@ -1828,7 +1835,7 @@ HTML = r"""
             <div class="api-help" id="apiHelp">本地模拟盘不需要 API Key。切到 Binance Futures Testnet 时，第一次连接必须同时填 API Key 和 Secret，不要填实盘 Key。</div>
             <label>每仓保证金 USDT<input id="orderUsdt" type="number" min="1" step="1" value="10"></label>
             <label>杠杆<input id="tradeLeverage" type="number" min="1" max="20" step="1" value="4"></label>
-            <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="20"></label>
+            <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="15"></label>
             <label>平仓分钟<input id="autoCloseMinutes" type="number" min="1" step="1" value="5"></label>
             <label class="wide">策略模式<select id="strategyMode">
               <option value="test_more">测试高频：多信号放宽</option>
@@ -1920,8 +1927,8 @@ HTML = r"""
     const NON_CRYPTO_BASES = new Set(["AVGO","RKLB","SKHYNIX","DRAM","NOK","INTC","MSTR","CRCL","SOXL","SPCX","XAG","LAB","GUA","BEAT"]);
     const MAJORS = new Set(["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]);
     const ALPHA = {
-      minScore:58, minProb:56, minEdgePct:0.03,
-      minTotal5x:2.2, minDirectionGap:5,
+      minScore:50, minProb:52, minEdgePct:0.01,
+      minTotal5x:1.5, minDirectionGap:3,
       majorMaxP1:0.45, altMaxP1:0.70, majorMaxP5:1.20, altMaxP5:1.80,
     };
     const MICRO = {
@@ -1938,10 +1945,10 @@ HTML = r"""
     };
     const FUNDING = {
       enabled:true,
-      extremePct:0.05, normalPct:0.035,
-      minVolume24hUsd:35000000,
+      extremePct:0.03, normalPct:0.035,
+      minVolume24hUsd:20000000,
       maxAgainstP1:0.32, coolP1:0.08,
-      minP5Stretch:0.18,
+      minP5Stretch:0.10,
     };
     const SECTOR_GROUPS = {
       meme:["DOGEUSDT","1000PEPEUSDT","1000SHIBUSDT","1000BONKUSDT","WIFUSDT","FLOKIUSDT","MEMEUSDT","TURBOUSDT","PNUTUSDT"],
