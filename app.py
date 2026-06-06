@@ -90,9 +90,9 @@ BINANCE_TESTNET_REST = os.environ.get("BINANCE_TESTNET_REST", "https://demo-fapi
 TESTNET_AUTO_CLOSE_MINUTES = float(os.environ.get("TESTNET_AUTO_CLOSE_MINUTES", "5"))
 TESTNET_ORDER_USDT = float(os.environ.get("TESTNET_ORDER_USDT", "10"))
 TESTNET_LEVERAGE = int(os.environ.get("TESTNET_LEVERAGE", "4"))
-TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "12"))
-TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "150"))
-TESTNET_STRATEGY_MODE = os.environ.get("TESTNET_STRATEGY_MODE", "primary")
+TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "20"))
+TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "45"))
+TESTNET_STRATEGY_MODE = os.environ.get("TESTNET_STRATEGY_MODE", "test_more")
 PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "100"))
 ENTRY_CONFIRM_SNAPSHOTS = int(os.environ.get("ENTRY_CONFIRM_SNAPSHOTS", "1"))
 ENTRY_CONFIRM_MAX_GAP_SECONDS = int(os.environ.get("ENTRY_CONFIRM_MAX_GAP_SECONDS", "8"))
@@ -158,9 +158,18 @@ _market_snapshot_version = 0
 _paper_cash = PAPER_STARTING_BALANCE
 _paper_positions: dict[str, dict] = {}
 PRIMARY_AUTO_STRATEGIES = {"liquidity_sweep_reclaim"}
+TEST_MORE_AUTO_STRATEGIES = {
+    "liquidity_sweep_reclaim",
+    "liquidation_reversal",
+    "sector_lead_lag",
+    "flow_exhaustion_reversal",
+    "flow_momentum",
+    "funding_reversion",
+}
 STRATEGY_MODE_MAP = {
     "primary": PRIMARY_AUTO_STRATEGIES,
     "liquidity_sweep_reclaim": {"liquidity_sweep_reclaim"},
+    "test_more": TEST_MORE_AUTO_STRATEGIES,
 }
 LEGACY_STRATEGY_MODE_ALIASES = {
     "exhaustion_sector": "primary",
@@ -173,6 +182,7 @@ LEGACY_STRATEGY_MODE_ALIASES = {
 STRATEGY_MODE_LABELS = {
     "primary": "主信号：流动性扫单收回",
     "liquidity_sweep_reclaim": "主信号：流动性扫单收回",
+    "test_more": "测试高频：多信号放宽",
 }
 
 
@@ -407,7 +417,7 @@ def _auto_signal_allowed_for_trade(row: dict) -> bool:
     strategy = str(row.get("strategy") or "").strip()
     if not _strategy_allowed_for_auto(strategy):
         return False
-    if _opportunity_grade(row) == "C":
+    if _strategy_mode() != "test_more" and _opportunity_grade(row) == "C":
         return False
     return True
 
@@ -1818,9 +1828,10 @@ HTML = r"""
             <div class="api-help" id="apiHelp">本地模拟盘不需要 API Key。切到 Binance Futures Testnet 时，第一次连接必须同时填 API Key 和 Secret，不要填实盘 Key。</div>
             <label>每仓保证金 USDT<input id="orderUsdt" type="number" min="1" step="1" value="10"></label>
             <label>杠杆<input id="tradeLeverage" type="number" min="1" max="20" step="1" value="4"></label>
-            <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="10"></label>
+            <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="20"></label>
             <label>平仓分钟<input id="autoCloseMinutes" type="number" min="1" step="1" value="5"></label>
             <label class="wide">策略模式<select id="strategyMode">
+              <option value="test_more">测试高频：多信号放宽</option>
               <option value="primary">主信号：流动性扫单收回</option>
             </select></label>
           </div>
@@ -1909,28 +1920,28 @@ HTML = r"""
     const NON_CRYPTO_BASES = new Set(["AVGO","RKLB","SKHYNIX","DRAM","NOK","INTC","MSTR","CRCL","SOXL","SPCX","XAG","LAB","GUA","BEAT"]);
     const MAJORS = new Set(["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]);
     const ALPHA = {
-      minScore:68, minProb:60, minEdgePct:0.09,
-      minTotal5x:4.2, minDirectionGap:10,
-      majorMaxP1:0.32, altMaxP1:0.45, majorMaxP5:0.85, altMaxP5:1.20,
+      minScore:58, minProb:56, minEdgePct:0.03,
+      minTotal5x:2.2, minDirectionGap:5,
+      majorMaxP1:0.45, altMaxP1:0.70, majorMaxP5:1.20, altMaxP5:1.80,
     };
     const MICRO = {
-      enableMomentum:false,
+      enableMomentum:true,
       invertFollow:false,
       enableExhaustionReversal:true,
-      minLiqX:2.2,
-      strongLiqX:5.2,
-      washoutP5:0.45,
-      reversalP1:0.025,
-      minAbsorbX:0.65,
-      leadMovePct:1.0,
-      lagMaxMovePct:0.55,
+      minLiqX:1.2,
+      strongLiqX:3.0,
+      washoutP5:0.25,
+      reversalP1:0.005,
+      minAbsorbX:0.35,
+      leadMovePct:0.55,
+      lagMaxMovePct:0.85,
     };
     const FUNDING = {
-      enabled:false,
-      extremePct:0.10, normalPct:0.035,
-      minVolume24hUsd:80000000,
-      maxAgainstP1:0.20, coolP1:0.03,
-      minP5Stretch:0.35,
+      enabled:true,
+      extremePct:0.05, normalPct:0.035,
+      minVolume24hUsd:35000000,
+      maxAgainstP1:0.32, coolP1:0.08,
+      minP5Stretch:0.18,
     };
     const SECTOR_GROUPS = {
       meme:["DOGEUSDT","1000PEPEUSDT","1000SHIBUSDT","1000BONKUSDT","WIFUSDT","FLOKIUSDT","MEMEUSDT","TURBOUSDT","PNUTUSDT"],
@@ -2081,9 +2092,9 @@ HTML = r"""
       const m=meta(symbol);
       const quoteVolume=Number(m.quoteVolume||0);
       if(!isCryptoTradableSymbol(symbol))return false;
-      if(!MAJORS.has(symbol)&&quoteVolume<90000000)return false;
-      if(isNum(d.bookSpreadPct)&&d.bookSpreadPct>(MAJORS.has(symbol)?0.04:0.09))return false;
-      const minDepth=Math.max(threshold*6, MAJORS.has(symbol)?80000:35000);
+      if(!MAJORS.has(symbol)&&quoteVolume<35000000)return false;
+      if(isNum(d.bookSpreadPct)&&d.bookSpreadPct>(MAJORS.has(symbol)?0.06:0.16))return false;
+      const minDepth=Math.max(threshold*3, MAJORS.has(symbol)?45000:18000);
       if(isNum(d.bidDepthUsd)&&d.bidDepthUsd<minDepth)return false;
       if(isNum(d.askDepthUsd)&&d.askDepthUsd<minDepth)return false;
       return true;
@@ -2092,13 +2103,13 @@ HTML = r"""
       if(!liquidMarketOk(symbol,d,threshold))return null;
       const closeLocation=isNum(cm.closeLocation)?cm.closeLocation:0.5;
       const hasOiDrop=(isNum(d.oi5Pct)&&d.oi5Pct<=-0.20)||(isNum(d.oi15Pct)&&d.oi15Pct<=-0.70);
-      const longSweep=cm.sweepLow&&cm.sweepLowPct>=0.08&&cm.reclaimLowPct>=0.02&&p5<=0.20;
-      const shortSweep=cm.sweepHigh&&cm.sweepHighPct>=0.08&&cm.reclaimHighPct>=0.02&&p5>=-0.20;
-      const longFlow=f60.net>=threshold*0.85&&f60.buyCount>=2&&f60.lastSide==="BUY"&&f5.total>=threshold*4.0;
-      const shortFlow=f60.net<=-threshold*0.85&&f60.sellCount>=2&&f60.lastSide==="SELL"&&f5.total>=threshold*4.0;
-      const longTrap=l5.longLiq>=threshold*1.7||cm.lowerWickPct>=0.12||hasOiDrop;
-      const shortTrap=l5.shortLiq>=threshold*1.7||cm.upperWickPct>=0.12||hasOiDrop;
-      if(longSweep&&longFlow&&longTrap&&closeLocation>=0.56&&mb.bias>=-1){
+      const longSweep=cm.sweepLow&&cm.sweepLowPct>=0.04&&cm.reclaimLowPct>=0&&p5<=0.35;
+      const shortSweep=cm.sweepHigh&&cm.sweepHighPct>=0.04&&cm.reclaimHighPct>=0&&p5>=-0.35;
+      const longFlow=f60.net>=threshold*0.45&&f60.buyCount>=1&&f60.lastSide==="BUY"&&f5.total>=threshold*2.0;
+      const shortFlow=f60.net<=-threshold*0.45&&f60.sellCount>=1&&f60.lastSide==="SELL"&&f5.total>=threshold*2.0;
+      const longTrap=l5.longLiq>=threshold*0.8||cm.lowerWickPct>=0.06||hasOiDrop;
+      const shortTrap=l5.shortLiq>=threshold*0.8||cm.upperWickPct>=0.06||hasOiDrop;
+      if(longSweep&&longFlow&&longTrap&&closeLocation>=0.50&&mb.bias>=-2){
         const strength=Math.min(14,cm.sweepLowPct*12)+Math.min(10,Math.abs(f60.net)/Math.max(threshold,1)*1.4)+Math.min(8,l5.longLiq/Math.max(threshold,1));
         return {
           follow:"FOLLOW_LONG", side:"LONG", label:"扫低收回",
@@ -2108,7 +2119,7 @@ HTML = r"""
           sweepSide:"LOW", reclaimLevel:cm.prevLow, sweepDepthPct:cm.sweepLowPct,
         };
       }
-      if(shortSweep&&shortFlow&&shortTrap&&closeLocation<=0.44&&mb.bias<=1){
+      if(shortSweep&&shortFlow&&shortTrap&&closeLocation<=0.50&&mb.bias<=2){
         const strength=Math.min(14,cm.sweepHighPct*12)+Math.min(10,Math.abs(f60.net)/Math.max(threshold,1)*1.4)+Math.min(8,l5.shortLiq/Math.max(threshold,1));
         return {
           follow:"FOLLOW_SHORT", side:"SHORT", label:"扫高收回",
@@ -2405,27 +2416,41 @@ HTML = r"""
       const momentumBookShort=!bookKnown||d.bookImbalance<=-0.04;
       const momentumDepthLong=!isNum(depthLongRatio)||depthLongRatio>=0.06;
       const momentumDepthShort=!isNum(depthShortRatio)||depthShortRatio>=0.06;
-      const alignedLong=MICRO.enableMomentum&&signal==="LONG"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastLong&&profitOk&&flowLong&&flowStrong&&priceLong&&momentumImpulseLong&&repeatLong&&volumeOk&&marketOkLong&&btcOkLong&&oiLongOk&&candleOkLong&&spreadOk&&bookLongOk&&momentumBookLong&&depthLongOk&&momentumDepthLong&&!oiFallingHard&&f60.largest>=threshold&&!chaseLong;
-      const alignedShort=MICRO.enableMomentum&&signal==="SHORT"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastShort&&profitOk&&flowShort&&flowStrong&&priceShort&&momentumImpulseShort&&repeatShort&&volumeOk&&marketOkShort&&btcOkShort&&oiShortOk&&candleOkShort&&spreadOk&&bookShortOk&&momentumBookShort&&depthShortOk&&momentumDepthShort&&!oiFallingHard&&f60.largest>=threshold&&!chaseShort;
+      const testMomentumLong=p1>=-0.02&&p3>=0.02&&p5>=0.04&&closeLocation>=0.52;
+      const testMomentumShort=p1<=0.02&&p3<=-0.02&&p5<=-0.04&&closeLocation<=0.48;
+      const alignedLong=MICRO.enableMomentum&&signal==="LONG"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastLong&&profitOk&&flowLong&&flowStrong&&testMomentumLong&&repeatLong&&volumeOk&&marketOkLong&&btcOkLong&&oiLongOk&&candleOkLong&&spreadOk&&bookLongOk&&depthLongOk&&!oiFallingHard&&f60.largest>=threshold*0.8&&!chaseLong;
+      const alignedShort=MICRO.enableMomentum&&signal==="SHORT"&&score>=ALPHA.minScore&&directionGap>=ALPHA.minDirectionGap&&forecastShort&&profitOk&&flowShort&&flowStrong&&testMomentumShort&&repeatShort&&volumeOk&&marketOkShort&&btcOkShort&&oiShortOk&&candleOkShort&&spreadOk&&bookShortOk&&depthShortOk&&!oiFallingHard&&f60.largest>=threshold*0.8&&!chaseShort;
       const sweepSetup=liquiditySweepReclaimSetup(symbol,p1,p3,p5,f60,f5,l5,cm,d,mb,threshold);
+      const liquidationSetup=liquidationReversalSetup(symbol,p1,p5,f60,l5,cm,d,mb,threshold);
+      const sectorSetup=sectorLeadLagSetup(symbol,p1,p5,f60,f5,cm,mb,threshold);
+      const exhaustionSetup=flowExhaustionSetup(symbol,p1,p5,f60,f5,cm,d,mb,threshold);
+      const momentumSetup=alignedLong ? {
+        follow:"FOLLOW_LONG", side:"LONG", label:"策略多",
+        strategy:"flow_momentum", strategyLabel:"大单顺势",
+        score:Math.max(score,72), reason:"大单顺势多，测试放宽触发",
+      } : (alignedShort ? {
+        follow:"FOLLOW_SHORT", side:"SHORT", label:"策略空",
+        strategy:"flow_momentum", strategyLabel:"大单顺势",
+        score:Math.max(score,72), reason:"大单顺势空，测试放宽触发",
+      } : null);
       const fundingSetup=fundingReversionSetup(symbol,p1,p5,f60,cm,d,mb,signal,score,threshold);
-      let follow=sweepSetup?sweepSetup.follow:"";
-      let label=sweepSetup?sweepSetup.label:"";
-      let strategy=sweepSetup?sweepSetup.strategy:"none";
-      let strategyLabel=sweepSetup?sweepSetup.strategyLabel:"";
-      const microSetup=sweepSetup;
+      const microSetup=sweepSetup||liquidationSetup||sectorSetup||exhaustionSetup||momentumSetup;
+      let follow=microSetup?microSetup.follow:"";
+      let label=microSetup?microSetup.label:"";
+      let strategy=microSetup?microSetup.strategy:"none";
+      let strategyLabel=microSetup?microSetup.strategyLabel:"";
       if(microSetup){
         signal=microSetup.side;
         score=Math.max(score,microSetup.score);
         forecast.side=microSetup.side;
-        const minProb=72;
+        const minProb=microSetup.strategy==="flow_momentum"?64:68;
         forecast.prob5=Math.max(forecast.prob5,minProb);
-        const microExpected=Math.max(Math.abs(forecast.expected5Pct),0.72);
+        const microExpected=Math.max(Math.abs(forecast.expected5Pct),microSetup.strategy==="flow_momentum"?0.42:0.55);
         forecast.expected5Pct=microSetup.side==="LONG"?microExpected:-microExpected;
         cost=costModel(d,forecast.side);
         forecast.cost=cost;
         forecast.netEdgePct=Math.abs(forecast.expected5Pct)-cost.requiredPct;
-        forecast.targets={takeProfit:Math.max(1.50, dynamicTargets(cm,cost).takeProfit), trailArm:Math.max(0.80, dynamicTargets(cm,cost).trailArm)};
+        forecast.targets={takeProfit:Math.max(microSetup.strategy==="flow_momentum"?1.05:1.25, dynamicTargets(cm,cost).takeProfit), trailArm:Math.max(0.65, dynamicTargets(cm,cost).trailArm)};
       }
       if(!follow&&fundingSetup){
         follow=fundingSetup.follow;
