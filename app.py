@@ -536,6 +536,49 @@ def _opportunity_margin_usdt(row: dict, account: dict, open_count: int) -> tuple
     return max(1.0, margin), grade
 
 
+def _strategy_exit_plan(row: dict, strategy: str) -> dict:
+    base_r = abs(_strategy_hard_stop_pct(strategy))
+    if strategy == "flow_exhaustion_reversal":
+        r_pct = max(0.85, min(1.25, base_r))
+        return {
+            "stop_pct": -r_pct,
+            "r_pct": r_pct,
+            "take_profit_pct": max(1.45, r_pct * 1.80),
+            "trail_arm_pct": max(0.85, r_pct),
+            "fail_seconds": 60,
+            "timeout_seconds": 120,
+        }
+    if strategy == "liquidation_reversal":
+        r_pct = max(0.90, min(1.35, base_r))
+        return {
+            "stop_pct": -r_pct,
+            "r_pct": r_pct,
+            "take_profit_pct": max(1.25, r_pct * 1.50),
+            "trail_arm_pct": max(0.75, r_pct * 0.90),
+            "fail_seconds": 40,
+            "timeout_seconds": 75,
+        }
+    if strategy == "sector_lead_lag":
+        r_pct = max(0.75, min(1.20, base_r))
+        return {
+            "stop_pct": -r_pct,
+            "r_pct": r_pct,
+            "take_profit_pct": max(1.20, r_pct * 1.60),
+            "trail_arm_pct": max(0.75, r_pct),
+            "fail_seconds": 120,
+            "timeout_seconds": 240,
+        }
+    r_pct = max(0.80, base_r)
+    return {
+        "stop_pct": -r_pct,
+        "r_pct": r_pct,
+        "take_profit_pct": max(_safe_float(row.get("take_profit_pct")) or EXIT_TAKE_PROFIT_PCT, r_pct * 1.50),
+        "trail_arm_pct": max(_safe_float(row.get("trail_arm_pct")) or EXIT_PROFIT_ARM_PCT, r_pct),
+        "fail_seconds": 90,
+        "timeout_seconds": EXIT_MAX_HOLD_SECONDS,
+    }
+
+
 def _paper_one_way_cost(notional: float) -> float:
     return max(0.0, float(notional)) * (TAKER_FEE_BPS + SLIPPAGE_BPS) / 10000
 
@@ -629,12 +672,28 @@ def _paper_close_position(symbol: str, amount: float) -> dict:
         raise RuntimeError(f"{symbol} 没有本地模拟持仓")
     entry = float(pos.get("entry_price") or 0)
     mark = _paper_mark_price(symbol, entry)
-    gross_pnl = (mark - entry) * float(pos.get("amount") or amount)
-    exit_cost = _paper_one_way_cost(abs(float(pos.get("amount") or amount)) * mark)
-    entry_cost = float(pos.get("entry_cost") or 0)
+    pos_amount = float(pos.get("amount") or amount)
+    close_abs = min(abs(float(amount or pos_amount)), abs(pos_amount))
+    if close_abs <= 0:
+        raise RuntimeError(f"{symbol} 平仓数量无效")
+    close_amount = close_abs if pos_amount > 0 else -close_abs
+    ratio = close_abs / max(abs(pos_amount), 1e-12)
+    gross_pnl = (mark - entry) * close_amount
+    exit_cost = _paper_one_way_cost(close_abs * mark)
+    entry_cost = float(pos.get("entry_cost") or 0) * ratio
     net_pnl = gross_pnl - entry_cost - exit_cost
     _paper_cash += gross_pnl - exit_cost
-    _paper_positions.pop(symbol, None)
+    remaining_amount = pos_amount - close_amount
+    if abs(remaining_amount) <= max(abs(pos_amount), 1e-12) * 0.01:
+        _paper_positions.pop(symbol, None)
+    else:
+        remain_ratio = 1 - ratio
+        pos.update({
+            "amount": remaining_amount,
+            "margin": float(pos.get("margin") or 0) * remain_ratio,
+            "notional": float(pos.get("notional") or abs(pos_amount) * entry) * remain_ratio,
+            "entry_cost": float(pos.get("entry_cost") or 0) * remain_ratio,
+        })
     return {
         "orderId": uuid.uuid4().hex[:12],
         "symbol": symbol,
@@ -643,6 +702,9 @@ def _paper_close_position(symbol: str, amount: float) -> dict:
         "entryCost": entry_cost,
         "exitCost": exit_cost,
         "avgPrice": mark,
+        "closedRatio": ratio,
+        "closedAmount": close_amount,
+        "remainingAmount": remaining_amount,
         "paper": True,
     }
 
@@ -809,6 +871,53 @@ def _track_hold_support(meta: dict, supported: bool, reverse: bool, snap_version
     return count
 
 
+def _strategy_failure_exit_reason(strategy: str, side: str, snap: dict, meta: dict, age_ms: int, pnl_pct: float, peak_pct: float, reverse: bool, would_open: bool) -> str | None:
+    if not snap:
+        return None
+    net_60s = _safe_float(snap.get("net_60s_usd"))
+    net_5m = _safe_float(snap.get("net_5m_usd"))
+    p1 = _safe_float(snap.get("price_1m_pct"))
+    p5 = _safe_float(snap.get("price_5m_pct"))
+    fail_ms = int(meta.get("exit_fail_seconds") or 90) * 1000
+    timeout_ms = int(meta.get("exit_timeout_seconds") or EXIT_MAX_HOLD_SECONDS) * 1000
+
+    if strategy == "flow_exhaustion_reversal":
+        if side == "LONG" and net_60s < 0 and net_5m < 0 and pnl_pct <= 0.05:
+            return f"耗尽回归失败，主动卖流重新压制 {pnl_pct:.2f}%"
+        if side == "SHORT" and net_60s > 0 and net_5m > 0 and pnl_pct <= 0.05:
+            return f"耗尽回归失败，主动买流重新推升 {pnl_pct:.2f}%"
+        if age_ms >= timeout_ms and peak_pct < 0.35:
+            return f"耗尽回归超时，最高浮盈 {peak_pct:.2f}%"
+
+    if strategy == "liquidation_reversal":
+        if reverse and pnl_pct <= 0.10:
+            return f"爆仓反弹被反穿，当前 {pnl_pct:.2f}%"
+        if age_ms >= fail_ms and peak_pct < 0.25 and pnl_pct <= 0.05:
+            return f"爆仓反弹未快速收复，最高浮盈 {peak_pct:.2f}%"
+        if age_ms >= timeout_ms and peak_pct < 0.45:
+            return f"爆仓反弹超时，最高浮盈 {peak_pct:.2f}%"
+
+    if strategy == "sector_lead_lag":
+        if side == "LONG" and p5 < -0.35 and net_5m < 0 and pnl_pct <= 0.05:
+            return f"板块价差失败，目标币继续跟跌 {p5:.2f}%"
+        if side == "SHORT" and p5 > 0.35 and net_5m > 0 and pnl_pct <= 0.05:
+            return f"板块价差失败，目标币继续跟涨 {p5:.2f}%"
+        if age_ms >= timeout_ms and not would_open and peak_pct < 0.45:
+            return f"板块价差回归超时，最高浮盈 {peak_pct:.2f}%"
+
+    return None
+
+
+def _partial_exit_reason(symbol: str, pos: dict, meta: dict) -> str | None:
+    if meta.get("partial_taken"):
+        return None
+    pnl, pnl_pct = _position_pnl_pct(symbol, pos, meta)
+    r_pct = _safe_float(meta.get("exit_r_pct")) or abs(_strategy_hard_stop_pct(str(meta.get("strategy") or "")))
+    if r_pct > 0 and pnl_pct >= r_pct:
+        return f"1R半仓止盈 {pnl_pct:.2f}% · R {r_pct:.2f}%"
+    return None
+
+
 def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     opened_at = int(meta.get("opened_at", now_ms))
     age_ms = now_ms - opened_at
@@ -826,7 +935,7 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
         meta["last_favorable_at"] = now_ms
 
     strategy = str(meta.get("strategy") or "flow_momentum")
-    hard_stop_pct = _strategy_hard_stop_pct(strategy)
+    hard_stop_pct = _safe_float(meta.get("exit_stop_pct")) or _strategy_hard_stop_pct(strategy)
     if pnl_pct <= hard_stop_pct:
         return f"止损平仓 {pnl_pct:.2f}%"
 
@@ -854,6 +963,10 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     if age_ms < EXIT_MIN_HOLD_SECONDS * 1000:
         return None
 
+    strategy_failure = _strategy_failure_exit_reason(strategy, side, snap, meta, age_ms, pnl_pct, peak_pct, reverse, would_open)
+    if strategy_failure:
+        return strategy_failure
+
     if not would_open and pnl >= POSITION_PROFIT_FLOOR_USDT:
         return f"当前不再触发开仓，净利落袋 {pnl:+.2f} USDT"
 
@@ -880,6 +993,10 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
 
     if peak_pct >= trail_arm_pct and pnl_pct <= max(0.0, peak_pct * EXIT_TRAIL_KEEP_RATIO):
         return f"移动止盈平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
+
+    r_pct = _safe_float(meta.get("exit_r_pct"))
+    if r_pct > 0 and peak_pct >= r_pct and pnl_pct <= max(0.05, r_pct * 0.25):
+        return f"1R回吐保护平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
     if peak_pct >= EXIT_BREAKEVEN_ARM_PCT and pnl_pct <= EXIT_BREAKEVEN_FLOOR_PCT:
         return f"浮盈回吐保护平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
@@ -994,6 +1111,60 @@ def _close_due_positions(account: dict | None = None) -> None:
                 continue
             except Exception as exc:  # noqa: BLE001
                 _event(f"{symbol} 自动加仓失败：{exc}", "warn", symbol=symbol)
+        partial_reason = _partial_exit_reason(symbol, pos, meta)
+        if partial_reason:
+            try:
+                close_amount = float(pos["amount"]) * 0.5
+                if _is_paper_mode():
+                    order = _paper_close_position(symbol, close_amount)
+                else:
+                    order = _close_position(symbol, close_amount)
+                realized = _safe_float(order.get("realizedPnl")) if isinstance(order, dict) else 0.0
+                close_ratio = _safe_float(order.get("closedRatio"), 0.5) if isinstance(order, dict) else 0.5
+                remain_ratio = max(0.0, 1.0 - close_ratio)
+                meta["partial_taken"] = True
+                meta["margin"] = _safe_float(meta.get("margin")) * remain_ratio
+                meta["notional"] = _safe_float(meta.get("notional")) * remain_ratio
+                meta["entry_cost"] = _safe_float(meta.get("entry_cost")) * remain_ratio
+                meta["peak_pnl"] = 0.0
+                meta["peak_pnl_pct"] = 0.0
+                meta["last_progress_at"] = now_ms
+                close_item = {
+                    "ts": now_ms,
+                    "symbol": symbol,
+                    "realized": realized,
+                    "strategy": meta.get("strategy"),
+                    "strategy_label": meta.get("strategy_label"),
+                    "main_signal": meta.get("main_signal"),
+                    "signal_variant": meta.get("signal_variant"),
+                    "grade": meta.get("opportunity_grade"),
+                    "reason": partial_reason,
+                    "margin": _safe_float(meta.get("margin")) / max(remain_ratio, 0.01) * close_ratio,
+                }
+                _trade_closes.append(close_item)
+                del _trade_closes[:-400]
+                try:
+                    log_trade_close(close_item)
+                except Exception:
+                    pass
+                extra = f" · 已实现 {realized:+.2f} USDT" if realized else ""
+                _event(
+                    f"{symbol} {partial_reason}{extra}",
+                    "info",
+                    symbol=symbol,
+                    order=order,
+                    close=close_item,
+                    event_type="partial",
+                    strategy=meta.get("strategy"),
+                    strategy_label=meta.get("strategy_label"),
+                    main_signal=meta.get("main_signal"),
+                    signal_variant=meta.get("signal_variant"),
+                    grade=meta.get("opportunity_grade"),
+                    margin=close_item["margin"],
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001
+                _event(f"{symbol} 半仓止盈失败：{exc}", "warn", symbol=symbol)
         reason = _exit_reason(symbol, pos, meta, now_ms)
         if not reason:
             continue
@@ -1080,6 +1251,7 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                 price = float(row.get("price") or prices.get(symbol) or 0)
                 order_margin, opportunity_grade = _opportunity_margin_usdt(row, account, open_count)
                 order_notional = _order_notional_usdt(order_margin)
+                exit_plan = _strategy_exit_plan(row, strategy)
                 if _is_paper_mode():
                     order = _paper_place_market_order(symbol, follow, price, order_margin)
                 else:
@@ -1102,8 +1274,12 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                     "entry_cost": _safe_float(order.get("entryCost")) if isinstance(order, dict) else 0.0,
                     "forecast_prob": _safe_float(row.get("forecast_5m_prob") or row.get("forecast_prob")),
                     "net_edge_pct": _safe_float(row.get("net_edge_pct")),
-                    "take_profit_pct": _safe_float(row.get("take_profit_pct")) or EXIT_TAKE_PROFIT_PCT,
-                    "trail_arm_pct": _safe_float(row.get("trail_arm_pct")) or EXIT_PROFIT_ARM_PCT,
+                    "exit_stop_pct": exit_plan["stop_pct"],
+                    "exit_r_pct": exit_plan["r_pct"],
+                    "take_profit_pct": exit_plan["take_profit_pct"],
+                    "trail_arm_pct": exit_plan["trail_arm_pct"],
+                    "exit_fail_seconds": exit_plan["fail_seconds"],
+                    "exit_timeout_seconds": exit_plan["timeout_seconds"],
                     "peak_pnl": 0.0,
                     "peak_pnl_pct": 0.0,
                     "last_favorable_pct": 0.0,
@@ -2544,6 +2720,7 @@ HTML = r"""
     }
     function eventTypeText(type,message){
       const text=String(message||"");
+      if(type==="partial"||text.includes("半仓"))return "半仓";
       if(type==="open"||text.includes("自动下单"))return text.includes("加仓")?"加仓":"开仓";
       if(type==="add"||text.includes("加仓"))return "加仓";
       if(type==="close"||text.includes("平仓")||text.includes("已实现"))return "平仓";
@@ -2561,7 +2738,7 @@ HTML = r"""
     function renderTradeEvent(e){
       const type=eventTypeText(e.event_type,e.message);
       const realized=eventRealized(e);
-      const isClose=type==="平仓";
+      const isClose=type==="平仓"||type==="半仓";
       const win=realized!==null&&realized>=0;
       const cls=`trade-log-row ${type==="开仓"?"open":""} ${isClose?"close":""} ${isClose?(win?"win":"loss"):""}`;
       const symbol=e.symbol?String(e.symbol).replace("USDT",""):"--";
