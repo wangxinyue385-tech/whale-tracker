@@ -459,7 +459,7 @@ def _auto_signal_allowed_for_trade(row: dict) -> bool:
         if symbol not in MAJOR_SYMBOLS and volume_24h and volume_24h < 120_000_000:
             return False
     if strategy == "liquidity_sweep_reclaim":
-        if prob < 72 or edge < 0.30 or score < 80:
+        if prob < 66 or edge < 0.14 or score < 70:
             return False
     if _strategy_mode() != "test_more" and _opportunity_grade(row) == "C":
         return False
@@ -592,7 +592,8 @@ def _opportunity_margin_usdt(row: dict, account: dict, open_count: int) -> tuple
         if grade == "A":
             grade = "B"
     if strategy == "liquidity_sweep_reclaim":
-        target = min(target, base * 1.25)
+        tier = str(row.get("test_tier") or row.get("signal_tier") or "core")
+        target = min(target, base * (0.65 if tier == "probe" else 1.25))
     available = _available_margin_usdt(account, open_count)
     equity = _safe_float(account.get("equity") or account.get("wallet"), PAPER_STARTING_BALANCE)
     per_trade_cap = max(base, equity * 0.45)
@@ -2184,33 +2185,47 @@ HTML = r"""
       const volumeSpike=isNum(cm.volSpike)?cm.volSpike:1;
       const rsi=isNum(cm.rsi14)?cm.rsi14:50;
       const z=isNum(cm.bbZ)?cm.bbZ:0;
-      const extremeLong=(rsi<=32||z<=-1.85||p5<=-0.65);
-      const extremeShort=(rsi>=68||z>=1.85||p5>=0.65);
-      const longSweep=cm.sweepLow&&cm.sweepLowPct>=0.10&&cm.reclaimLowPct>=0.02&&p1>=-0.08;
-      const shortSweep=cm.sweepHigh&&cm.sweepHighPct>=0.10&&cm.reclaimHighPct>=0.02&&p1<=0.08;
-      const longFlow=f60.net>=threshold*0.85&&f60.buyCount>=2&&f60.lastSide==="BUY"&&f5.total>=threshold*3.2&&f60.imbalance>=0.25;
-      const shortFlow=f60.net<=-threshold*0.85&&f60.sellCount>=2&&f60.lastSide==="SELL"&&f5.total>=threshold*3.2&&f60.imbalance<=-0.25;
-      const longTrap=l5.longLiq>=threshold*1.5||cm.lowerWickPct>=0.12||hasOiDrop;
-      const shortTrap=l5.shortLiq>=threshold*1.5||cm.upperWickPct>=0.12||hasOiDrop;
-      const volOk=volumeSpike>=0.85||f5.total>=threshold*4.5;
-      if(longSweep&&extremeLong&&longFlow&&longTrap&&volOk&&closeLocation>=0.58&&mb.bias>=0){
+      const coreExtremeLong=(rsi<=32||z<=-1.85||p5<=-0.65);
+      const coreExtremeShort=(rsi>=68||z>=1.85||p5>=0.65);
+      const probeExtremeLong=(rsi<=38||z<=-1.20||p5<=-0.38);
+      const probeExtremeShort=(rsi>=62||z>=1.20||p5>=0.38);
+      const coreLongSweep=cm.sweepLow&&cm.sweepLowPct>=0.10&&cm.reclaimLowPct>=0.02&&p1>=-0.08;
+      const coreShortSweep=cm.sweepHigh&&cm.sweepHighPct>=0.10&&cm.reclaimHighPct>=0.02&&p1<=0.08;
+      const probeLongSweep=cm.sweepLow&&cm.sweepLowPct>=0.055&&cm.reclaimLowPct>=0&&p1>=-0.14;
+      const probeShortSweep=cm.sweepHigh&&cm.sweepHighPct>=0.055&&cm.reclaimHighPct>=0&&p1<=0.14;
+      const coreLongFlow=f60.net>=threshold*0.85&&f60.buyCount>=2&&f60.lastSide==="BUY"&&f5.total>=threshold*3.2&&f60.imbalance>=0.25;
+      const coreShortFlow=f60.net<=-threshold*0.85&&f60.sellCount>=2&&f60.lastSide==="SELL"&&f5.total>=threshold*3.2&&f60.imbalance<=-0.25;
+      const probeLongFlow=f60.net>=threshold*0.42&&f60.buyCount>=1&&f60.lastSide==="BUY"&&f5.total>=threshold*1.8&&f60.imbalance>=0.10;
+      const probeShortFlow=f60.net<=-threshold*0.42&&f60.sellCount>=1&&f60.lastSide==="SELL"&&f5.total>=threshold*1.8&&f60.imbalance<=-0.10;
+      const coreLongTrap=l5.longLiq>=threshold*1.5||cm.lowerWickPct>=0.12||hasOiDrop;
+      const coreShortTrap=l5.shortLiq>=threshold*1.5||cm.upperWickPct>=0.12||hasOiDrop;
+      const probeLongTrap=l5.longLiq>=threshold*0.65||cm.lowerWickPct>=0.06||hasOiDrop||z<=-1.50;
+      const probeShortTrap=l5.shortLiq>=threshold*0.65||cm.upperWickPct>=0.06||hasOiDrop||z>=1.50;
+      const volOk=volumeSpike>=0.65||f5.total>=threshold*2.8;
+      const longCore=coreLongSweep&&coreExtremeLong&&coreLongFlow&&coreLongTrap&&volOk&&closeLocation>=0.58&&mb.bias>=0;
+      const shortCore=coreShortSweep&&coreExtremeShort&&coreShortFlow&&coreShortTrap&&volOk&&closeLocation<=0.42&&mb.bias<=0;
+      const longProbe=probeLongSweep&&probeExtremeLong&&probeLongFlow&&probeLongTrap&&volOk&&closeLocation>=0.52&&mb.bias>=-1;
+      const shortProbe=probeShortSweep&&probeExtremeShort&&probeShortFlow&&probeShortTrap&&volOk&&closeLocation<=0.48&&mb.bias<=1;
+      if(longCore||longProbe){
+        const tier=longCore?"core":"probe";
         const strength=Math.min(14,cm.sweepLowPct*12)+Math.min(10,Math.abs(f60.net)/Math.max(threshold,1)*1.4)+Math.min(8,l5.longLiq/Math.max(threshold,1))+Math.max(0,(35-rsi)*0.35);
         return {
-          follow:"FOLLOW_LONG", side:"LONG", label:"极端扫低反转",
+          follow:"FOLLOW_LONG", side:"LONG", label:tier==="core"?"极端扫低反转":"测试扫低反转",
           strategy:"liquidity_sweep_reclaim", strategyLabel:"极端扫单反转",
-          score:Math.min(98,Math.round(78+strength)),
-          reason:`极端扫破前低 ${cm.sweepLowPct.toFixed(2)}% 后收回，RSI ${rsi.toFixed(0)}，主动买确认`,
-          sweepSide:"LOW", reclaimLevel:cm.prevLow, sweepDepthPct:cm.sweepLowPct,
+          score:Math.min(98,Math.round((tier==="core"?78:70)+strength)),
+          reason:`${tier==="core"?"极端":"测试"}扫破前低 ${cm.sweepLowPct.toFixed(2)}% 后收回，RSI ${rsi.toFixed(0)}，主动买确认`,
+          sweepSide:"LOW", reclaimLevel:cm.prevLow, sweepDepthPct:cm.sweepLowPct, testTier:tier,
         };
       }
-      if(shortSweep&&extremeShort&&shortFlow&&shortTrap&&volOk&&closeLocation<=0.42&&mb.bias<=0){
+      if(shortCore||shortProbe){
+        const tier=shortCore?"core":"probe";
         const strength=Math.min(14,cm.sweepHighPct*12)+Math.min(10,Math.abs(f60.net)/Math.max(threshold,1)*1.4)+Math.min(8,l5.shortLiq/Math.max(threshold,1))+Math.max(0,(rsi-65)*0.35);
         return {
-          follow:"FOLLOW_SHORT", side:"SHORT", label:"极端扫高反转",
+          follow:"FOLLOW_SHORT", side:"SHORT", label:tier==="core"?"极端扫高反转":"测试扫高反转",
           strategy:"liquidity_sweep_reclaim", strategyLabel:"极端扫单反转",
-          score:Math.min(98,Math.round(78+strength)),
-          reason:`极端扫破前高 ${cm.sweepHighPct.toFixed(2)}% 后收回，RSI ${rsi.toFixed(0)}，主动卖确认`,
-          sweepSide:"HIGH", reclaimLevel:cm.prevHigh, sweepDepthPct:cm.sweepHighPct,
+          score:Math.min(98,Math.round((tier==="core"?78:70)+strength)),
+          reason:`${tier==="core"?"极端":"测试"}扫破前高 ${cm.sweepHighPct.toFixed(2)}% 后收回，RSI ${rsi.toFixed(0)}，主动卖确认`,
+          sweepSide:"HIGH", reclaimLevel:cm.prevHigh, sweepDepthPct:cm.sweepHighPct, testTier:tier,
         };
       }
       return null;
@@ -2528,9 +2543,9 @@ HTML = r"""
         signal=microSetup.side;
         score=Math.max(score,microSetup.score);
         forecast.side=microSetup.side;
-        const minProb=microSetup.strategy==="liquidity_sweep_reclaim"?74:(microSetup.strategy==="flow_momentum"?64:68);
+        const minProb=microSetup.strategy==="liquidity_sweep_reclaim"?(microSetup.testTier==="probe"?67:74):(microSetup.strategy==="flow_momentum"?64:68);
         forecast.prob5=Math.max(forecast.prob5,minProb);
-        const microExpected=Math.max(Math.abs(forecast.expected5Pct),microSetup.strategy==="liquidity_sweep_reclaim"?0.90:(microSetup.strategy==="flow_momentum"?0.42:0.55));
+        const microExpected=Math.max(Math.abs(forecast.expected5Pct),microSetup.strategy==="liquidity_sweep_reclaim"?(microSetup.testTier==="probe"?0.58:0.90):(microSetup.strategy==="flow_momentum"?0.42:0.55));
         forecast.expected5Pct=microSetup.side==="LONG"?microExpected:-microExpected;
         cost=costModel(d,forecast.side);
         forecast.cost=cost;
@@ -2641,7 +2656,7 @@ HTML = r"""
       const signalVariant=rawFollow&&follow!==rawFollow?"inverted":"primary";
       const mainSignal=strategy==="flow_momentum"&&signalVariant==="inverted"?"flow_momentum_inverted":strategy;
       if(!follow){ follow=signal==="LONG"?"WATCH_LONG":signal==="SHORT"?"WATCH_SHORT":"WAIT"; label=follow==="WATCH_LONG"?"多头异动":follow==="WATCH_SHORT"?"空头异动":"观察"; }
-      return {symbol,base:base(symbol),price:state.prices.get(symbol)||0,p1,p3,p5,f60,f5,l5,d,m:meta(symbol),cm,mb,threshold,signal,score,follow,label,strategy,strategyLabel,mainSignal,signalVariant,rawFollow,rawLabel,rawStrategy,rawStrategyLabel,rawForecast,forecast,cost,risks,reasons,sweepSide:microSetup&&microSetup.sweepSide,reclaimLevel:microSetup&&microSetup.reclaimLevel,sweepDepthPct:microSetup&&microSetup.sweepDepthPct};
+      return {symbol,base:base(symbol),price:state.prices.get(symbol)||0,p1,p3,p5,f60,f5,l5,d,m:meta(symbol),cm,mb,threshold,signal,score,follow,label,strategy,strategyLabel,mainSignal,signalVariant,rawFollow,rawLabel,rawStrategy,rawStrategyLabel,rawForecast,forecast,cost,risks,reasons,sweepSide:microSetup&&microSetup.sweepSide,reclaimLevel:microSetup&&microSetup.reclaimLevel,sweepDepthPct:microSetup&&microSetup.sweepDepthPct,testTier:microSetup&&microSetup.testTier};
     }
     function rows(){ return activeSymbols().map(scoreRow).sort((a,b)=>b.score-a.score||Math.abs(b.f60.net)-Math.abs(a.f60.net)||Number(b.m.quoteVolume||0)-Number(a.m.quoteVolume||0)); }
     function allowedStrategySet(){
@@ -2770,7 +2785,7 @@ HTML = r"""
       board.innerHTML=cards.map(renderStrategyCard).join("");
     }
     function renderEvents(){ const list=document.getElementById("eventList"); if(!list)return; const text=[`价格流 ${state.priceConnected?"正常":"异常"}`,`大单流 ${state.tradeConnected?"正常":"异常"}`,`爆仓流 ${state.liqConnected?"正常":"异常"}`,`事件 ${state.events.length}`]; const latest=state.events.slice(0,4).map(ev=>{ const cls=ev.side==="BUY"?"buy":"sell"; return `<div class="event"><div class="event-side ${cls}">${ev.label}</div><div><div class="event-title"><span>${base(ev.symbol)}</span><span>${money(ev.notional)}</span></div><div class="event-meta">${new Date(ev.ts).toLocaleTimeString()} · 后台记录</div></div></div>`; }).join(""); list.innerHTML=`<div class="event"><div></div><div><div class="event-title">后台监控状态</div><div class="event-meta">${text.join(" · ")}</div></div></div>${latest}`; }
-    function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,strategy:r.strategy,strategy_label:r.strategyLabel,main_signal:r.mainSignal,signal_variant:r.signalVariant,price:r.price,forecast_side:r.forecast.side,forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),forecast_5m_expected_pct:Number(r.forecast.expected5Pct.toFixed(3)),required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),take_profit_pct:r.forecast.targets?Number(r.forecast.targets.takeProfit.toFixed(3)):null,trail_arm_pct:r.forecast.targets?Number(r.forecast.targets.trailArm.toFixed(3)):null,funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),price_1m_pct:Number(r.p1.toFixed(3)),price_3m_pct:Number(r.p3.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,atr_pct:r.cm.atrPct,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),long_liq_5m_usd:Math.round(r.l5.longLiq||0),short_liq_5m_usd:Math.round(r.l5.shortLiq||0),sweep_side:r.sweepSide||"",reclaim_level:r.reclaimLevel||0,sweep_depth_pct:r.sweepDepthPct||0,largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_5m_pct:r.d.oi5Pct,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,book_spread_pct:r.d.bookSpreadPct,book_imbalance:r.d.bookImbalance,bid_depth_usd:r.d.bidDepthUsd,ask_depth_usd:r.d.askDepthUsd,risks:r.risks,reasons:r.reasons})); }
+    function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,strategy:r.strategy,strategy_label:r.strategyLabel,main_signal:r.mainSignal,signal_variant:r.signalVariant,test_tier:r.testTier||"",price:r.price,forecast_side:r.forecast.side,forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),forecast_5m_expected_pct:Number(r.forecast.expected5Pct.toFixed(3)),required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),take_profit_pct:r.forecast.targets?Number(r.forecast.targets.takeProfit.toFixed(3)):null,trail_arm_pct:r.forecast.targets?Number(r.forecast.targets.trailArm.toFixed(3)):null,funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),price_1m_pct:Number(r.p1.toFixed(3)),price_3m_pct:Number(r.p3.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,atr_pct:r.cm.atrPct,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),long_liq_5m_usd:Math.round(r.l5.longLiq||0),short_liq_5m_usd:Math.round(r.l5.shortLiq||0),sweep_side:r.sweepSide||"",reclaim_level:r.reclaimLevel||0,sweep_depth_pct:r.sweepDepthPct||0,largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_5m_pct:r.d.oi5Pct,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,book_spread_pct:r.d.bookSpreadPct,book_imbalance:r.d.bookImbalance,bid_depth_usd:r.d.bidDepthUsd,ask_depth_usd:r.d.askDepthUsd,risks:r.risks,reasons:r.reasons})); }
     function compactEvents(){ return state.events.slice(0,40).map(e=>({symbol:e.symbol,base:base(e.symbol),label:e.label,side:e.side,price:e.price,notional:Math.round(e.notional),time:new Date(e.ts).toLocaleTimeString()})); }
     function trimOld(){ const cut=now()-6*60*1000; for(const map of [state.trades,state.liquidations]){ for(const [sym,list] of map){ while(list.length&&list[0].ts<cut)list.shift(); if(!list.length)map.delete(sym); } } }
 
@@ -2791,7 +2806,7 @@ HTML = r"""
       const positionSymbols=new Set(((state.testnet&&state.testnet.positions)||[]).map(p=>p.symbol));
       const marketRows=all.filter((r,i)=>i<90||positionSymbols.has(r.symbol)||r.follow==="FOLLOW_LONG"||r.follow==="FOLLOW_SHORT").map(r=>({
         symbol:r.symbol, follow:r.follow, signal:r.signal, score:r.score, strategy:r.strategy, strategy_label:r.strategyLabel,
-        main_signal:r.mainSignal, signal_variant:r.signalVariant,
+        main_signal:r.mainSignal, signal_variant:r.signalVariant, test_tier:r.testTier||"",
         raw_follow:r.rawFollow, raw_strategy:r.rawStrategy, raw_strategy_label:r.rawStrategyLabel,
         price:r.price,
 	        price_1m_pct:r.p1, price_3m_pct:r.p3, price_5m_pct:r.p5,
@@ -2811,7 +2826,7 @@ HTML = r"""
       }));
       const payload=toLog.map(r=>({
         symbol:r.symbol, follow:r.follow, score:r.score, strategy:r.strategy, strategy_label:r.strategyLabel,
-        main_signal:r.mainSignal, signal_variant:r.signalVariant,
+        main_signal:r.mainSignal, signal_variant:r.signalVariant, test_tier:r.testTier||"",
         raw_follow:r.rawFollow, raw_strategy:r.rawStrategy, raw_strategy_label:r.rawStrategyLabel,
         raw_forecast_side:r.rawForecast&&r.rawForecast.side,
         raw_forecast_5m_prob:r.rawForecast?Number(r.rawForecast.prob5.toFixed(1)):null,
