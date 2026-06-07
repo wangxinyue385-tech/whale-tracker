@@ -8,63 +8,55 @@ def bind(runtime) -> None:
 
 def _strategy_exit_plan(row: dict, strategy: str) -> dict:
     base_r = abs(_strategy_hard_stop_pct(strategy))
-    one_minute = _strategy_mode() in {"one_minute", "current"}
+    one_minute = _strategy_mode() in {"one_minute", "current", "test_more"}
     if strategy == "main_flow_direction":
+        r_pct = 0.70 if one_minute else 1.10
         return {
-            "stop_pct": -12.0,
-            "r_pct": 99.0,
-            "take_profit_pct": 99.0,
-            "trail_arm_pct": 99.0,
-            "fail_seconds": 0,
-            "timeout_seconds": 0,
+            "stop_pct": -r_pct,
+            "r_pct": r_pct,
+            "take_profit_pct": 1.35 if one_minute else 2.40,
+            "trail_arm_pct": 0.75 if one_minute else 1.30,
+            "fail_seconds": 60,
+            "timeout_seconds": 240 if one_minute else 900,
         }
     if strategy == "liquidity_sweep_reclaim":
-        r_pct = max(0.24, min(0.42, base_r)) if one_minute else max(0.45, min(0.65, base_r))
+        tier = str(row.get("test_tier") or row.get("signal_tier") or "probe")
+        r_pct = 0.24 if tier == "probe" or one_minute else max(0.40, min(0.60, base_r))
         return {
             "stop_pct": -r_pct,
             "r_pct": r_pct,
-            "take_profit_pct": max(0.38, r_pct * 1.55) if one_minute else max(1.20, r_pct * 2.20),
-            "trail_arm_pct": max(0.22, r_pct * 0.80) if one_minute else max(0.60, r_pct * 0.80),
+            "take_profit_pct": max(0.34, r_pct * 1.55) if one_minute else max(0.75, r_pct * 1.90),
+            "trail_arm_pct": max(0.20, r_pct * 0.85) if one_minute else max(0.45, r_pct),
             "fail_seconds": 18 if one_minute else 45,
-            "timeout_seconds": 55 if one_minute else 120,
+            "timeout_seconds": 55 if one_minute else 150,
         }
-    if strategy == "flow_exhaustion_reversal":
-        r_pct = max(0.28, min(0.45, base_r)) if one_minute else max(0.85, min(1.25, base_r))
+    if strategy in {"flow_exhaustion_reversal", "liquidation_reversal"}:
+        r_pct = 0.28 if one_minute else max(0.55, min(0.90, base_r))
         return {
             "stop_pct": -r_pct,
             "r_pct": r_pct,
-            "take_profit_pct": max(0.42, r_pct * 1.45) if one_minute else max(1.45, r_pct * 1.80),
-            "trail_arm_pct": max(0.24, r_pct * 0.85) if one_minute else max(0.85, r_pct),
-            "fail_seconds": 20 if one_minute else 60,
-            "timeout_seconds": 60 if one_minute else 120,
+            "take_profit_pct": max(0.38, r_pct * 1.45) if one_minute else max(0.90, r_pct * 1.65),
+            "trail_arm_pct": max(0.22, r_pct * 0.85) if one_minute else max(0.50, r_pct * 0.90),
+            "fail_seconds": 20 if one_minute else 50,
+            "timeout_seconds": 60 if one_minute else 150,
         }
-    if strategy == "liquidation_reversal":
-        r_pct = max(0.28, min(0.48, base_r)) if one_minute else max(0.90, min(1.35, base_r))
+    if strategy == "funding_reversion":
+        r_pct = 0.26 if one_minute else max(0.45, min(0.70, base_r))
         return {
             "stop_pct": -r_pct,
             "r_pct": r_pct,
-            "take_profit_pct": max(0.40, r_pct * 1.45) if one_minute else max(1.25, r_pct * 1.50),
-            "trail_arm_pct": max(0.22, r_pct * 0.85) if one_minute else max(0.75, r_pct * 0.90),
-            "fail_seconds": 18 if one_minute else 40,
-            "timeout_seconds": 50 if one_minute else 75,
+            "take_profit_pct": max(0.32, r_pct * 1.35),
+            "trail_arm_pct": max(0.20, r_pct * 0.80),
+            "fail_seconds": 45,
+            "timeout_seconds": 600,
         }
-    if strategy == "sector_lead_lag":
-        r_pct = max(0.75, min(1.20, base_r))
-        return {
-            "stop_pct": -r_pct,
-            "r_pct": r_pct,
-            "take_profit_pct": max(1.20, r_pct * 1.60),
-            "trail_arm_pct": max(0.75, r_pct),
-            "fail_seconds": 120,
-            "timeout_seconds": 240,
-        }
-    r_pct = max(0.24, min(0.40, base_r)) if one_minute else max(0.80, base_r)
+    r_pct = 0.24 if one_minute else max(0.45, min(0.80, base_r))
     return {
         "stop_pct": -r_pct,
         "r_pct": r_pct,
-        "take_profit_pct": max(0.36, min(_safe_float(row.get("take_profit_pct")) or EXIT_TAKE_PROFIT_PCT, 0.75), r_pct * 1.35) if one_minute else max(_safe_float(row.get("take_profit_pct")) or EXIT_TAKE_PROFIT_PCT, r_pct * 1.50),
-        "trail_arm_pct": max(0.20, min(_safe_float(row.get("trail_arm_pct")) or EXIT_PROFIT_ARM_PCT, 0.55), r_pct * 0.80) if one_minute else max(_safe_float(row.get("trail_arm_pct")) or EXIT_PROFIT_ARM_PCT, r_pct),
-        "fail_seconds": 18 if one_minute else 90,
+        "take_profit_pct": max(0.34, r_pct * 1.45) if one_minute else max(0.75, r_pct * 1.60),
+        "trail_arm_pct": max(0.20, r_pct * 0.80) if one_minute else max(0.45, r_pct),
+        "fail_seconds": 18 if one_minute else 60,
         "timeout_seconds": 55 if one_minute else EXIT_MAX_HOLD_SECONDS,
     }
 
@@ -77,7 +69,7 @@ def _min_net_profit_usdt(meta: dict | None = None) -> float:
     margin = _safe_float((meta or {}).get("margin"), _order_margin_usdt())
     notional = _safe_float((meta or {}).get("notional"), _order_notional_usdt(margin))
     roundtrip_cost = _paper_one_way_cost(notional) * 2
-    return max(POSITION_PROFIT_FLOOR_USDT, LOW_CONFIDENCE_TAKE_PROFIT_USDT, roundtrip_cost * 1.35)
+    return max(POSITION_PROFIT_FLOOR_USDT, LOW_CONFIDENCE_TAKE_PROFIT_USDT, roundtrip_cost * 1.20)
 
 
 def _paper_mark_price(symbol: str, fallback: float = 0) -> float:
@@ -335,12 +327,8 @@ def _same_direction_still_valid(side: str, snap: dict) -> bool:
 def _strategy_hard_stop_pct(strategy: str) -> float:
     if strategy == "funding_reversion":
         return FUNDING_EXIT_HARD_STOP_PCT
-    if strategy == "flow_momentum":
+    if strategy in {"flow_momentum", "main_flow_direction"}:
         return FLOW_EXIT_HARD_STOP_PCT
-    if strategy == "main_flow_direction":
-        return FLOW_EXIT_HARD_STOP_PCT
-    if strategy == "liquidity_sweep_reclaim":
-        return -1.05
     if strategy == "flow_exhaustion_reversal":
         return EXHAUSTION_EXIT_HARD_STOP_PCT
     if strategy == "sector_lead_lag":
@@ -352,22 +340,21 @@ def _strategy_hard_stop_pct(strategy: str) -> float:
 
 def _strategy_unsupported_grace_seconds(strategy: str) -> int:
     if strategy == "flow_momentum":
-        return FLOW_POSITION_UNSUPPORTED_GRACE_SECONDS
-    return POSITION_UNSUPPORTED_GRACE_SECONDS
+        return min(FLOW_POSITION_UNSUPPORTED_GRACE_SECONDS, 18)
+    if strategy == "main_flow_direction":
+        return max(POSITION_UNSUPPORTED_GRACE_SECONDS, 45)
+    return min(POSITION_UNSUPPORTED_GRACE_SECONDS, 25)
 
 
 def _register_close_cooldown(symbol: str, strategy: str, realized: float, now_ms: int) -> None:
     if realized >= 0:
         return
-    _loss_cooldowns[symbol] = now_ms + 3 * 60 * 1000
-    recent = [
-        item for item in _trade_closes[-20:]
-        if str(item.get("strategy") or "") == strategy
-    ]
-    losses = [item for item in recent[-6:] if _safe_float(item.get("realized")) < 0]
-    if len(losses) >= 3:
+    _loss_cooldowns[symbol] = now_ms + 2 * 60 * 1000
+    recent = [item for item in _trade_closes[-24:] if str(item.get("strategy") or "") == strategy]
+    losses = [item for item in recent[-8:] if _safe_float(item.get("realized")) < 0]
+    if len(losses) >= 4:
         _strategy_cooldowns[strategy] = now_ms + 5 * 60 * 1000
-        _event(f"{strategy} 近期连续亏损，自动冷却 5 分钟", "warn", event_type="skip", strategy=strategy)
+        _event(f"{strategy} 近期亏损偏多，自动冷却 5 分钟", "warn", event_type="skip", strategy=strategy)
 
 
 def _track_hold_support(meta: dict, supported: bool, reverse: bool, snap_version: int) -> int:
@@ -378,9 +365,7 @@ def _track_hold_support(meta: dict, supported: bool, reverse: bool, snap_version
     if supported:
         meta["invalid_snapshots"] = 0
         return 0
-    increment = 1
-    if reverse and EXIT_INVALID_SNAPSHOTS > 1:
-        increment = 2
+    increment = 2 if reverse and EXIT_INVALID_SNAPSHOTS > 1 else 1
     count = int(meta.get("invalid_snapshots") or 0) + increment
     meta["invalid_snapshots"] = count
     return count
@@ -391,52 +376,38 @@ def _strategy_failure_exit_reason(strategy: str, side: str, snap: dict, meta: di
         return None
     net_60s = _safe_float(snap.get("net_60s_usd"))
     net_5m = _safe_float(snap.get("net_5m_usd"))
-    p1 = _safe_float(snap.get("price_1m_pct"))
-    p5 = _safe_float(snap.get("price_5m_pct"))
     price = _safe_float(snap.get("price"))
     reclaim_level = _safe_float(snap.get("reclaim_level"))
-    fail_ms = int(meta.get("exit_fail_seconds") or 90) * 1000
+    fail_ms = int(meta.get("exit_fail_seconds") or 45) * 1000
     timeout_ms = int(meta.get("exit_timeout_seconds") or EXIT_MAX_HOLD_SECONDS) * 1000
 
     if strategy == "liquidity_sweep_reclaim":
-        if side == "LONG":
-            if reclaim_level > 0 and price > 0 and price < reclaim_level and pnl_pct <= 0.10:
-                return f"扫低收回失败，跌回收回位下方 {pnl_pct:.2f}%"
-            if net_60s < 0 and net_5m < 0 and pnl_pct <= 0.10:
-                return f"扫低收回失败，主动卖流反压 {pnl_pct:.2f}%"
-        else:
-            if reclaim_level > 0 and price > 0 and price > reclaim_level and pnl_pct <= 0.10:
-                return f"扫高收回失败，站回收回位上方 {pnl_pct:.2f}%"
-            if net_60s > 0 and net_5m > 0 and pnl_pct <= 0.10:
-                return f"扫高收回失败，主动买流反推 {pnl_pct:.2f}%"
-        if age_ms >= fail_ms and peak_pct < 0.30 and pnl_pct <= 0.05:
+        if side == "LONG" and reclaim_level > 0 and price > 0 and price < reclaim_level:
+            return f"扫低收回失败，跌回收回位下方 {pnl_pct:.2f}%"
+        if side == "SHORT" and reclaim_level > 0 and price > 0 and price > reclaim_level:
+            return f"扫高收回失败，站回收回位上方 {pnl_pct:.2f}%"
+        if side == "LONG" and net_60s < 0 and net_5m < 0:
+            return f"扫低收回失败，主动卖流反压 {pnl_pct:.2f}%"
+        if side == "SHORT" and net_60s > 0 and net_5m > 0:
+            return f"扫高收回失败，主动买流反推 {pnl_pct:.2f}%"
+        if age_ms >= fail_ms and peak_pct < 0.20:
             return f"扫单收回未快速兑现，最高浮盈 {peak_pct:.2f}%"
-        if age_ms >= timeout_ms and peak_pct < 0.55:
-            return f"扫单收回超时，最高浮盈 {peak_pct:.2f}%"
 
-    if strategy == "flow_exhaustion_reversal":
-        if side == "LONG" and net_60s < 0 and net_5m < 0 and pnl_pct <= 0.05:
-            return f"耗尽回归失败，主动卖流重新压制 {pnl_pct:.2f}%"
-        if side == "SHORT" and net_60s > 0 and net_5m > 0 and pnl_pct <= 0.05:
-            return f"耗尽回归失败，主动买流重新推升 {pnl_pct:.2f}%"
-        if age_ms >= timeout_ms and peak_pct < 0.35:
-            return f"耗尽回归超时，最高浮盈 {peak_pct:.2f}%"
+    if strategy in {"flow_exhaustion_reversal", "liquidation_reversal"}:
+        if reverse:
+            return f"反转测试被反向信号穿回，当前 {pnl_pct:.2f}%"
+        if side == "LONG" and net_60s < 0 and net_5m < 0:
+            return f"反转测试承接失败，卖流重新压制 {pnl_pct:.2f}%"
+        if side == "SHORT" and net_60s > 0 and net_5m > 0:
+            return f"反转测试压回失败，买流重新推升 {pnl_pct:.2f}%"
+        if age_ms >= timeout_ms and peak_pct < 0.28:
+            return f"反转测试超时，最高浮盈 {peak_pct:.2f}%"
 
-    if strategy == "liquidation_reversal":
-        if reverse and pnl_pct <= 0.10:
-            return f"爆仓反弹被反穿，当前 {pnl_pct:.2f}%"
-        if age_ms >= fail_ms and peak_pct < 0.25 and pnl_pct <= 0.05:
-            return f"爆仓反弹未快速收复，最高浮盈 {peak_pct:.2f}%"
-        if age_ms >= timeout_ms and peak_pct < 0.45:
-            return f"爆仓反弹超时，最高浮盈 {peak_pct:.2f}%"
-
-    if strategy == "sector_lead_lag":
-        if side == "LONG" and p5 < -0.35 and net_5m < 0 and pnl_pct <= 0.05:
-            return f"板块价差失败，目标币继续跟跌 {p5:.2f}%"
-        if side == "SHORT" and p5 > 0.35 and net_5m > 0 and pnl_pct <= 0.05:
-            return f"板块价差失败，目标币继续跟涨 {p5:.2f}%"
-        if age_ms >= timeout_ms and not would_open and peak_pct < 0.45:
-            return f"板块价差回归超时，最高浮盈 {peak_pct:.2f}%"
+    if strategy == "flow_momentum":
+        if reverse:
+            return f"顺势测试出现反向快照，当前 {pnl_pct:.2f}%"
+        if age_ms >= fail_ms and peak_pct < 0.16:
+            return f"顺势测试未快速推进，最高浮盈 {peak_pct:.2f}%"
 
     return None
 
@@ -444,10 +415,13 @@ def _strategy_failure_exit_reason(strategy: str, side: str, snap: dict, meta: di
 def _partial_exit_reason(symbol: str, pos: dict, meta: dict) -> str | None:
     if meta.get("partial_taken"):
         return None
+    strategy = str(meta.get("strategy") or "")
+    if strategy != "main_flow_direction":
+        return None
     pnl, pnl_pct = _position_pnl_pct(symbol, pos, meta)
-    r_pct = _safe_float(meta.get("exit_r_pct")) or abs(_strategy_hard_stop_pct(str(meta.get("strategy") or "")))
+    r_pct = _safe_float(meta.get("exit_r_pct")) or abs(_strategy_hard_stop_pct(strategy))
     if r_pct > 0 and pnl_pct >= r_pct:
-        return f"1R半仓止盈 {pnl_pct:.2f}% · R {r_pct:.2f}%"
+        return f"主趋势1R半仓止盈 {pnl_pct:.2f}% · R {r_pct:.2f}%"
     return None
 
 
@@ -469,13 +443,14 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
 
     strategy = str(meta.get("strategy") or "flow_momentum")
     min_profit = _min_net_profit_usdt(meta)
-    if strategy == "funding_reversion" and pnl_pct >= FUNDING_EXIT_TAKE_PROFIT_PCT:
-        return f"费率回归止盈 {pnl_pct:.2f}%"
+    stop_pct = _safe_float(meta.get("exit_stop_pct"))
+    if stop_pct < 0 and pnl_pct <= stop_pct:
+        return f"测试止损平仓 {pnl_pct:.2f}% · 止损 {stop_pct:.2f}%"
 
     take_profit_pct = _safe_float(meta.get("take_profit_pct")) or EXIT_TAKE_PROFIT_PCT
     trail_arm_pct = _safe_float(meta.get("trail_arm_pct")) or EXIT_PROFIT_ARM_PCT
     if pnl_pct >= take_profit_pct:
-        return f"动态止盈平仓 {pnl_pct:.2f}% · 目标 {take_profit_pct:.2f}%"
+        return f"目标止盈平仓 {pnl_pct:.2f}% · 目标 {take_profit_pct:.2f}%"
 
     snap = _market_snapshots.get(symbol) or {}
     side = _position_side(pos, meta)
@@ -494,98 +469,68 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
         return None
 
     if strategy == "main_flow_direction":
-        if not snap_fresh:
-            return None
-        price = _safe_float(snap.get("price")) or _paper_mark_price(symbol, _safe_float(meta.get("entry_price")))
-        channel_low = _safe_float(snap.get("channel_low_20"))
-        ema_gap = _safe_float(snap.get("ema_trend_gap_pct"))
-        btc_ema_gap = _safe_float(snap.get("btc_ema_trend_gap_pct"))
-        btc_ret24 = _safe_float(snap.get("btc_trend_ret_24h"))
-        btc_ret = _safe_float(snap.get("btc_5m_pct"))
-        if side == "LONG" and channel_low > 0 and price > 0 and price < channel_low:
-            return f"4h趋势破坏平仓，跌破20根低点 {pnl_pct:.2f}%"
-        if side == "LONG" and ema_gap < 0:
-            return f"4h EMA趋势转弱平仓，当前 {pnl_pct:.2f}%"
-        if side == "LONG" and btc_ema_gap < 0 and btc_ret24 < 0:
-            return f"BTC 4h风险关闭平仓，BTC24h {btc_ret24:.2f}% · 当前 {pnl_pct:.2f}%"
-        if side == "LONG" and btc_ret <= -1.8:
-            return f"BTC风险关闭平仓，BTC短线 {btc_ret:.2f}% · 当前 {pnl_pct:.2f}%"
+        if snap_fresh:
+            price = _safe_float(snap.get("price")) or _paper_mark_price(symbol, _safe_float(meta.get("entry_price")))
+            channel_low = _safe_float(snap.get("channel_low_20"))
+            channel_high = _safe_float(snap.get("channel_high_20"))
+            ema_gap = _safe_float(snap.get("ema_trend_gap_pct"))
+            btc_ema_gap = _safe_float(snap.get("btc_ema_trend_gap_pct"))
+            btc_ret24 = _safe_float(snap.get("btc_trend_ret_24h"))
+            btc_ret = _safe_float(snap.get("btc_5m_pct"))
+            if side == "LONG" and channel_low > 0 and price > 0 and price < channel_low:
+                return f"主趋势破坏平仓，跌破20根低点 {pnl_pct:.2f}%"
+            if side == "SHORT" and channel_high > 0 and price > 0 and price > channel_high:
+                return f"主空趋势破坏平仓，突破20根高点 {pnl_pct:.2f}%"
+            if side == "LONG" and ema_gap < -0.02:
+                return f"主多EMA转弱平仓，当前 {pnl_pct:.2f}%"
+            if side == "SHORT" and ema_gap > 0.02:
+                return f"主空EMA转强平仓，当前 {pnl_pct:.2f}%"
+            if side == "LONG" and btc_ema_gap < 0 and btc_ret24 < 0:
+                return f"BTC风险关闭主多，BTC24h {btc_ret24:.2f}% · 当前 {pnl_pct:.2f}%"
+            if side == "SHORT" and btc_ema_gap > 0 and btc_ret24 > 0:
+                return f"BTC风险关闭主空，BTC24h {btc_ret24:.2f}% · 当前 {pnl_pct:.2f}%"
+            if side == "LONG" and btc_ret <= -1.8:
+                return f"BTC短线急跌关闭主多，BTC {btc_ret:.2f}% · 当前 {pnl_pct:.2f}%"
+            if side == "SHORT" and btc_ret >= 1.8:
+                return f"BTC短线急涨关闭主空，BTC {btc_ret:.2f}% · 当前 {pnl_pct:.2f}%"
+        if peak_pct >= trail_arm_pct and pnl_pct <= max(0.18, peak_pct * EXIT_TRAIL_KEEP_RATIO):
+            return f"主趋势移动止盈，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
+        if age_ms >= int(meta.get("exit_timeout_seconds") or 900) * 1000 and pnl >= min_profit:
+            return f"主趋势到时盈利平仓，最高浮盈 {peak_pct:.2f}%"
         return None
 
     strategy_failure = _strategy_failure_exit_reason(strategy, side, snap, meta, age_ms, pnl_pct, peak_pct, reverse, would_open)
     if strategy_failure:
+        return strategy_failure
+
+    if not would_open and snap_fresh and invalid_count >= max(1, EXIT_INVALID_SNAPSHOTS):
         if pnl >= min_profit:
-            return strategy_failure
+            return f"信号连续 {invalid_count} 次不支持，盈利平仓"
+        if pnl_pct <= max(stop_pct * 0.50, -0.16):
+            return f"信号失效且亏损受控退出 {pnl_pct:.2f}%"
 
-    if not would_open and pnl >= min_profit:
-        return f"当前不再触发开仓，净利落袋 {pnl:+.2f} USDT"
-
-    entry_prob = _safe_float(meta.get("forecast_prob"))
-    if (
-        entry_prob > 0
-        and entry_prob <= LOW_CONFIDENCE_PROB
-        and pnl >= min_profit
-        and (not snap_fresh or reverse or not supported)
-    ):
-        return f"低置信微利平仓，预测 {entry_prob:.1f}% · 净利 {pnl:+.2f} USDT"
-
-    if strategy == "funding_reversion" and snap_fresh:
-        funding_rate = _safe_float(snap.get("funding_rate"))
-        can_exit_on_normalized_funding = pnl >= min_profit
-        if side == "LONG" and funding_rate >= -FUNDING_EXIT_NORMAL_RATE_PCT and can_exit_on_normalized_funding:
-            return f"负资金费回归平仓，当前 {funding_rate:.4f}%"
-        if side == "SHORT" and funding_rate <= FUNDING_EXIT_NORMAL_RATE_PCT and can_exit_on_normalized_funding:
-            return f"正资金费回归平仓，当前 {funding_rate:.4f}%"
-        if reverse and pnl >= min_profit:
-            return f"费率单被动量反穿盈利平仓，当前 {pnl_pct:.2f}%"
-
-    if would_open and peak_pnl >= min_profit and pnl >= min_profit and peak_pnl - pnl >= POSITION_PROFIT_PULLBACK_USDT:
-        return f"仍支持持仓但盈利回撤平仓，最高净利 {peak_pnl:+.2f} 回落到 {pnl:+.2f} USDT"
-
-    if peak_pct >= trail_arm_pct and pnl_pct <= max(0.12, peak_pct * EXIT_TRAIL_KEEP_RATIO):
+    if peak_pct >= trail_arm_pct and pnl_pct <= max(0.08, peak_pct * EXIT_TRAIL_KEEP_RATIO):
         return f"移动止盈平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
     r_pct = _safe_float(meta.get("exit_r_pct"))
-    if r_pct > 0 and peak_pct >= r_pct and pnl_pct <= max(0.05, r_pct * 0.25):
+    if r_pct > 0 and peak_pct >= r_pct and pnl_pct <= max(0.03, r_pct * 0.20):
         return f"1R回吐保护平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
-    if peak_pct >= EXIT_BREAKEVEN_ARM_PCT and pnl_pct <= max(0.08, EXIT_BREAKEVEN_FLOOR_PCT):
+    if peak_pct >= EXIT_BREAKEVEN_ARM_PCT and pnl_pct <= max(0.03, EXIT_BREAKEVEN_FLOOR_PCT):
         return f"浮盈回吐保护平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
-    if (
-        snap_fresh
-        and invalid_count >= EXIT_INVALID_SNAPSHOTS
-        and strategy != "funding_reversion"
-        and pnl >= min_profit
-    ):
-        return f"当前策略连续 {invalid_count} 次不支持持仓，盈利平仓"
-
-    progress_age_ms = now_ms - int(meta.get("last_progress_at") or opened_at)
-    unsupported_grace_ms = _strategy_unsupported_grace_seconds(strategy) * 1000
-    unsupported_since = int(meta.get("unsupported_since") or 0)
-    if not would_open:
-        if not unsupported_since:
-            meta["unsupported_since"] = now_ms
-            unsupported_since = now_ms
-    else:
-        meta.pop("unsupported_since", None)
-    if age_ms >= EXIT_STALL_SECONDS * 1000 and peak_pct < EXIT_STALL_MIN_PEAK_PCT and snap_fresh:
-        if reverse and pnl >= min_profit:
-            return f"走势转弱平仓，最高浮盈 {peak_pct:.2f}%"
-        if not supported and pnl >= min_profit:
-            return f"信号衰减平仓，最高浮盈 {peak_pct:.2f}%"
-
-    if strategy == "funding_reversion" and age_ms >= FUNDING_EXIT_MAX_HOLD_SECONDS * 1000 and pnl >= min_profit:
-        return f"费率回归到时平仓，持仓 {int(age_ms / 1000)} 秒，最高浮盈 {peak_pct:.2f}%"
-
-    if age_ms >= EXIT_MAX_HOLD_SECONDS * 1000:
+    timeout_seconds = int(meta.get("exit_timeout_seconds") or EXIT_MAX_HOLD_SECONDS)
+    if age_ms >= timeout_seconds * 1000:
         if pnl >= min_profit:
-            return f"持仓到时盈利平仓，持仓 {int(age_ms / 1000)} 秒，最高浮盈 {peak_pct:.2f}%"
-        return None
+            return f"测试到时盈利平仓，持仓 {int(age_ms / 1000)} 秒，最高浮盈 {peak_pct:.2f}%"
+        return f"测试到时退出，当前 {pnl_pct:.2f}% · 最高浮盈 {peak_pct:.2f}%"
 
     close_ms = float(_testnet_config["auto_close_minutes"]) * 60 * 1000
-    if not snap_fresh and age_ms >= close_ms and pnl >= min_profit:
-        return "缺少新策略快照，到时盈利平仓"
+    if not snap_fresh and age_ms >= close_ms:
+        if pnl >= min_profit:
+            return "缺少新策略快照，到时盈利平仓"
+        if pnl_pct <= max(stop_pct * 0.50, -0.18):
+            return f"缺少新快照且亏损退出 {pnl_pct:.2f}%"
 
     return None
 
@@ -601,65 +546,11 @@ def _close_due_positions(account: dict | None = None) -> None:
         if not pos:
             _auto_positions.pop(symbol, None)
             continue
-        side = _position_side(pos, meta)
-        would_open, snap = _would_open_same_side(symbol, side, meta, now_ms)
-        gross_pnl = _position_gross_pnl(pos)
-        _, pnl_pct = _position_pnl_pct(symbol, pos, meta)
-        add_count = int(meta.get("add_count") or 0)
-        last_add_at = int(meta.get("last_add_at") or 0)
-        if (
-            would_open
-            and _strategy_allowed_for_auto(str(meta.get("strategy") or ""))
-            and gross_pnl <= -POSITION_ADD_GROSS_LOSS_USDT
-            and pnl_pct > EXIT_HARD_STOP_PCT * 0.70
-            and add_count < POSITION_MAX_ADDS
-            and now_ms - last_add_at >= POSITION_ADD_COOLDOWN_SECONDS * 1000
-        ):
-            try:
-                add_row = {
-                    **snap,
-                    "forecast_5m_prob": snap.get("forecast_5m_prob") or meta.get("forecast_prob"),
-                    "net_edge_pct": snap.get("net_edge_pct") or meta.get("net_edge_pct"),
-                    "strategy": meta.get("strategy"),
-                }
-                add_margin, add_grade = _opportunity_margin_usdt(add_row, account, len(positions))
-                add_margin = max(1.0, min(add_margin * 0.50, _safe_float(meta.get("margin"), _order_margin_usdt())))
-                price = _safe_float(snap.get("price")) or _paper_mark_price(symbol, _safe_float(meta.get("entry_price")))
-                if _is_paper_mode():
-                    order = _paper_place_market_order(symbol, meta.get("follow") or _same_side_follow(side), price, add_margin)
-                else:
-                    _set_leverage(symbol)
-                    order = _place_market_order(symbol, meta.get("follow") or _same_side_follow(side), price, add_margin)
-                meta["add_count"] = add_count + 1
-                meta["last_add_at"] = now_ms
-                meta["margin"] = _safe_float(meta.get("margin")) + add_margin
-                meta["notional"] = _safe_float(meta.get("notional")) + _order_notional_usdt(add_margin)
-                meta["entry_cost"] = _safe_float(meta.get("entry_cost")) + (_safe_float(order.get("entryCost")) if isinstance(order, dict) else 0.0)
-                meta["invalid_snapshots"] = 0
-                _event(
-                    f"{symbol} 仍触发开仓且浮亏，加仓 · {add_grade}级 {add_margin:.2f}U保证金 · 浮亏 {gross_pnl:+.2f} USDT",
-                    "info",
-                    symbol=symbol,
-                    order=order,
-                    event_type="add",
-                    strategy=meta.get("strategy"),
-                    strategy_label=meta.get("strategy_label"),
-                    main_signal=meta.get("main_signal"),
-                    signal_variant=meta.get("signal_variant"),
-                    grade=add_grade,
-                    margin=add_margin,
-                )
-                continue
-            except Exception as exc:  # noqa: BLE001
-                _event(f"{symbol} 自动加仓失败：{exc}", "warn", symbol=symbol)
         partial_reason = _partial_exit_reason(symbol, pos, meta)
         if partial_reason:
             try:
                 close_amount = float(pos["amount"]) * 0.5
-                if _is_paper_mode():
-                    order = _paper_close_position(symbol, close_amount)
-                else:
-                    order = _close_position(symbol, close_amount)
+                order = _paper_close_position(symbol, close_amount) if _is_paper_mode() else _close_position(symbol, close_amount)
                 realized = _safe_float(order.get("realizedPnl")) if isinstance(order, dict) else 0.0
                 fee = _safe_float(order.get("entryCost")) + _safe_float(order.get("exitCost")) if isinstance(order, dict) else 0.0
                 gross_realized = _safe_float(order.get("grossPnl"), realized + fee) if isinstance(order, dict) else realized
@@ -693,20 +584,7 @@ def _close_due_positions(account: dict | None = None) -> None:
                 except Exception:
                     pass
                 extra = f" · 手续费 {fee:.4f} USDT · 净利 {realized:+.4f} USDT" if isinstance(order, dict) else f" · 净利 {realized:+.4f} USDT"
-                _event(
-                    f"{symbol} {partial_reason}{extra}",
-                    "info",
-                    symbol=symbol,
-                    order=order,
-                    close=close_item,
-                    event_type="partial",
-                    strategy=meta.get("strategy"),
-                    strategy_label=meta.get("strategy_label"),
-                    main_signal=meta.get("main_signal"),
-                    signal_variant=meta.get("signal_variant"),
-                    grade=meta.get("opportunity_grade"),
-                    margin=close_item["margin"],
-                )
+                _event(f"{symbol} {partial_reason}{extra}", "info", symbol=symbol, order=order, close=close_item, event_type="partial", strategy=meta.get("strategy"), strategy_label=meta.get("strategy_label"), main_signal=meta.get("main_signal"), signal_variant=meta.get("signal_variant"), grade=meta.get("opportunity_grade"), margin=close_item["margin"])
                 continue
             except Exception as exc:  # noqa: BLE001
                 _event(f"{symbol} 半仓止盈失败：{exc}", "warn", symbol=symbol)
@@ -714,10 +592,7 @@ def _close_due_positions(account: dict | None = None) -> None:
         if not reason:
             continue
         try:
-            if _is_paper_mode():
-                order = _paper_close_position(symbol, float(pos["amount"]))
-            else:
-                order = _close_position(symbol, float(pos["amount"]))
+            order = _paper_close_position(symbol, float(pos["amount"])) if _is_paper_mode() else _close_position(symbol, float(pos["amount"]))
             realized = _safe_float(order.get("realizedPnl")) if isinstance(order, dict) else 0.0
             fee = _safe_float(order.get("entryCost")) + _safe_float(order.get("exitCost")) if isinstance(order, dict) else 0.0
             gross_realized = _safe_float(order.get("grossPnl"), realized + fee) if isinstance(order, dict) else realized
@@ -731,6 +606,7 @@ def _close_due_positions(account: dict | None = None) -> None:
                 "strategy_label": meta.get("strategy_label"),
                 "main_signal": meta.get("main_signal"),
                 "signal_variant": meta.get("signal_variant"),
+                "market_regime": meta.get("market_regime"),
                 "grade": meta.get("opportunity_grade"),
                 "reason": reason,
                 "margin": meta.get("margin"),
@@ -743,25 +619,10 @@ def _close_due_positions(account: dict | None = None) -> None:
             except Exception:
                 pass
             extra = f" · 手续费 {fee:.4f} USDT · 净利 {realized:+.4f} USDT" if isinstance(order, dict) else f" · 净利 {realized:+.4f} USDT"
-            _event(
-                f"{symbol} {reason}{extra}",
-                "info",
-                symbol=symbol,
-                order=order,
-                close=close_item,
-                event_type="close",
-                strategy=meta.get("strategy"),
-                strategy_label=meta.get("strategy_label"),
-                main_signal=meta.get("main_signal"),
-                signal_variant=meta.get("signal_variant"),
-                grade=meta.get("opportunity_grade"),
-                margin=meta.get("margin"),
-            )
+            _event(f"{symbol} {reason}{extra}", "info", symbol=symbol, order=order, close=close_item, event_type="close", strategy=meta.get("strategy"), strategy_label=meta.get("strategy_label"), main_signal=meta.get("main_signal"), signal_variant=meta.get("signal_variant"), grade=meta.get("opportunity_grade"), margin=meta.get("margin"))
             _auto_positions.pop(symbol, None)
         except Exception as exc:  # noqa: BLE001
             _event(f"{symbol} 自动平仓失败：{exc}", "error", symbol=symbol)
-
-
 
 
 def bind_entry_strategy(entry_strategy) -> None:
