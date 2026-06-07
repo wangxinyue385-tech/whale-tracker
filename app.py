@@ -1946,7 +1946,7 @@ HTML = r"""
           <div class="panel-head">
             <div>
               <div class="panel-title">模拟盘自动下单</div>
-              <div class="panel-note" id="tradeConnNote">未连接模拟盘</div>
+              <div class="panel-note" id="tradeConnNote">正在连接模拟盘...</div>
             </div>
             <button class="ai-btn" id="saveTradeCfg">保存连接</button>
           </div>
@@ -1970,7 +1970,7 @@ HTML = r"""
             <div class="mini-stat"><div class="label">盈亏</div><div class="value" id="tradePnl">--</div></div>
             <div class="mini-stat"><div class="label">持仓</div><div class="value" id="tradePositions">--</div></div>
           </div>
-          <div class="trade-log" id="tradeLog"><div>等待模拟盘连接。</div></div>
+          <div class="trade-log" id="tradeLog"><div>正在连接模拟盘...</div></div>
         </div>
         <div class="panel">
           <div class="panel-head">
@@ -3207,8 +3207,15 @@ HTML = r"""
       renderFullTradeTable(stats);
     }
     async function loadTestnetStatus(){
-      try{ const res=await fetch("/api/testnet/status"); renderTestnetStatus(await res.json()); }
-      catch(err){ document.getElementById("tradeConnNote").textContent="模拟盘状态读取失败"; drawPnlChart([]); }
+      try{
+        const res=await fetch("/api/testnet/status");
+        if(!res.ok)throw new Error("HTTP "+res.status);
+        renderTestnetStatus(await res.json());
+      }
+      catch(err){
+        document.getElementById("tradeConnNote").textContent="模拟盘状态读取失败，稍后自动重试";
+        drawPnlChart([]);
+      }
     }
     async function saveTestnetConfig(){
       const payload={
@@ -3298,9 +3305,9 @@ HTML = r"""
     document.getElementById("filters").addEventListener("click",e=>{ if(!e.target.dataset.filter)return; state.activeFilter=e.target.dataset.filter; document.querySelectorAll("#filters button").forEach(btn=>btn.classList.toggle("active",btn.dataset.filter===state.activeFilter)); render(); });
     setInterval(()=>{ trimOld(); render(); renderEvents(); logSignals(); },1000);
     setInterval(loadSignalStats,2*60*1000);
+    loadTestnetStatus();
     setInterval(loadTestnetStatus,5000);
     setTimeout(loadSignalStats,5000);
-    setTimeout(loadTestnetStatus,1000);
     window.addEventListener("resize",()=>{ drawPnlChart((state.testnet&&state.testnet.equity_curve)||[]); drawTradeStatsChart((state.testnet&&state.testnet.trade_stats)||{}); });
     start();
   </script>
