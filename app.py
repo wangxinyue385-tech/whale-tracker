@@ -56,14 +56,11 @@ HOLD_MINUTES = float(os.environ.get("HOLD_MINUTES", "15"))
 STRATEGY_VERSION = "2026-06-07-flow-v2"
 STRATEGY_VERSION_FILE = os.environ.get("STRATEGY_VERSION_FILE", ".strategy_version")
 
-BINANCE_WS = os.environ.get("BINANCE_WS", "wss://fstream.binance.com/market").rstrip("/")
-if BINANCE_WS in {"wss://fstream.binance.com", "wss://fstream.binancefuture.com"}:
-    BINANCE_WS += "/market"
+BINANCE_WS = os.environ.get("BINANCE_WS", "wss://fstream.binance.com").rstrip("/")
 BINANCE_WS_BASES = [
     url.strip().rstrip("/")
     for url in os.environ.get(
         "BINANCE_WS_BASES",
-        "wss://fstream.binance.com/market,wss://fstream.binancefuture.com/market,"
         "wss://fstream.binance.com,wss://fstream.binancefuture.com",
     ).split(",")
     if url.strip()
@@ -1480,18 +1477,9 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
 
 def _public_testnet_status() -> dict:
     cfg = _testnet_config
-    try:
-        closes = get_trade_closes(200)
-    except Exception:
-        closes = []
-    if not closes:
-        closes = _trade_closes[-200:]
-    try:
-        persisted_events = get_trade_events(300)
-    except Exception:
-        persisted_events = []
+    closes = _trade_closes[-200:]
     events = [
-        item for item in (persisted_events or _trade_events[:300])
+        item for item in _trade_events[:300]
         if str(item.get("event_type") or "") not in {"skip", "info"} and "跳过" not in str(item.get("message") or "")
     ]
     wins = [item for item in closes if _safe_float(item.get("realized")) > 0]
@@ -2411,7 +2399,23 @@ HTML = r"""
       const expected15Pct=expected5Pct*(isNum(cm.ret15)&&Math.sign(cm.ret15)===Math.sign(expected5Pct)?1.45:1.15);
       return {side,probUp,probDown:100-probUp,prob5,expected5Pct,expected15Pct};
     }
-    async function fetchJson(path){ let last; for(const host of BINANCE_REST_BASES){ try{ const res=await fetch(host+path,{cache:"no-store"}); if(!res.ok)throw new Error(`${res.status} ${res.statusText}`); return await res.json(); }catch(err){ last=err; } } throw last || new Error("Binance REST unavailable"); }
+    async function fetchJson(path){
+      let last;
+      for(const host of BINANCE_REST_BASES){
+        const controller=new AbortController();
+        const timeout=setTimeout(()=>controller.abort(),6000);
+        try{
+          const res=await fetch(host+path,{cache:"no-store",signal:controller.signal});
+          if(!res.ok)throw new Error(`${res.status} ${res.statusText}`);
+          return await res.json();
+        }catch(err){
+          last=err;
+        }finally{
+          clearTimeout(timeout);
+        }
+      }
+      throw last || new Error("Binance REST unavailable");
+    }
 
     async function refreshMarketUniverse(){
       try{
@@ -2604,7 +2608,7 @@ HTML = r"""
         follow:"FOLLOW_SHORT", side:"SHORT", label:"回归空",
         strategy:"main_flow_direction", strategyLabel:"主信号方向",
         score:Math.max(score,62), reason:"短线急拉后出现主动卖压，主信号做回归空",
-      } : null));
+      } : null)));
       const scalpLong=MICRO.enableMomentum&&signal==="LONG"&&score>=56&&directionGap>=4&&forecastLong&&forecast.prob5>=58&&forecast.netEdgePct>=0.03&&profitOk&&flowLong&&f60.net>threshold*0.28&&f5.total>=threshold*1.15&&testMomentumLong&&repeatLong&&volumeOk&&marketOkLong&&btcOkLong&&spreadOk&&!chaseLong;
       const scalpShort=MICRO.enableMomentum&&signal==="SHORT"&&score>=56&&directionGap>=4&&forecastShort&&forecast.prob5>=58&&forecast.netEdgePct>=0.03&&profitOk&&flowShort&&Math.abs(f60.net)>threshold*0.28&&f5.total>=threshold*1.15&&testMomentumShort&&repeatShort&&volumeOk&&marketOkShort&&btcOkShort&&spreadOk&&!chaseShort;
       const momentumSetup=alignedLong ? {
@@ -3207,15 +3211,18 @@ HTML = r"""
       renderFullTradeTable(stats);
     }
     async function loadTestnetStatus(){
+      const controller=new AbortController();
+      const timeout=setTimeout(()=>controller.abort(),8000);
       try{
-        const res=await fetch("/api/testnet/status");
+        const res=await fetch("/api/testnet/status",{signal:controller.signal,cache:"no-store"});
         if(!res.ok)throw new Error("HTTP "+res.status);
         renderTestnetStatus(await res.json());
       }
       catch(err){
-        document.getElementById("tradeConnNote").textContent="模拟盘状态读取失败，稍后自动重试";
+        document.getElementById("tradeConnNote").textContent=(err&&err.name==="AbortError")?"模拟盘状态超时，稍后自动重试":"模拟盘状态读取失败，稍后自动重试";
         drawPnlChart([]);
       }
+      finally{ clearTimeout(timeout); }
     }
     async function saveTestnetConfig(){
       const payload={
