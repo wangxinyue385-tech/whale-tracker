@@ -14,6 +14,7 @@ from urllib.parse import urlencode
 
 from flask import Flask, jsonify, render_template_string, request
 from signal_logger import (
+    clear_trade_history,
     fill_prices,
     get_recent,
     get_stats,
@@ -52,6 +53,8 @@ TAKER_FEE_BPS = float(os.environ.get("TAKER_FEE_BPS", "5"))
 SLIPPAGE_BPS = float(os.environ.get("SLIPPAGE_BPS", "3"))
 SAFETY_EDGE_BPS = float(os.environ.get("SAFETY_EDGE_BPS", "8"))
 HOLD_MINUTES = float(os.environ.get("HOLD_MINUTES", "15"))
+STRATEGY_VERSION = "2026-06-07-flow-v2"
+STRATEGY_VERSION_FILE = os.environ.get("STRATEGY_VERSION_FILE", ".strategy_version")
 
 BINANCE_WS = os.environ.get("BINANCE_WS", "wss://fstream.binance.com/market").rstrip("/")
 if BINANCE_WS in {"wss://fstream.binance.com", "wss://fstream.binancefuture.com"}:
@@ -87,46 +90,46 @@ AI_API_BASE = os.environ.get("AI_API_BASE") or (
 AI_MODEL = os.environ.get("AI_MODEL") or ("deepseek-chat" if os.environ.get("DEEPSEEK_API_KEY") else "gpt-4o-mini")
 
 BINANCE_TESTNET_REST = os.environ.get("BINANCE_TESTNET_REST", "https://demo-fapi.binance.com").rstrip("/")
-TESTNET_AUTO_CLOSE_MINUTES = float(os.environ.get("TESTNET_AUTO_CLOSE_MINUTES", "5"))
+TESTNET_AUTO_CLOSE_MINUTES = float(os.environ.get("TESTNET_AUTO_CLOSE_MINUTES", "1"))
 TESTNET_ORDER_USDT = float(os.environ.get("TESTNET_ORDER_USDT", "10"))
 TESTNET_LEVERAGE = int(os.environ.get("TESTNET_LEVERAGE", "4"))
 TESTNET_MAX_POSITIONS = int(os.environ.get("TESTNET_MAX_POSITIONS", "15"))
 TESTNET_COOLDOWN_SECONDS = int(os.environ.get("TESTNET_COOLDOWN_SECONDS", "20"))
-TESTNET_STRATEGY_MODE = os.environ.get("TESTNET_STRATEGY_MODE", "test_more")
+TESTNET_STRATEGY_MODE = os.environ.get("TESTNET_STRATEGY_MODE", "current")
 PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "100"))
 ENTRY_CONFIRM_SNAPSHOTS = int(os.environ.get("ENTRY_CONFIRM_SNAPSHOTS", "1"))
 ENTRY_CONFIRM_MAX_GAP_SECONDS = int(os.environ.get("ENTRY_CONFIRM_MAX_GAP_SECONDS", "8"))
-EXIT_MIN_HOLD_SECONDS = int(os.environ.get("EXIT_MIN_HOLD_SECONDS", "30"))
+EXIT_MIN_HOLD_SECONDS = int(os.environ.get("EXIT_MIN_HOLD_SECONDS", "10"))
 EXIT_TAKE_PROFIT_PCT = float(os.environ.get("EXIT_TAKE_PROFIT_PCT", "1.20"))
 EXIT_PROFIT_ARM_PCT = float(os.environ.get("EXIT_PROFIT_ARM_PCT", "0.80"))
 EXIT_TRAIL_KEEP_RATIO = float(os.environ.get("EXIT_TRAIL_KEEP_RATIO", "0.35"))
 EXIT_BREAKEVEN_ARM_PCT = float(os.environ.get("EXIT_BREAKEVEN_ARM_PCT", "0.45"))
 EXIT_BREAKEVEN_FLOOR_PCT = float(os.environ.get("EXIT_BREAKEVEN_FLOOR_PCT", "0.02"))
-EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-0.60"))
-FLOW_EXIT_HARD_STOP_PCT = float(os.environ.get("FLOW_EXIT_HARD_STOP_PCT", "-0.50"))
-EXHAUSTION_EXIT_HARD_STOP_PCT = float(os.environ.get("EXHAUSTION_EXIT_HARD_STOP_PCT", "-0.55"))
-SECTOR_EXIT_HARD_STOP_PCT = float(os.environ.get("SECTOR_EXIT_HARD_STOP_PCT", "-0.45"))
-LIQUIDATION_EXIT_HARD_STOP_PCT = float(os.environ.get("LIQUIDATION_EXIT_HARD_STOP_PCT", "-0.60"))
-EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "90"))
+EXIT_HARD_STOP_PCT = float(os.environ.get("EXIT_HARD_STOP_PCT", "-0.35"))
+FLOW_EXIT_HARD_STOP_PCT = float(os.environ.get("FLOW_EXIT_HARD_STOP_PCT", "-0.28"))
+EXHAUSTION_EXIT_HARD_STOP_PCT = float(os.environ.get("EXHAUSTION_EXIT_HARD_STOP_PCT", "-0.32"))
+SECTOR_EXIT_HARD_STOP_PCT = float(os.environ.get("SECTOR_EXIT_HARD_STOP_PCT", "-0.30"))
+LIQUIDATION_EXIT_HARD_STOP_PCT = float(os.environ.get("LIQUIDATION_EXIT_HARD_STOP_PCT", "-0.35"))
+EXIT_STALL_SECONDS = int(os.environ.get("EXIT_STALL_SECONDS", "35"))
 EXIT_STALL_MIN_PEAK_PCT = float(os.environ.get("EXIT_STALL_MIN_PEAK_PCT", "0.12"))
 EXIT_STALL_LOSS_PCT = float(os.environ.get("EXIT_STALL_LOSS_PCT", "-0.14"))
 EXIT_PROGRESS_EPS_PCT = float(os.environ.get("EXIT_PROGRESS_EPS_PCT", "0.03"))
-EXIT_MAX_HOLD_SECONDS = int(os.environ.get("EXIT_MAX_HOLD_SECONDS", "300"))
+EXIT_MAX_HOLD_SECONDS = int(os.environ.get("EXIT_MAX_HOLD_SECONDS", "75"))
 EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT = float(os.environ.get("EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT", "-0.20"))
 FUNDING_EXIT_TAKE_PROFIT_PCT = float(os.environ.get("FUNDING_EXIT_TAKE_PROFIT_PCT", "0.55"))
-FUNDING_EXIT_HARD_STOP_PCT = float(os.environ.get("FUNDING_EXIT_HARD_STOP_PCT", "-0.35"))
+FUNDING_EXIT_HARD_STOP_PCT = float(os.environ.get("FUNDING_EXIT_HARD_STOP_PCT", "-0.28"))
 FUNDING_EXIT_NORMAL_RATE_PCT = float(os.environ.get("FUNDING_EXIT_NORMAL_RATE_PCT", "0.035"))
 FUNDING_EXIT_MAX_HOLD_SECONDS = int(os.environ.get("FUNDING_EXIT_MAX_HOLD_SECONDS", "900"))
 EXIT_REVERSE_SCORE = float(os.environ.get("EXIT_REVERSE_SCORE", "70"))
 EXIT_HOLD_MIN_SCORE = float(os.environ.get("EXIT_HOLD_MIN_SCORE", "65"))
 EXIT_INVALID_SNAPSHOTS = int(os.environ.get("EXIT_INVALID_SNAPSHOTS", "2"))
 LOW_CONFIDENCE_PROB = float(os.environ.get("LOW_CONFIDENCE_PROB", "68"))
-LOW_CONFIDENCE_TAKE_PROFIT_USDT = float(os.environ.get("LOW_CONFIDENCE_TAKE_PROFIT_USDT", "0.01"))
+LOW_CONFIDENCE_TAKE_PROFIT_USDT = float(os.environ.get("LOW_CONFIDENCE_TAKE_PROFIT_USDT", "0.03"))
 POSITION_ADD_COOLDOWN_SECONDS = int(os.environ.get("POSITION_ADD_COOLDOWN_SECONDS", "45"))
 POSITION_MAX_ADDS = int(os.environ.get("POSITION_MAX_ADDS", "0"))
 POSITION_ADD_GROSS_LOSS_USDT = float(os.environ.get("POSITION_ADD_GROSS_LOSS_USDT", "0.03"))
-POSITION_PROFIT_FLOOR_USDT = float(os.environ.get("POSITION_PROFIT_FLOOR_USDT", "0.01"))
-POSITION_PROFIT_PULLBACK_USDT = float(os.environ.get("POSITION_PROFIT_PULLBACK_USDT", "0.02"))
+POSITION_PROFIT_FLOOR_USDT = float(os.environ.get("POSITION_PROFIT_FLOOR_USDT", "0.06"))
+POSITION_PROFIT_PULLBACK_USDT = float(os.environ.get("POSITION_PROFIT_PULLBACK_USDT", "0.04"))
 POSITION_UNSUPPORTED_GRACE_SECONDS = int(os.environ.get("POSITION_UNSUPPORTED_GRACE_SECONDS", "45"))
 FLOW_POSITION_UNSUPPORTED_GRACE_SECONDS = int(os.environ.get("FLOW_POSITION_UNSUPPORTED_GRACE_SECONDS", "25"))
 FLOW_MOMENTUM_MAX_MARGIN_MULT = float(os.environ.get("FLOW_MOMENTUM_MAX_MARGIN_MULT", "1.15"))
@@ -165,14 +168,25 @@ BANNED_LOW_LIQUIDITY = {
     "ALLOUSDT", "SLXUSDT", "BLUAIUSDT", "SKYAIUSDT", "CBRSUSDT",
 }
 MAJOR_SYMBOLS = {"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"}
-PRIMARY_AUTO_STRATEGIES = {"liquidity_sweep_reclaim"}
+PRIMARY_AUTO_STRATEGIES = {"main_flow_direction"}
+CURRENT_AUTO_STRATEGIES = {"main_flow_direction", "flow_momentum"}
 TEST_MORE_AUTO_STRATEGIES = {
+    "main_flow_direction",
     "liquidity_sweep_reclaim",
+    "flow_momentum",
+    "liquidation_reversal",
+    "flow_exhaustion_reversal",
+    "funding_reversion",
+}
+ONE_MINUTE_AUTO_STRATEGIES = {
+    "main_flow_direction",
 }
 STRATEGY_MODE_MAP = {
     "primary": PRIMARY_AUTO_STRATEGIES,
     "liquidity_sweep_reclaim": {"liquidity_sweep_reclaim"},
     "test_more": TEST_MORE_AUTO_STRATEGIES,
+    "one_minute": ONE_MINUTE_AUTO_STRATEGIES,
+    "current": CURRENT_AUTO_STRATEGIES,
 }
 LEGACY_STRATEGY_MODE_ALIASES = {
     "exhaustion_sector": "primary",
@@ -183,19 +197,21 @@ LEGACY_STRATEGY_MODE_ALIASES = {
     "liquidation_reversal": "primary",
 }
 STRATEGY_MODE_LABELS = {
-    "primary": "主信号：极端扫单反转",
+    "primary": "主信号：订单流方向",
     "liquidity_sweep_reclaim": "主信号：极端扫单反转",
-    "test_more": "主信号：极端扫单反转",
+    "test_more": "主信号+子信号：多策略测试",
+    "one_minute": "一分钟主信号：订单流方向",
+    "current": "当前策略：订单流高频稳健版",
 }
 
 
 def _strategy_mode() -> str:
-    mode = str(_testnet_config.get("strategy_mode") or "primary").strip()
+    mode = str(_testnet_config.get("strategy_mode") or "current").strip()
     if mode in STRATEGY_MODE_MAP:
         return mode
     if mode in LEGACY_STRATEGY_MODE_ALIASES:
         return LEGACY_STRATEGY_MODE_ALIASES[mode]
-    return "primary"
+    return "current"
 
 
 def _strategy_allowed_for_auto(strategy: str) -> bool:
@@ -204,7 +220,39 @@ def _strategy_allowed_for_auto(strategy: str) -> bool:
 
 
 def _strategy_mode_label() -> str:
-    return STRATEGY_MODE_LABELS.get(_strategy_mode(), STRATEGY_MODE_LABELS["primary"])
+    return STRATEGY_MODE_LABELS.get(_strategy_mode(), STRATEGY_MODE_LABELS["current"])
+
+
+def _reset_paper_state(reason: str = "") -> None:
+    global _paper_cash
+    _paper_cash = PAPER_STARTING_BALANCE
+    _paper_positions.clear()
+    _auto_positions.clear()
+    _trade_events.clear()
+    _trade_closes.clear()
+    _equity_curve.clear()
+    _entry_candidates.clear()
+    _trade_cooldown.clear()
+    _loss_cooldowns.clear()
+    _strategy_cooldowns.clear()
+    clear_trade_history()
+    if reason:
+        _event(reason, "info", event_type="info")
+
+
+def _reset_if_strategy_changed() -> None:
+    try:
+        current = ""
+        if os.path.exists(STRATEGY_VERSION_FILE):
+            with open(STRATEGY_VERSION_FILE, "r", encoding="utf-8") as handle:
+                current = handle.read().strip()
+        if current == STRATEGY_VERSION:
+            return
+        _reset_paper_state(f"策略已更新到 {STRATEGY_VERSION}，模拟盘战绩已归零")
+        with open(STRATEGY_VERSION_FILE, "w", encoding="utf-8") as handle:
+            handle.write(STRATEGY_VERSION)
+    except Exception as exc:  # noqa: BLE001
+        _event(f"策略版本记录失败：{exc}", "warn", event_type="warn")
 
 
 def _public_testnet_get(path: str, params: dict | None = None) -> dict:
@@ -261,6 +309,8 @@ def _signed_testnet_request(method: str, path: str, params: dict | None = None) 
 
 
 def _event(message: str, level: str = "info", **extra) -> None:
+    if str(extra.get("event_type") or "") == "skip" or "跳过" in str(message or ""):
+        return
     item = {"ts": int(time.time() * 1000), "message": message, "level": level, **extra}
     _trade_events.insert(0, item)
     del _trade_events[80:]
@@ -268,6 +318,9 @@ def _event(message: str, level: str = "info", **extra) -> None:
         log_trade_event(item)
     except Exception:
         pass
+
+
+_reset_if_strategy_changed()
 
 
 def _exchange_filters(symbol: str) -> dict:
@@ -439,14 +492,10 @@ def _market_quality_allows_auto(row: dict) -> bool:
 
 def _auto_signal_allowed_for_trade(row: dict) -> bool:
     strategy = str(row.get("strategy") or "").strip()
-    now_ms = int(time.time() * 1000)
+    one_minute = _strategy_mode() in {"one_minute", "current"}
     if not _strategy_allowed_for_auto(strategy):
         return False
     symbol = str(row.get("symbol") or "")
-    if now_ms < int(_loss_cooldowns.get(symbol, 0) or 0):
-        return False
-    if now_ms < int(_strategy_cooldowns.get(strategy, 0) or 0):
-        return False
     if not _market_quality_allows_auto(row):
         return False
     prob = _safe_float(row.get("forecast_5m_prob") or row.get("forecast_prob"))
@@ -454,66 +503,43 @@ def _auto_signal_allowed_for_trade(row: dict) -> bool:
     score = _safe_float(row.get("score"))
     volume_24h = _safe_float(row.get("volume_24h_usd") or row.get("volume_24h"))
     if strategy == "funding_reversion":
-        if prob < 62 or edge < 0.06:
+        if prob < (58 if one_minute else 62) or edge < (0.03 if one_minute else 0.06):
             return False
-        if symbol not in MAJOR_SYMBOLS and volume_24h and volume_24h < 120_000_000:
+        if symbol not in MAJOR_SYMBOLS and volume_24h and volume_24h < (70_000_000 if one_minute else 120_000_000):
             return False
     if strategy == "liquidity_sweep_reclaim":
-        if prob < 66 or edge < 0.14 or score < 70:
+        if prob < (63 if one_minute else 66) or edge < (0.06 if one_minute else 0.14) or score < (64 if one_minute else 70):
             return False
-    if _strategy_mode() != "test_more" and _opportunity_grade(row) == "C":
+    if strategy == "main_flow_direction":
+        if score < 54 or prob < 62 or edge < 0.08:
+            return False
+    if strategy == "flow_momentum":
+        if prob < 62 or edge < 0.08 or score < 62:
+            return False
+    if strategy == "liquidation_reversal":
+        if prob < 60 or edge < 0.03 or score < 62:
+            return False
+    if strategy == "flow_exhaustion_reversal":
+        if prob < 60 or edge < 0.03 or score < 62:
+            return False
+    if _strategy_mode() not in {"test_more", "one_minute"} and _opportunity_grade(row) == "C":
         return False
     return True
 
 
 def _confirmed_entry_rows(rows: list[dict], market_rows: list[dict] | None, now_ms: int) -> list[dict]:
     source = market_rows or rows or []
-    current: dict[str, dict] = {}
-    symbols_seen: set[str] = set()
+    confirmed: list[dict] = []
     for row in source:
         symbol = str(row.get("symbol") or "").strip()
         if not symbol:
             continue
-        symbols_seen.add(symbol)
         follow = row.get("follow")
         if follow not in {"FOLLOW_LONG", "FOLLOW_SHORT"}:
             continue
-        strategy = str(row.get("strategy") or "").strip()
         if not _auto_signal_allowed_for_trade(row):
             continue
-        current[_entry_key(symbol, str(follow), strategy)] = row
-
-    max_gap_ms = max(1, ENTRY_CONFIRM_MAX_GAP_SECONDS) * 1000
-    needed = max(1, ENTRY_CONFIRM_SNAPSHOTS)
-    snap_version = _market_snapshot_version if market_rows else now_ms
-    confirmed: list[dict] = []
-
-    for key, row in current.items():
-        prev = _entry_candidates.get(key) or {}
-        prev_version = int(prev.get("last_version") or 0)
-        last_seen = int(prev.get("last_seen") or 0)
-        if prev and prev_version == snap_version:
-            count = int(prev.get("count") or 0)
-        elif prev and now_ms - last_seen <= max_gap_ms:
-            count = int(prev.get("count") or 0) + 1
-        else:
-            count = 1
-        _entry_candidates[key] = {
-            "count": count,
-            "first_seen": int(prev.get("first_seen") or now_ms),
-            "last_seen": now_ms,
-            "last_version": snap_version,
-        }
-        if count >= needed:
-            confirmed.append({**row, "entry_confirm_count": count})
-
-    for key, item in list(_entry_candidates.items()):
-        if key in current:
-            continue
-        symbol = key.split("|", 1)[0]
-        if symbol in symbols_seen or now_ms - int(item.get("last_seen") or 0) > max_gap_ms:
-            _entry_candidates.pop(key, None)
-
+        confirmed.append({**row, "entry_confirm_count": 1})
     return confirmed
 
 
@@ -591,6 +617,10 @@ def _opportunity_margin_usdt(row: dict, account: dict, open_count: int) -> tuple
         target = min(target, base * FLOW_MOMENTUM_MAX_MARGIN_MULT)
         if grade == "A":
             grade = "B"
+    if strategy == "main_flow_direction":
+        target = min(target, base * 0.35)
+        if grade == "A":
+            grade = "B+"
     if strategy == "liquidity_sweep_reclaim":
         tier = str(row.get("test_tier") or row.get("signal_tier") or "core")
         target = min(target, base * (0.65 if tier == "probe" else 1.25))
@@ -603,35 +633,46 @@ def _opportunity_margin_usdt(row: dict, account: dict, open_count: int) -> tuple
 
 def _strategy_exit_plan(row: dict, strategy: str) -> dict:
     base_r = abs(_strategy_hard_stop_pct(strategy))
-    if strategy == "liquidity_sweep_reclaim":
-        r_pct = max(0.45, min(0.65, base_r))
+    one_minute = _strategy_mode() in {"one_minute", "current"}
+    if strategy == "main_flow_direction":
+        r_pct = 0.46 if one_minute else 0.90
         return {
             "stop_pct": -r_pct,
             "r_pct": r_pct,
-            "take_profit_pct": max(1.20, r_pct * 2.20),
-            "trail_arm_pct": max(0.60, r_pct * 0.80),
-            "fail_seconds": 45,
-            "timeout_seconds": 120,
+            "take_profit_pct": 0.74 if one_minute else 1.25,
+            "trail_arm_pct": 0.36 if one_minute else 0.85,
+            "fail_seconds": 22 if one_minute else 35,
+            "timeout_seconds": 70 if one_minute else 90,
+        }
+    if strategy == "liquidity_sweep_reclaim":
+        r_pct = max(0.24, min(0.42, base_r)) if one_minute else max(0.45, min(0.65, base_r))
+        return {
+            "stop_pct": -r_pct,
+            "r_pct": r_pct,
+            "take_profit_pct": max(0.38, r_pct * 1.55) if one_minute else max(1.20, r_pct * 2.20),
+            "trail_arm_pct": max(0.22, r_pct * 0.80) if one_minute else max(0.60, r_pct * 0.80),
+            "fail_seconds": 18 if one_minute else 45,
+            "timeout_seconds": 55 if one_minute else 120,
         }
     if strategy == "flow_exhaustion_reversal":
-        r_pct = max(0.85, min(1.25, base_r))
+        r_pct = max(0.28, min(0.45, base_r)) if one_minute else max(0.85, min(1.25, base_r))
         return {
             "stop_pct": -r_pct,
             "r_pct": r_pct,
-            "take_profit_pct": max(1.45, r_pct * 1.80),
-            "trail_arm_pct": max(0.85, r_pct),
-            "fail_seconds": 60,
-            "timeout_seconds": 120,
+            "take_profit_pct": max(0.42, r_pct * 1.45) if one_minute else max(1.45, r_pct * 1.80),
+            "trail_arm_pct": max(0.24, r_pct * 0.85) if one_minute else max(0.85, r_pct),
+            "fail_seconds": 20 if one_minute else 60,
+            "timeout_seconds": 60 if one_minute else 120,
         }
     if strategy == "liquidation_reversal":
-        r_pct = max(0.90, min(1.35, base_r))
+        r_pct = max(0.28, min(0.48, base_r)) if one_minute else max(0.90, min(1.35, base_r))
         return {
             "stop_pct": -r_pct,
             "r_pct": r_pct,
-            "take_profit_pct": max(1.25, r_pct * 1.50),
-            "trail_arm_pct": max(0.75, r_pct * 0.90),
-            "fail_seconds": 40,
-            "timeout_seconds": 75,
+            "take_profit_pct": max(0.40, r_pct * 1.45) if one_minute else max(1.25, r_pct * 1.50),
+            "trail_arm_pct": max(0.22, r_pct * 0.85) if one_minute else max(0.75, r_pct * 0.90),
+            "fail_seconds": 18 if one_minute else 40,
+            "timeout_seconds": 50 if one_minute else 75,
         }
     if strategy == "sector_lead_lag":
         r_pct = max(0.75, min(1.20, base_r))
@@ -643,19 +684,26 @@ def _strategy_exit_plan(row: dict, strategy: str) -> dict:
             "fail_seconds": 120,
             "timeout_seconds": 240,
         }
-    r_pct = max(0.80, base_r)
+    r_pct = max(0.24, min(0.40, base_r)) if one_minute else max(0.80, base_r)
     return {
         "stop_pct": -r_pct,
         "r_pct": r_pct,
-        "take_profit_pct": max(_safe_float(row.get("take_profit_pct")) or EXIT_TAKE_PROFIT_PCT, r_pct * 1.50),
-        "trail_arm_pct": max(_safe_float(row.get("trail_arm_pct")) or EXIT_PROFIT_ARM_PCT, r_pct),
-        "fail_seconds": 90,
-        "timeout_seconds": EXIT_MAX_HOLD_SECONDS,
+        "take_profit_pct": max(0.36, min(_safe_float(row.get("take_profit_pct")) or EXIT_TAKE_PROFIT_PCT, 0.75), r_pct * 1.35) if one_minute else max(_safe_float(row.get("take_profit_pct")) or EXIT_TAKE_PROFIT_PCT, r_pct * 1.50),
+        "trail_arm_pct": max(0.20, min(_safe_float(row.get("trail_arm_pct")) or EXIT_PROFIT_ARM_PCT, 0.55), r_pct * 0.80) if one_minute else max(_safe_float(row.get("trail_arm_pct")) or EXIT_PROFIT_ARM_PCT, r_pct),
+        "fail_seconds": 18 if one_minute else 90,
+        "timeout_seconds": 55 if one_minute else EXIT_MAX_HOLD_SECONDS,
     }
 
 
 def _paper_one_way_cost(notional: float) -> float:
     return max(0.0, float(notional)) * (TAKER_FEE_BPS + SLIPPAGE_BPS) / 10000
+
+
+def _min_net_profit_usdt(meta: dict | None = None) -> float:
+    margin = _safe_float((meta or {}).get("margin"), _order_margin_usdt())
+    notional = _safe_float((meta or {}).get("notional"), _order_notional_usdt(margin))
+    roundtrip_cost = _paper_one_way_cost(notional) * 2
+    return max(POSITION_PROFIT_FLOOR_USDT, LOW_CONFIDENCE_TAKE_PROFIT_USDT, roundtrip_cost * 1.35)
 
 
 def _paper_mark_price(symbol: str, fallback: float = 0) -> float:
@@ -915,6 +963,8 @@ def _strategy_hard_stop_pct(strategy: str) -> float:
         return FUNDING_EXIT_HARD_STOP_PCT
     if strategy == "flow_momentum":
         return FLOW_EXIT_HARD_STOP_PCT
+    if strategy == "main_flow_direction":
+        return FLOW_EXIT_HARD_STOP_PCT
     if strategy == "liquidity_sweep_reclaim":
         return -1.05
     if strategy == "flow_exhaustion_reversal":
@@ -1044,10 +1094,7 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
         meta["last_favorable_at"] = now_ms
 
     strategy = str(meta.get("strategy") or "flow_momentum")
-    hard_stop_pct = _safe_float(meta.get("exit_stop_pct")) or _strategy_hard_stop_pct(strategy)
-    if pnl_pct <= hard_stop_pct:
-        return f"止损平仓 {pnl_pct:.2f}%"
-
+    min_profit = _min_net_profit_usdt(meta)
     if strategy == "funding_reversion" and pnl_pct >= FUNDING_EXIT_TAKE_PROFIT_PCT:
         return f"费率回归止盈 {pnl_pct:.2f}%"
 
@@ -1072,52 +1119,57 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
     if age_ms < EXIT_MIN_HOLD_SECONDS * 1000:
         return None
 
+    stop_pct = -abs(_safe_float(meta.get("exit_stop_pct")) or abs(_strategy_hard_stop_pct(strategy)))
+    if pnl_pct <= stop_pct:
+        return f"小亏止损，当前 {pnl_pct:.2f}% · 保护本金"
+
     strategy_failure = _strategy_failure_exit_reason(strategy, side, snap, meta, age_ms, pnl_pct, peak_pct, reverse, would_open)
     if strategy_failure:
-        return strategy_failure
+        if pnl >= min_profit or pnl_pct <= max(stop_pct * 0.65, -0.18):
+            return strategy_failure
 
-    if not would_open and pnl >= POSITION_PROFIT_FLOOR_USDT:
+    if not would_open and pnl >= min_profit:
         return f"当前不再触发开仓，净利落袋 {pnl:+.2f} USDT"
 
     entry_prob = _safe_float(meta.get("forecast_prob"))
     if (
         entry_prob > 0
         and entry_prob <= LOW_CONFIDENCE_PROB
-        and pnl >= LOW_CONFIDENCE_TAKE_PROFIT_USDT
+        and pnl >= min_profit
         and (not snap_fresh or reverse or not supported)
     ):
         return f"低置信微利平仓，预测 {entry_prob:.1f}% · 净利 {pnl:+.2f} USDT"
 
     if strategy == "funding_reversion" and snap_fresh:
         funding_rate = _safe_float(snap.get("funding_rate"))
-        can_exit_on_normalized_funding = pnl >= POSITION_PROFIT_FLOOR_USDT or age_ms >= 180 * 1000
+        can_exit_on_normalized_funding = pnl >= min_profit
         if side == "LONG" and funding_rate >= -FUNDING_EXIT_NORMAL_RATE_PCT and can_exit_on_normalized_funding:
             return f"负资金费回归平仓，当前 {funding_rate:.4f}%"
         if side == "SHORT" and funding_rate <= FUNDING_EXIT_NORMAL_RATE_PCT and can_exit_on_normalized_funding:
             return f"正资金费回归平仓，当前 {funding_rate:.4f}%"
-        if reverse and pnl_pct <= EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT:
-            return f"费率单被动量反穿平仓，当前 {pnl_pct:.2f}%"
+        if reverse and pnl >= min_profit:
+            return f"费率单被动量反穿盈利平仓，当前 {pnl_pct:.2f}%"
 
-    if would_open and peak_pnl >= POSITION_PROFIT_FLOOR_USDT and pnl >= POSITION_PROFIT_FLOOR_USDT and peak_pnl - pnl >= POSITION_PROFIT_PULLBACK_USDT:
+    if would_open and peak_pnl >= min_profit and pnl >= min_profit and peak_pnl - pnl >= POSITION_PROFIT_PULLBACK_USDT:
         return f"仍支持持仓但盈利回撤平仓，最高净利 {peak_pnl:+.2f} 回落到 {pnl:+.2f} USDT"
 
-    if peak_pct >= trail_arm_pct and pnl_pct <= max(0.0, peak_pct * EXIT_TRAIL_KEEP_RATIO):
+    if peak_pct >= trail_arm_pct and pnl_pct <= max(0.12, peak_pct * EXIT_TRAIL_KEEP_RATIO):
         return f"移动止盈平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
     r_pct = _safe_float(meta.get("exit_r_pct"))
     if r_pct > 0 and peak_pct >= r_pct and pnl_pct <= max(0.05, r_pct * 0.25):
         return f"1R回吐保护平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
-    if peak_pct >= EXIT_BREAKEVEN_ARM_PCT and pnl_pct <= EXIT_BREAKEVEN_FLOOR_PCT:
+    if peak_pct >= EXIT_BREAKEVEN_ARM_PCT and pnl_pct <= max(0.08, EXIT_BREAKEVEN_FLOOR_PCT):
         return f"浮盈回吐保护平仓，最高 {peak_pct:.2f}% 回落到 {pnl_pct:.2f}%"
 
     if (
         snap_fresh
         and invalid_count >= EXIT_INVALID_SNAPSHOTS
         and strategy != "funding_reversion"
-        and pnl_pct <= EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT
+        and pnl >= min_profit
     ):
-        return f"当前策略连续 {invalid_count} 次不支持持仓，平仓"
+        return f"当前策略连续 {invalid_count} 次不支持持仓，盈利平仓"
 
     progress_age_ms = now_ms - int(meta.get("last_progress_at") or opened_at)
     unsupported_grace_ms = _strategy_unsupported_grace_seconds(strategy) * 1000
@@ -1128,33 +1180,25 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
             unsupported_since = now_ms
     else:
         meta.pop("unsupported_since", None)
-    if (
-        not would_open
-        and pnl < 0
-        and age_ms >= unsupported_grace_ms
-        and now_ms - unsupported_since >= unsupported_grace_ms
-    ):
-        return f"不再触发开仓且亏损超时平仓，净利 {pnl:+.2f} USDT"
-
     if age_ms >= EXIT_STALL_SECONDS * 1000 and peak_pct < EXIT_STALL_MIN_PEAK_PCT and snap_fresh:
-        if reverse:
+        if reverse and pnl >= min_profit:
             return f"走势转弱平仓，最高浮盈 {peak_pct:.2f}%"
-        if not supported and pnl_pct <= EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT:
+        if not supported and pnl >= min_profit:
             return f"信号衰减平仓，最高浮盈 {peak_pct:.2f}%"
-        if progress_age_ms >= EXIT_STALL_SECONDS * 1000 and pnl_pct <= EXIT_STALL_LOSS_PCT:
-            return f"无进展且浮亏平仓，当前 {pnl_pct:.2f}%"
 
-    if strategy == "funding_reversion" and age_ms >= FUNDING_EXIT_MAX_HOLD_SECONDS * 1000:
+    if strategy == "funding_reversion" and age_ms >= FUNDING_EXIT_MAX_HOLD_SECONDS * 1000 and pnl >= min_profit:
         return f"费率回归到时平仓，持仓 {int(age_ms / 1000)} 秒，最高浮盈 {peak_pct:.2f}%"
 
     if age_ms >= EXIT_MAX_HOLD_SECONDS * 1000:
-        if snap_fresh and supported and pnl_pct >= EXIT_MAX_HOLD_SUPPORT_FLOOR_PCT:
-            return None
-        return f"持仓信号衰减平仓，持仓 {int(age_ms / 1000)} 秒，最高浮盈 {peak_pct:.2f}%"
+        if pnl >= min_profit:
+            return f"持仓到时盈利平仓，持仓 {int(age_ms / 1000)} 秒，最高浮盈 {peak_pct:.2f}%"
+        if not would_open and pnl_pct <= -0.08:
+            return f"持仓到时且信号失效，小亏退出 {pnl_pct:.2f}%"
+        return None
 
     close_ms = float(_testnet_config["auto_close_minutes"]) * 60 * 1000
-    if not snap_fresh and age_ms >= close_ms:
-        return "缺少新策略快照，到时自动平仓"
+    if not snap_fresh and age_ms >= close_ms and pnl >= min_profit:
+        return "缺少新策略快照，到时盈利平仓"
 
     return None
 
@@ -1230,6 +1274,8 @@ def _close_due_positions(account: dict | None = None) -> None:
                 else:
                     order = _close_position(symbol, close_amount)
                 realized = _safe_float(order.get("realizedPnl")) if isinstance(order, dict) else 0.0
+                fee = _safe_float(order.get("entryCost")) + _safe_float(order.get("exitCost")) if isinstance(order, dict) else 0.0
+                gross_realized = _safe_float(order.get("grossPnl"), realized + fee) if isinstance(order, dict) else realized
                 close_ratio = _safe_float(order.get("closedRatio"), 0.5) if isinstance(order, dict) else 0.5
                 remain_ratio = max(0.0, 1.0 - close_ratio)
                 meta["partial_taken"] = True
@@ -1243,6 +1289,8 @@ def _close_due_positions(account: dict | None = None) -> None:
                     "ts": now_ms,
                     "symbol": symbol,
                     "realized": realized,
+                    "fee": fee,
+                    "gross_realized": gross_realized,
                     "strategy": meta.get("strategy"),
                     "strategy_label": meta.get("strategy_label"),
                     "main_signal": meta.get("main_signal"),
@@ -1257,7 +1305,7 @@ def _close_due_positions(account: dict | None = None) -> None:
                     log_trade_close(close_item)
                 except Exception:
                     pass
-                extra = f" · 已实现 {realized:+.2f} USDT" if realized else ""
+                extra = f" · 手续费 {fee:.4f} USDT · 净利 {realized:+.4f} USDT" if isinstance(order, dict) else f" · 净利 {realized:+.4f} USDT"
                 _event(
                     f"{symbol} {partial_reason}{extra}",
                     "info",
@@ -1284,10 +1332,14 @@ def _close_due_positions(account: dict | None = None) -> None:
             else:
                 order = _close_position(symbol, float(pos["amount"]))
             realized = _safe_float(order.get("realizedPnl")) if isinstance(order, dict) else 0.0
+            fee = _safe_float(order.get("entryCost")) + _safe_float(order.get("exitCost")) if isinstance(order, dict) else 0.0
+            gross_realized = _safe_float(order.get("grossPnl"), realized + fee) if isinstance(order, dict) else realized
             close_item = {
                 "ts": now_ms,
                 "symbol": symbol,
                 "realized": realized,
+                "fee": fee,
+                "gross_realized": gross_realized,
                 "strategy": meta.get("strategy"),
                 "strategy_label": meta.get("strategy_label"),
                 "main_signal": meta.get("main_signal"),
@@ -1303,7 +1355,7 @@ def _close_due_positions(account: dict | None = None) -> None:
                 log_trade_close(close_item)
             except Exception:
                 pass
-            extra = f" · 已实现 {realized:+.2f} USDT" if realized else ""
+            extra = f" · 手续费 {fee:.4f} USDT · 净利 {realized:+.4f} USDT" if isinstance(order, dict) else f" · 净利 {realized:+.4f} USDT"
             _event(
                 f"{symbol} {reason}{extra}",
                 "info",
@@ -1353,7 +1405,12 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                 _event(f"{symbol} 跳过：持仓数量已达上限", "warn", symbol=symbol)
                 continue
             cooldown_key = f"{symbol}|{follow}"
-            if now_ms - _trade_cooldown.get(cooldown_key, 0) < int(_testnet_config["cooldown_seconds"]) * 1000:
+            symbol_cooldown_key = f"{symbol}|*"
+            cooldown_seconds = max(20, int(_testnet_config["cooldown_seconds"]))
+            if cooldown_seconds and (
+                now_ms - _trade_cooldown.get(cooldown_key, 0) < cooldown_seconds * 1000
+                or now_ms - _trade_cooldown.get(symbol_cooldown_key, 0) < cooldown_seconds * 1000
+            ):
                 continue
             if symbol in BANNED_LOW_LIQUIDITY:
                 _event(f"{symbol} 跳过：流动性过低", "warn", symbol=symbol)
@@ -1372,6 +1429,7 @@ def _auto_trade_signals(rows: list[dict], prices: dict[str, float], market_rows:
                     _set_leverage(symbol)
                     order = _place_market_order(symbol, follow, price, order_margin)
                 _trade_cooldown[cooldown_key] = now_ms
+                _trade_cooldown[symbol_cooldown_key] = now_ms
                 _entry_candidates.pop(_entry_key(symbol, str(follow), strategy), None)
                 _auto_positions[symbol] = {
                     "follow": follow,
@@ -1432,7 +1490,10 @@ def _public_testnet_status() -> dict:
         persisted_events = get_trade_events(300)
     except Exception:
         persisted_events = []
-    events = persisted_events or _trade_events[:300]
+    events = [
+        item for item in (persisted_events or _trade_events[:300])
+        if str(item.get("event_type") or "") not in {"skip", "info"} and "跳过" not in str(item.get("message") or "")
+    ]
     wins = [item for item in closes if _safe_float(item.get("realized")) > 0]
     losses = [item for item in closes if _safe_float(item.get("realized")) < 0]
     gross_win = sum(_safe_float(item.get("realized")) for item in wins)
@@ -1508,6 +1569,7 @@ def _public_testnet_status() -> dict:
         "wins": len(wins),
         "losses": len(losses),
         "net": sum(_safe_float(item.get("realized")) for item in closes),
+        "fees": sum(_safe_float(item.get("fee")) for item in closes),
         "win_rate": (len(wins) / len(closes) * 100) if closes else 0,
         "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else (gross_win if gross_win > 0 else 0),
         "avg_win": (gross_win / len(wins)) if wins else 0,
@@ -1792,7 +1854,8 @@ HTML = r"""
     .trade-detail-table th:nth-child(5){width:72px}
     .trade-detail-table th:nth-child(6){width:96px}
     .trade-detail-table th:nth-child(7){width:86px}
-    .trade-detail-table th:nth-child(8){width:360px}
+    .trade-detail-table th:nth-child(8){width:86px}
+    .trade-detail-table th:nth-child(9){width:340px}
     .trade-detail-row.win { background:#f5fbf7; }
     .trade-detail-row.loss { background:#fff7f7; }
     .api-help { grid-column:1/-1; color:var(--muted); font-size:11px; line-height:1.45; margin-top:-2px; }
@@ -1896,10 +1959,7 @@ HTML = r"""
             <label>杠杆<input id="tradeLeverage" type="number" min="1" max="20" step="1" value="4"></label>
             <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="15"></label>
             <label>平仓分钟<input id="autoCloseMinutes" type="number" min="1" step="1" value="5"></label>
-            <label class="wide">策略模式<select id="strategyMode">
-              <option value="test_more">主信号：极端扫单反转</option>
-              <option value="primary">主信号：极端扫单反转</option>
-            </select></label>
+            <label class="wide">当前策略<input id="strategyModeLabel" type="text" value="当前策略：订单流高频稳健版" readonly><input id="strategyMode" type="hidden" value="current"></label>
           </div>
           <div class="trade-actions">
             <label class="toggle"><input id="autoTradeToggle" type="checkbox">FOLLOW 自动下单</label>
@@ -1964,8 +2024,8 @@ HTML = r"""
       <div class="trade-breakdown" id="tradeBreakdown"></div>
       <div class="full-trade-table-wrap">
         <table class="trade-detail-table">
-          <thead><tr><th>#</th><th>时间</th><th>币种</th><th>信号</th><th>等级</th><th>保证金</th><th>盈亏</th><th>平仓原因</th></tr></thead>
-          <tbody id="fullTradeBody"><tr><td colspan="8">等待交易明细。</td></tr></tbody>
+          <thead><tr><th>#</th><th>时间</th><th>币种</th><th>信号</th><th>等级</th><th>保证金</th><th>手续费</th><th>净利</th><th>平仓原因</th></tr></thead>
+          <tbody id="fullTradeBody"><tr><td colspan="9">等待交易明细。</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -2524,6 +2584,29 @@ HTML = r"""
       const liquidationSetup=liquidationReversalSetup(symbol,p1,p5,f60,l5,cm,d,mb,threshold);
       const sectorSetup=sectorLeadLagSetup(symbol,p1,p5,f60,f5,cm,mb,threshold);
       const exhaustionSetup=flowExhaustionSetup(symbol,p1,p5,f60,f5,cm,d,mb,threshold);
+      const mainTrendLong=score>=56&&directionGap>=5&&forecastLong&&forecast.netEdgePct>=0.08&&flowLong&&f60.net>threshold*0.34&&f5.total>=threshold*1.35&&p1>=0.00&&p3>=0.03&&p5>=0.04&&repeatLong&&volumeOk&&marketOkLong&&btcOkLong&&spreadOk&&!chaseLong&&closeLocation>=0.52;
+      const mainTrendShort=score>=56&&directionGap>=5&&forecastShort&&forecast.netEdgePct>=0.08&&flowShort&&Math.abs(f60.net)>threshold*0.34&&f5.total>=threshold*1.35&&p1<=0.00&&p3<=-0.03&&p5<=-0.04&&repeatShort&&volumeOk&&marketOkShort&&btcOkShort&&spreadOk&&!chaseShort&&closeLocation<=0.48;
+      const mainRevertLong=score>=58&&p1<=-0.06&&p1>=-0.34&&p3<=-0.12&&p3>=-0.75&&f60.net>threshold*0.30&&f60.buyCount>=2&&f5.net>-threshold*0.35&&closeLocation>=0.58&&closeLocation<=0.82&&marketOkLong&&btcOkLong&&spreadOk&&bookLongOk;
+      const mainRevertShort=score>=58&&p1>=0.06&&p1<=0.34&&p3>=0.12&&p3<=0.75&&f60.net<-threshold*0.30&&f60.sellCount>=2&&f5.net<threshold*0.35&&closeLocation>=0.18&&closeLocation<=0.42&&marketOkShort&&btcOkShort&&spreadOk&&bookShortOk;
+      const mainSetup=mainTrendLong ? {
+        follow:"FOLLOW_LONG", side:"LONG", label:"主多",
+        strategy:"main_flow_direction", strategyLabel:"订单流顺势",
+        score:Math.max(score,64), reason:"价格与主动买流同步，主信号顺势多",
+      } : (mainTrendShort ? {
+        follow:"FOLLOW_SHORT", side:"SHORT", label:"主空",
+        strategy:"main_flow_direction", strategyLabel:"订单流顺势",
+        score:Math.max(score,64), reason:"价格与主动卖流同步，主信号顺势空",
+      } : (mainRevertLong ? {
+        follow:"FOLLOW_LONG", side:"LONG", label:"回归多",
+        strategy:"main_flow_direction", strategyLabel:"主信号方向",
+        score:Math.max(score,62), reason:"短线急跌后出现主动买承接，主信号做回归多",
+      } : (mainRevertShort ? {
+        follow:"FOLLOW_SHORT", side:"SHORT", label:"回归空",
+        strategy:"main_flow_direction", strategyLabel:"主信号方向",
+        score:Math.max(score,62), reason:"短线急拉后出现主动卖压，主信号做回归空",
+      } : null));
+      const scalpLong=MICRO.enableMomentum&&signal==="LONG"&&score>=56&&directionGap>=4&&forecastLong&&forecast.prob5>=58&&forecast.netEdgePct>=0.03&&profitOk&&flowLong&&f60.net>threshold*0.28&&f5.total>=threshold*1.15&&testMomentumLong&&repeatLong&&volumeOk&&marketOkLong&&btcOkLong&&spreadOk&&!chaseLong;
+      const scalpShort=MICRO.enableMomentum&&signal==="SHORT"&&score>=56&&directionGap>=4&&forecastShort&&forecast.prob5>=58&&forecast.netEdgePct>=0.03&&profitOk&&flowShort&&Math.abs(f60.net)>threshold*0.28&&f5.total>=threshold*1.15&&testMomentumShort&&repeatShort&&volumeOk&&marketOkShort&&btcOkShort&&spreadOk&&!chaseShort;
       const momentumSetup=alignedLong ? {
         follow:"FOLLOW_LONG", side:"LONG", label:"策略多",
         strategy:"flow_momentum", strategyLabel:"大单顺势",
@@ -2532,9 +2615,17 @@ HTML = r"""
         follow:"FOLLOW_SHORT", side:"SHORT", label:"策略空",
         strategy:"flow_momentum", strategyLabel:"大单顺势",
         score:Math.max(score,76), reason:"大单顺势空，强流确认",
-      } : null);
+      } : (scalpLong ? {
+        follow:"FOLLOW_LONG", side:"LONG", label:"一分钟多",
+        strategy:"flow_momentum", strategyLabel:"一分钟顺势",
+        score:Math.max(score,64), reason:"1m/3m 价格和 60s 资金同向，短线顺势测试",
+      } : (scalpShort ? {
+        follow:"FOLLOW_SHORT", side:"SHORT", label:"一分钟空",
+        strategy:"flow_momentum", strategyLabel:"一分钟顺势",
+        score:Math.max(score,64), reason:"1m/3m 价格和 60s 资金同向，短线顺势测试",
+      } : null)));
       const fundingSetup=fundingReversionSetup(symbol,p1,p5,f60,cm,d,mb,signal,score,threshold);
-      const microSetup=sweepSetup||liquidationSetup||sectorSetup||exhaustionSetup||momentumSetup;
+      const microSetup=mainSetup||sweepSetup||liquidationSetup||sectorSetup||exhaustionSetup||momentumSetup;
       let follow=microSetup?microSetup.follow:"";
       let label=microSetup?microSetup.label:"";
       let strategy=microSetup?microSetup.strategy:"none";
@@ -2569,7 +2660,16 @@ HTML = r"""
         forecast.targets=dynamicTargets(cm,cost);
       }
       const risks=[];
-	      if(strategy==="funding_reversion"){
+	      if(strategy==="main_flow_direction"){
+	        if(follow==="FOLLOW_LONG"&&f5.net<0)risks.push("5m净流未同步");
+	        if(follow==="FOLLOW_SHORT"&&f5.net>0)risks.push("5m净流未同步");
+	        if(follow==="FOLLOW_LONG"&&p3<0)risks.push("3m价格未同步");
+	        if(follow==="FOLLOW_SHORT"&&p3>0)risks.push("3m价格未同步");
+	        if(follow==="FOLLOW_LONG"&&!btcOkLong)risks.push("BTC/ETH压制");
+	        if(follow==="FOLLOW_SHORT"&&!btcOkShort)risks.push("BTC/ETH反抽");
+	        if(!spreadOk)risks.push("点差过宽");
+	        if(cost.fundingPct>0)risks.push("资金费成本");
+	      }else if(strategy==="funding_reversion"){
 	        if(follow==="FOLLOW_LONG"&&f60.net<0&&Math.abs(f60.net)>=threshold)risks.push("短流反向");
 	        if(follow==="FOLLOW_SHORT"&&f60.net>0&&Math.abs(f60.net)>=threshold)risks.push("短流反向");
 	        if(cost.fundingPct>0)risks.push("资金费成本");
@@ -2629,6 +2729,7 @@ HTML = r"""
       }
       const reasons=[];
       if(microSetup)reasons.push(microSetup.reason);
+      if(strategy==="main_flow_direction")reasons.push("主信号宽口径：方向样本优先");
       if(strategy==="flow_momentum")reasons.push("Alpha过滤通过");
       if(strategy==="funding_reversion"&&fundingSetup)reasons.push(fundingSetup.reason);
       if(Math.abs(f60.net)>=threshold)reasons.push((f60.net>0?"主动买净流 ":"主动卖净流 ")+money(Math.abs(f60.net)));
@@ -2676,7 +2777,8 @@ HTML = r"""
     }
     function strategyBlockReason(row){
       if(!row||!row.strategy||!allowedStrategySet().has(row.strategy))return "当前策略模式不下单";
-      if(estimatedGrade(row)==="C")return "C级信号不下单";
+      const mode=state.testnet&&state.testnet.strategy_mode;
+      if(mode!=="one_minute"&&estimatedGrade(row)==="C")return "C级信号不下单";
       return "";
     }
     function strategyAllowed(row){ return !strategyBlockReason(row); }
@@ -2721,11 +2823,11 @@ HTML = r"""
     }
     function strategyAction(row){
       if(row.follow==="FOLLOW_LONG"){
-        const text=row.strategy==="liquidity_sweep_reclaim"?"自动测扫低收回":(row.strategy==="funding_reversion"?"自动测试费率多":(row.strategy==="liquidation_reversal"?"自动测爆仓反弹":(row.strategy==="sector_lead_lag"?"自动测跷跷板多":"自动测试做多")));
+        const text=row.strategy==="main_flow_direction"?"自动测主多":(row.strategy==="liquidity_sweep_reclaim"?"自动测扫低收回":(row.strategy==="funding_reversion"?"自动测试费率多":(row.strategy==="liquidation_reversal"?"自动测爆仓反弹":(row.strategy==="sector_lead_lag"?"自动测跷跷板多":"自动测试做多"))));
         return {text, cls:"long", order:"模拟盘将市价 BUY"};
       }
       if(row.follow==="FOLLOW_SHORT"){
-        const text=row.strategy==="liquidity_sweep_reclaim"?"自动测扫高收回":(row.strategy==="funding_reversion"?"自动测试费率空":(row.strategy==="liquidation_reversal"?"自动测爆仓回落":(row.strategy==="sector_lead_lag"?"自动测跷跷板空":"自动测试做空")));
+        const text=row.strategy==="main_flow_direction"?"自动测主空":(row.strategy==="liquidity_sweep_reclaim"?"自动测扫高收回":(row.strategy==="funding_reversion"?"自动测试费率空":(row.strategy==="liquidation_reversal"?"自动测爆仓回落":(row.strategy==="sector_lead_lag"?"自动测跷跷板空":"自动测试做空"))));
         return {text, cls:"short", order:"模拟盘将市价 SELL"};
       }
       if(row.follow==="WATCH_LONG")return {text:"观察多头", cls:"wait", order:"条件未齐，不下单"};
@@ -2938,7 +3040,7 @@ HTML = r"""
       const recentWins=recent.filter(x=>Number(x.realized||0)>0).length;
       const recentLosses=recent.filter(x=>Number(x.realized||0)<0).length;
       if(left)left.textContent=`最近 ${vals.length} 笔 · 胜 ${recentWins} / 负 ${recentLosses}`;
-      if(right){ right.textContent=`净利 ${net>=0?"+":""}${usdt(net)} · PF ${pf?pf.toFixed(2):"--"}`; right.className=net>=0?"up":"down"; }
+      if(right){ right.textContent=`净利 ${net>=0?"+":""}${usdt(net)} · 手续费 ${usdt(stats.fees||0)} · PF ${pf?pf.toFixed(2):"--"}`; right.className=net>=0?"up":"down"; }
     }
     function updateExecutionModeUi(mode){
       const isPaper=(mode||"paper")==="paper";
@@ -2966,9 +3068,20 @@ HTML = r"""
       const match=String(e.message||"").match(/已实现 ([+-]?\d+(?:\.\d+)?) USDT/);
       return match?Number(match[1]):null;
     }
+    function eventFee(e){
+      const close=e.close||{};
+      if(close.fee!==null&&close.fee!==undefined)return Number(close.fee||0);
+      const extra=e.extra_json||{};
+      if(extra.close&&extra.close.fee!==undefined)return Number(extra.close.fee||0);
+      const order=e.order_json||e.order||{};
+      const entry=Number(order.entryCost||0), exit=Number(order.exitCost||0);
+      return entry||exit?entry+exit:null;
+    }
     function renderTradeEvent(e){
       const type=eventTypeText(e.event_type,e.message);
+      if(!["开仓","平仓","半仓","加仓"].includes(type))return "";
       const realized=eventRealized(e);
+      const fee=eventFee(e);
       const isClose=type==="平仓"||type==="半仓";
       const win=realized!==null&&realized>=0;
       const cls=`trade-log-row ${type==="开仓"?"open":""} ${isClose?"close":""} ${isClose?(win?"win":"loss"):""}`;
@@ -2977,6 +3090,7 @@ HTML = r"""
         e.strategy_label||"",
         e.grade?e.grade+"级":"",
         e.margin?Number(e.margin).toFixed(2)+"U保证金":"",
+        fee!==null&&isClose?"手续费 "+fee.toFixed(4)+"U":"",
         e.main_signal||"",
       ].filter(Boolean).join(" · ");
       const pnl=realized===null?"":(realized>=0?"+":"")+realized.toFixed(2)+"U";
@@ -3020,7 +3134,7 @@ HTML = r"""
       const closes=(stats.recent||[]).slice(-200).reverse();
       if(note)note.textContent=`显示 ${closes.length} / ${stats.count||0} 笔平仓交易`;
       if(!closes.length){
-        body.innerHTML='<tr><td colspan="8">等待平仓交易。</td></tr>';
+        body.innerHTML='<tr><td colspan="9">等待平仓交易。</td></tr>';
         renderTradeBreakdown(stats);
         return;
       }
@@ -3029,6 +3143,7 @@ HTML = r"""
         const cls=realized>=0?"win":"loss";
         const symbol=(item.symbol||"--").replace("USDT","");
         const margin=item.margin!==null&&item.margin!==undefined?Number(item.margin||0).toFixed(2)+"U":"--";
+        const fee=item.fee!==null&&item.fee!==undefined?Number(item.fee||0).toFixed(4)+"U":"--";
         return `<tr class="trade-detail-row ${cls}">
           <td>${idx+1}</td>
           <td>${new Date(item.ts).toLocaleTimeString()}</td>
@@ -3036,6 +3151,7 @@ HTML = r"""
           <td>${esc(item.strategy_label||item.strategy||"--")}<div class="small">${esc(item.main_signal||"")}</div></td>
           <td>${esc(item.grade||"--")}</td>
           <td>${margin}</td>
+          <td>${fee}</td>
           <td class="${realized>=0?"up":"down"}">${realized>=0?"+":""}${usdt(realized)}</td>
           <td>${esc(item.reason||"--")}</td>
         </tr>`;
@@ -3055,7 +3171,8 @@ HTML = r"""
       document.getElementById("tradeLeverage").value=data.leverage||4;
       document.getElementById("maxPositions").value=data.max_positions||10;
       document.getElementById("autoCloseMinutes").value=data.auto_close_minutes||5;
-      document.getElementById("strategyMode").value=data.strategy_mode||"primary";
+      document.getElementById("strategyMode").value="current";
+      document.getElementById("strategyModeLabel").value=data.strategy_mode_label||"当前策略：订单流高频稳健版";
       updateExecutionModeUi(mode);
     }
     function renderTestnetStatus(data, forceForm=false){
@@ -3101,7 +3218,7 @@ HTML = r"""
         leverage:Number(document.getElementById("tradeLeverage").value||4),
         max_positions:Number(document.getElementById("maxPositions").value||10),
         auto_close_minutes:Number(document.getElementById("autoCloseMinutes").value||5),
-        strategy_mode:document.getElementById("strategyMode").value,
+        strategy_mode:"current",
       };
       const key=document.getElementById("testnetKey").value.trim();
       const secret=document.getElementById("testnetSecret").value.trim();
@@ -3287,7 +3404,7 @@ def testnet_config():
             _testnet_config["auto_trade"] = bool(payload.get("auto_trade"))
         if "strategy_mode" in payload:
             mode = str(payload.get("strategy_mode") or "primary").strip()
-            next_mode = mode if mode in STRATEGY_MODE_MAP else LEGACY_STRATEGY_MODE_ALIASES.get(mode, "primary")
+            next_mode = "current" if mode in STRATEGY_MODE_MAP or mode in LEGACY_STRATEGY_MODE_ALIASES else "current"
             if next_mode != _strategy_mode():
                 _entry_candidates.clear()
             _testnet_config["strategy_mode"] = next_mode
@@ -3300,13 +3417,14 @@ def testnet_config():
         ]:
             if key in payload:
                 try:
-                    _testnet_config[key] = max(1, cast(payload.get(key)))
+                    floor = 0 if key == "cooldown_seconds" else 1
+                    _testnet_config[key] = max(floor, cast(payload.get(key)))
                 except (TypeError, ValueError):
                     _testnet_config[key] = default
         if _is_paper_mode():
-            _event(f"本地模拟盘配置已更新 · 策略模式：{_strategy_mode_label()}", "info")
+            _event(f"本地模拟盘配置已更新 · 当前策略：{_strategy_mode_label()}", "info")
         elif _testnet_config.get("api_key") and _testnet_config.get("api_secret"):
-            _event(f"模拟盘配置已更新 · 策略模式：{_strategy_mode_label()}", "info")
+            _event(f"模拟盘配置已更新 · 当前策略：{_strategy_mode_label()}", "info")
         else:
             _event("模拟盘配置未完整：第一次连接需要 API Key 和 Secret", "warn")
     return jsonify(_public_testnet_status())
