@@ -53,7 +53,7 @@ TAKER_FEE_BPS = float(os.environ.get("TAKER_FEE_BPS", "5"))
 SLIPPAGE_BPS = float(os.environ.get("SLIPPAGE_BPS", "3"))
 SAFETY_EDGE_BPS = float(os.environ.get("SAFETY_EDGE_BPS", "8"))
 HOLD_MINUTES = float(os.environ.get("HOLD_MINUTES", "15"))
-STRATEGY_VERSION = "2026-06-07-flow-v2"
+STRATEGY_VERSION = "2026-06-07-4h-trend-v1"
 STRATEGY_VERSION_FILE = os.environ.get("STRATEGY_VERSION_FILE", ".strategy_version")
 
 BINANCE_WS = os.environ.get("BINANCE_WS", "wss://fstream.binance.com").rstrip("/")
@@ -194,11 +194,11 @@ LEGACY_STRATEGY_MODE_ALIASES = {
     "liquidation_reversal": "primary",
 }
 STRATEGY_MODE_LABELS = {
-    "primary": "主信号：VWAP趋势方向",
+    "primary": "主信号：4h突破趋势",
     "liquidity_sweep_reclaim": "主信号：极端扫单反转",
     "test_more": "主信号+子信号：多策略测试",
-    "one_minute": "一分钟主信号：VWAP趋势方向",
-    "current": "当前策略：VWAP趋势主信号",
+    "one_minute": "主信号：4h突破趋势",
+    "current": "当前策略：4h突破趋势",
 }
 
 
@@ -615,7 +615,7 @@ def _opportunity_margin_usdt(row: dict, account: dict, open_count: int) -> tuple
         if grade == "A":
             grade = "B"
     if strategy == "main_flow_direction":
-        target = min(target, base * 0.35)
+        target = min(target, base * 0.80)
         if grade == "A":
             grade = "B+"
     if strategy == "liquidity_sweep_reclaim":
@@ -632,14 +632,13 @@ def _strategy_exit_plan(row: dict, strategy: str) -> dict:
     base_r = abs(_strategy_hard_stop_pct(strategy))
     one_minute = _strategy_mode() in {"one_minute", "current"}
     if strategy == "main_flow_direction":
-        r_pct = 0.38 if one_minute else 0.90
         return {
-            "stop_pct": -r_pct,
-            "r_pct": r_pct,
-            "take_profit_pct": 0.58 if one_minute else 1.25,
-            "trail_arm_pct": 0.30 if one_minute else 0.85,
-            "fail_seconds": 22 if one_minute else 35,
-            "timeout_seconds": 70 if one_minute else 90,
+            "stop_pct": -12.0,
+            "r_pct": 99.0,
+            "take_profit_pct": 99.0,
+            "trail_arm_pct": 99.0,
+            "fail_seconds": 0,
+            "timeout_seconds": 0,
         }
     if strategy == "liquidity_sweep_reclaim":
         r_pct = max(0.24, min(0.42, base_r)) if one_minute else max(0.45, min(0.65, base_r))
@@ -1114,6 +1113,25 @@ def _exit_reason(symbol: str, pos: dict, meta: dict, now_ms: int) -> str | None:
         invalid_count = _track_hold_support(meta, supported, reverse, int(snap.get("version") or 0))
 
     if age_ms < EXIT_MIN_HOLD_SECONDS * 1000:
+        return None
+
+    if strategy == "main_flow_direction":
+        if not snap_fresh:
+            return None
+        price = _safe_float(snap.get("price")) or _paper_mark_price(symbol, _safe_float(meta.get("entry_price")))
+        channel_low = _safe_float(snap.get("channel_low_20"))
+        ema_gap = _safe_float(snap.get("ema_trend_gap_pct"))
+        btc_ema_gap = _safe_float(snap.get("btc_ema_trend_gap_pct"))
+        btc_ret24 = _safe_float(snap.get("btc_trend_ret_24h"))
+        btc_ret = _safe_float(snap.get("btc_5m_pct"))
+        if side == "LONG" and channel_low > 0 and price > 0 and price < channel_low:
+            return f"4h趋势破坏平仓，跌破20根低点 {pnl_pct:.2f}%"
+        if side == "LONG" and ema_gap < 0:
+            return f"4h EMA趋势转弱平仓，当前 {pnl_pct:.2f}%"
+        if side == "LONG" and btc_ema_gap < 0 and btc_ret24 < 0:
+            return f"BTC 4h风险关闭平仓，BTC24h {btc_ret24:.2f}% · 当前 {pnl_pct:.2f}%"
+        if side == "LONG" and btc_ret <= -1.8:
+            return f"BTC风险关闭平仓，BTC短线 {btc_ret:.2f}% · 当前 {pnl_pct:.2f}%"
         return None
 
     strategy_failure = _strategy_failure_exit_reason(strategy, side, snap, meta, age_ms, pnl_pct, peak_pct, reverse, would_open)
@@ -1941,7 +1959,7 @@ HTML = r"""
             <label>杠杆<input id="tradeLeverage" type="number" min="1" max="20" step="1" value="4"></label>
             <label>最多持仓<input id="maxPositions" type="number" min="1" max="20" step="1" value="15"></label>
             <label>平仓分钟<input id="autoCloseMinutes" type="number" min="1" step="1" value="5"></label>
-            <label class="wide">当前策略<input id="strategyModeLabel" type="text" value="当前策略：VWAP趋势主信号" readonly><input id="strategyMode" type="hidden" value="current"></label>
+            <label class="wide">当前策略<input id="strategyModeLabel" type="text" value="当前策略：4h突破趋势" readonly><input id="strategyMode" type="hidden" value="current"></label>
           </div>
           <div class="trade-actions">
             <label class="toggle"><input id="autoTradeToggle" type="checkbox">FOLLOW 自动下单</label>
@@ -2164,14 +2182,25 @@ HTML = r"""
       const ema9=ema(closes.slice(-24),9);
       const ema21=ema(closes.slice(-30),21);
       const ema9Prev=ema(closes.slice(-25,-1),9);
+      const ema24=ema(closes.slice(-80),24);
+      const ema48=ema(closes.slice(-120),48);
+      const ema96=ema(closes.slice(-160),96);
       const vwapRows=rows.slice(Math.max(0,rows.length-21));
       const vwapDen=vwapRows.reduce((sum,row)=>sum+Number(row.quoteVolume||0),0);
       const vwap=vwapDen ? vwapRows.reduce((sum,row)=>sum+((row.high+row.low+row.close)/3)*Number(row.quoteVolume||0),0)/vwapDen : null;
       const emaGapPct=ema9&&ema21 ? (ema9-ema21)/last.close*100 : null;
+      const emaTrendGapPct=ema48&&ema96 ? (ema48-ema96)/last.close*100 : null;
       const emaSlopePct=ema9&&ema9Prev ? (ema9-ema9Prev)/ema9Prev*100 : null;
       const vwapDistPct=vwap ? (last.close-vwap)/vwap*100 : null;
+      const channel55Rows=rows.slice(Math.max(0,rows.length-56),rows.length-1);
+      const channel20Rows=rows.slice(Math.max(0,rows.length-21),rows.length-1);
+      const high55=channel55Rows.length>=20?Math.max(...channel55Rows.map(row=>row.high)):null;
+      const low20=channel20Rows.length>=10?Math.min(...channel20Rows.map(row=>row.low)):null;
+      const ret24h=rows.length>=7&&rows[rows.length-7].close ? (last.close-rows[rows.length-7].close)/rows[rows.length-7].close*100 : null;
+      const ret72h=rows.length>=19&&rows[rows.length-19].close ? (last.close-rows[rows.length-19].close)/rows[rows.length-19].close*100 : null;
 	      return {
 	        volSpike: avgVol ? Number(last.quoteVolume||0)/avgVol : null,
+	        lastClose: last.close,
 	        rangePct,
 	        atrPct,
 	        breakout: last.close>high ? 1 : (last.close<low ? -1 : 0),
@@ -2192,10 +2221,18 @@ HTML = r"""
         rsi14,
         ema9,
         ema21,
+        ema24,
+        ema48,
+        ema96,
         emaGapPct,
+        emaTrendGapPct,
         emaSlopePct,
         vwap,
         vwapDistPct,
+        high55,
+        low20,
+        ret24h,
+        ret72h,
         ret15: first&&first.open ? (last.close-first.open)/first.open*100 : null,
       };
     }
@@ -2513,7 +2550,7 @@ HTML = r"""
     }
     async function fetchKlineSymbol(symbol){
       try{
-        const data=await fetchJson(`/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=1m&limit=30`);
+        const data=await fetchJson(`/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=4h&limit=180`);
         if(!Array.isArray(data))return;
         state.candles.set(symbol,data.map(row=>({
           openTime:Number(row[0]), open:Number(row[1]), high:Number(row[2]), low:Number(row[3]),
@@ -2522,7 +2559,8 @@ HTML = r"""
       }catch(_){}
     }
     async function fetchKlines(){
-      const targets=[...new Set([...rows().slice(0,28).map(row=>row.symbol),"BTCUSDT","ETHUSDT","SOLUSDT"].filter(symbol=>activeSet().has(symbol)))];
+      const positionSymbols=new Set(((state.testnet&&state.testnet.positions)||[]).map(pos=>pos.symbol));
+      const targets=[...new Set([...activeSymbols().slice(0,80),...positionSymbols,"BTCUSDT","ETHUSDT","SOLUSDT"].filter(symbol=>activeSet().has(symbol)))];
       for(let i=0;i<targets.length;i+=4) await Promise.all(targets.slice(i,i+4).map(fetchKlineSymbol));
       render();
     }
@@ -2605,31 +2643,22 @@ HTML = r"""
       const liquidationSetup=liquidationReversalSetup(symbol,p1,p5,f60,l5,cm,d,mb,threshold);
       const sectorSetup=sectorLeadLagSetup(symbol,p1,p5,f60,f5,cm,mb,threshold);
       const exhaustionSetup=flowExhaustionSetup(symbol,p1,p5,f60,f5,cm,d,mb,threshold);
-      const trend15=isNum(cm.ret15)?cm.ret15:p5;
-      const emaTrendLong=isNum(cm.emaGapPct)&&isNum(cm.emaSlopePct)&&cm.emaGapPct>=0.015&&cm.emaSlopePct>=-0.015;
-      const emaTrendShort=isNum(cm.emaGapPct)&&isNum(cm.emaSlopePct)&&cm.emaGapPct<=-0.015&&cm.emaSlopePct<=0.015;
-      const vwapLongOk=!isNum(cm.vwapDistPct)||(cm.vwapDistPct>=-0.22&&cm.vwapDistPct<=0.58);
-      const vwapShortOk=!isNum(cm.vwapDistPct)||(cm.vwapDistPct<=0.22&&cm.vwapDistPct>=-0.58);
-      const vwapPullbackLong=isNum(cm.vwapDistPct)&&cm.vwapDistPct>=-0.22&&cm.vwapDistPct<=0.18&&closeLocation>=0.52;
-      const vwapPullbackShort=isNum(cm.vwapDistPct)&&cm.vwapDistPct<=0.22&&cm.vwapDistPct>=-0.18&&closeLocation<=0.48;
-      const trendBaseLong=trend15>=0.16&&p5>=0.04&&p3>=-0.08&&emaTrendLong&&marketOkLong&&btcOkLong;
-      const trendBaseShort=trend15<=-0.16&&p5<=-0.04&&p3<=0.08&&emaTrendShort&&marketOkShort&&btcOkShort;
-      const triggerLong=f60.net>threshold*0.24&&f60.buyCount>=2&&f5.net>=-threshold*0.20&&repeatLong&&closeLocation>=0.50&&bookLongOk;
-      const triggerShort=f60.net<-threshold*0.24&&f60.sellCount>=2&&f5.net<=threshold*0.20&&repeatShort&&closeLocation<=0.50&&bookShortOk;
-      const notExtendedLong=p1<=0.30&&p5<=maxP5*0.92&&(!isNum(cm.rsi14)||cm.rsi14<=76)&&!chaseLong;
-      const notExtendedShort=p1>=-0.30&&p5>=-maxP5*0.92&&(!isNum(cm.rsi14)||cm.rsi14>=24)&&!chaseShort;
-      const volumeMainOk=isNum(cm.volSpike)?cm.volSpike>=0.62:f5.total>=threshold*1.05;
-      const mainTrendLong=score>=54&&directionGap>=4&&forecastLong&&forecast.netEdgePct>=0.05&&trendBaseLong&&triggerLong&&vwapLongOk&&volumeMainOk&&spreadOk&&oiLongOk&&notExtendedLong&&(vwapPullbackLong||p1>=-0.04);
-      const mainTrendShort=score>=54&&directionGap>=4&&forecastShort&&forecast.netEdgePct>=0.05&&trendBaseShort&&triggerShort&&vwapShortOk&&volumeMainOk&&spreadOk&&oiShortOk&&notExtendedShort&&(vwapPullbackShort||p1<=0.04);
+      const btcCm=candleMetrics("BTCUSDT");
+      const currentPrice=Number(state.prices.get(symbol)||cm.lastClose||0);
+      const btcRiskOn=MAJORS.has(symbol)||(
+        isNum(btcCm.emaTrendGapPct)&&btcCm.emaTrendGapPct>=0&&
+        isNum(btcCm.ret24h)&&btcCm.ret24h>=-1.0
+      );
+      const channelBreakout=isNum(cm.high55)&&currentPrice>cm.high55;
+      const trendStack=isNum(cm.emaTrendGapPct)&&cm.emaTrendGapPct>0&&isNum(cm.ret24h)&&cm.ret24h>0;
+      const notIlliquid=MAJORS.has(symbol)||Number((meta(symbol)||{}).quoteVolume||0)>=35000000;
+      const mainVolumeOk=isNum(cm.volSpike)?cm.volSpike>=0.70:true;
+      const mainTrendLong=channelBreakout&&trendStack&&btcRiskOn&&notIlliquid&&mainVolumeOk&&spreadOk&&bookLongOk;
       const mainSetup=mainTrendLong ? {
-        follow:"FOLLOW_LONG", side:"LONG", label:"趋势多",
-        strategy:"main_flow_direction", strategyLabel:"VWAP趋势",
-        score:Math.max(score,66), reason:"15m/5m趋势向上，价格在VWAP合理区，1m主动买流触发",
-      } : (mainTrendShort ? {
-        follow:"FOLLOW_SHORT", side:"SHORT", label:"趋势空",
-        strategy:"main_flow_direction", strategyLabel:"VWAP趋势",
-        score:Math.max(score,66), reason:"15m/5m趋势向下，价格在VWAP合理区，1m主动卖流触发",
-      } : null);
+        follow:"FOLLOW_LONG", side:"LONG", label:"4h突破多",
+        strategy:"main_flow_direction", strategyLabel:"4h突破趋势",
+        score:Math.max(score,72), reason:"4h价格突破55根高点，EMA48在EMA96上方，BTC风险过滤通过",
+      } : null;
       const scalpLong=MICRO.enableMomentum&&signal==="LONG"&&score>=56&&directionGap>=4&&forecastLong&&forecast.prob5>=58&&forecast.netEdgePct>=0.03&&profitOk&&flowLong&&f60.net>threshold*0.28&&f5.total>=threshold*1.15&&testMomentumLong&&repeatLong&&volumeOk&&marketOkLong&&btcOkLong&&spreadOk&&!chaseLong;
       const scalpShort=MICRO.enableMomentum&&signal==="SHORT"&&score>=56&&directionGap>=4&&forecastShort&&forecast.prob5>=58&&forecast.netEdgePct>=0.03&&profitOk&&flowShort&&Math.abs(f60.net)>threshold*0.28&&f5.total>=threshold*1.15&&testMomentumShort&&repeatShort&&volumeOk&&marketOkShort&&btcOkShort&&spreadOk&&!chaseShort;
       const momentumSetup=alignedLong ? {
@@ -2659,14 +2688,14 @@ HTML = r"""
         signal=microSetup.side;
         score=Math.max(score,microSetup.score);
         forecast.side=microSetup.side;
-        const minProb=microSetup.strategy==="liquidity_sweep_reclaim"?(microSetup.testTier==="probe"?67:74):(microSetup.strategy==="flow_momentum"?64:(microSetup.strategy==="main_flow_direction"?64:68));
+        const minProb=microSetup.strategy==="liquidity_sweep_reclaim"?(microSetup.testTier==="probe"?67:74):(microSetup.strategy==="flow_momentum"?64:(microSetup.strategy==="main_flow_direction"?72:68));
         forecast.prob5=Math.max(forecast.prob5,minProb);
-        const microExpected=Math.max(Math.abs(forecast.expected5Pct),microSetup.strategy==="liquidity_sweep_reclaim"?(microSetup.testTier==="probe"?0.58:0.90):(microSetup.strategy==="flow_momentum"?0.42:(microSetup.strategy==="main_flow_direction"?0.42:0.55)));
+        const microExpected=Math.max(Math.abs(forecast.expected5Pct),microSetup.strategy==="liquidity_sweep_reclaim"?(microSetup.testTier==="probe"?0.58:0.90):(microSetup.strategy==="flow_momentum"?0.42:(microSetup.strategy==="main_flow_direction"?2.20:0.55)));
         forecast.expected5Pct=microSetup.side==="LONG"?microExpected:-microExpected;
         cost=costModel(d,forecast.side);
         forecast.cost=cost;
         forecast.netEdgePct=Math.abs(forecast.expected5Pct)-cost.requiredPct;
-        forecast.targets={takeProfit:Math.max(microSetup.strategy==="flow_momentum"?1.05:1.20, dynamicTargets(cm,cost).takeProfit), trailArm:Math.max(0.60, dynamicTargets(cm,cost).trailArm)};
+        forecast.targets=microSetup.strategy==="main_flow_direction"?{takeProfit:99,trailArm:99}:({takeProfit:Math.max(microSetup.strategy==="flow_momentum"?1.05:1.20, dynamicTargets(cm,cost).takeProfit), trailArm:Math.max(0.60, dynamicTargets(cm,cost).trailArm)});
       }
       if(!follow&&fundingSetup){
         follow=fundingSetup.follow;
@@ -2686,16 +2715,10 @@ HTML = r"""
       }
       const risks=[];
 	      if(strategy==="main_flow_direction"){
-	        if(follow==="FOLLOW_LONG"&&f5.net<0)risks.push("5m净流未同步");
-	        if(follow==="FOLLOW_SHORT"&&f5.net>0)risks.push("5m净流未同步");
-	        if(follow==="FOLLOW_LONG"&&p3<0)risks.push("3m价格未同步");
-	        if(follow==="FOLLOW_SHORT"&&p3>0)risks.push("3m价格未同步");
-	        if(follow==="FOLLOW_LONG"&&isNum(cm.vwapDistPct)&&cm.vwapDistPct>0.58)risks.push("离VWAP过远");
-	        if(follow==="FOLLOW_SHORT"&&isNum(cm.vwapDistPct)&&cm.vwapDistPct<-0.58)risks.push("离VWAP过远");
-	        if(follow==="FOLLOW_LONG"&&isNum(cm.emaGapPct)&&cm.emaGapPct<0)risks.push("EMA趋势未站上");
-	        if(follow==="FOLLOW_SHORT"&&isNum(cm.emaGapPct)&&cm.emaGapPct>0)risks.push("EMA趋势未跌破");
-	        if(follow==="FOLLOW_LONG"&&!btcOkLong)risks.push("BTC/ETH压制");
-	        if(follow==="FOLLOW_SHORT"&&!btcOkShort)risks.push("BTC/ETH反抽");
+	        if(follow==="FOLLOW_LONG"&&isNum(cm.high55)&&currentPrice<=cm.high55)risks.push("未突破4h 55高点");
+	        if(follow==="FOLLOW_LONG"&&isNum(cm.emaTrendGapPct)&&cm.emaTrendGapPct<=0)risks.push("4h EMA趋势未转强");
+	        if(follow==="FOLLOW_LONG"&&isNum(cm.ret24h)&&cm.ret24h<=0)risks.push("24h动量不足");
+	        if(follow==="FOLLOW_LONG"&&!btcRiskOn)risks.push("BTC风险过滤未通过");
 	        if(!spreadOk)risks.push("点差过宽");
 	        if(cost.fundingPct>0)risks.push("资金费成本");
 	      }else if(strategy==="funding_reversion"){
@@ -2758,7 +2781,7 @@ HTML = r"""
       }
       const reasons=[];
       if(microSetup)reasons.push(microSetup.reason);
-      if(strategy==="main_flow_direction")reasons.push("主信号：VWAP/EMA趋势方向");
+      if(strategy==="main_flow_direction")reasons.push("主信号：4h Donchian 突破趋势");
       if(strategy==="flow_momentum")reasons.push("Alpha过滤通过");
       if(strategy==="funding_reversion"&&fundingSetup)reasons.push(fundingSetup.reason);
       if(Math.abs(f60.net)>=threshold)reasons.push((f60.net>0?"主动买净流 ":"主动卖净流 ")+money(Math.abs(f60.net)));
@@ -2767,8 +2790,10 @@ HTML = r"""
       if(isNum(cm.volSpike))reasons.push("量能 "+cm.volSpike.toFixed(1)+"x");
       if(Math.abs(p5)>=0.25)reasons.push("5m价格 "+(p5>0?"+":"")+p5.toFixed(2)+"%");
       if(isNum(cm.closeLocation))reasons.push("收盘位置 "+Math.round(cm.closeLocation*100)+"%");
-      if(isNum(cm.vwapDistPct))reasons.push("距VWAP "+(cm.vwapDistPct>0?"+":"")+cm.vwapDistPct.toFixed(2)+"%");
-      if(isNum(cm.emaGapPct))reasons.push("EMA差 "+(cm.emaGapPct>0?"+":"")+cm.emaGapPct.toFixed(3)+"%");
+      if(isNum(cm.high55))reasons.push("4h通道高点 "+price(cm.high55));
+      if(isNum(cm.low20))reasons.push("4h退出低点 "+price(cm.low20));
+      if(isNum(cm.emaTrendGapPct))reasons.push("4h EMA差 "+(cm.emaTrendGapPct>0?"+":"")+cm.emaTrendGapPct.toFixed(3)+"%");
+      if(isNum(cm.ret24h))reasons.push("24h动量 "+(cm.ret24h>0?"+":"")+cm.ret24h.toFixed(2)+"%");
       if(isNum(d.oi15Pct)&&Math.abs(d.oi15Pct)>=1.2)reasons.push("OI15m "+(d.oi15Pct>0?"+":"")+d.oi15Pct.toFixed(2)+"%");
       if(isNum(d.oi5Pct)&&Math.abs(d.oi5Pct)>=0.08)reasons.push("OI5m "+(d.oi5Pct>0?"+":"")+d.oi5Pct.toFixed(2)+"%");
       if(isNum(d.takerRatio)&&(d.takerRatio>=1.12||d.takerRatio<=0.9))reasons.push("Taker "+d.takerRatio.toFixed(2));
@@ -2788,7 +2813,7 @@ HTML = r"""
       const signalVariant=rawFollow&&follow!==rawFollow?"inverted":"primary";
       const mainSignal=strategy==="flow_momentum"&&signalVariant==="inverted"?"flow_momentum_inverted":strategy;
       if(!follow){ follow=signal==="LONG"?"WATCH_LONG":signal==="SHORT"?"WATCH_SHORT":"WAIT"; label=follow==="WATCH_LONG"?"多头异动":follow==="WATCH_SHORT"?"空头异动":"观察"; }
-      return {symbol,base:base(symbol),price:state.prices.get(symbol)||0,p1,p3,p5,f60,f5,l5,d,m:meta(symbol),cm,mb,threshold,signal,score,follow,label,strategy,strategyLabel,mainSignal,signalVariant,rawFollow,rawLabel,rawStrategy,rawStrategyLabel,rawForecast,forecast,cost,risks,reasons,sweepSide:microSetup&&microSetup.sweepSide,reclaimLevel:microSetup&&microSetup.reclaimLevel,sweepDepthPct:microSetup&&microSetup.sweepDepthPct,testTier:microSetup&&microSetup.testTier};
+      return {symbol,base:base(symbol),price:state.prices.get(symbol)||0,p1,p3,p5,f60,f5,l5,d,m:meta(symbol),cm,btcCm,mb,threshold,signal,score,follow,label,strategy,strategyLabel,mainSignal,signalVariant,rawFollow,rawLabel,rawStrategy,rawStrategyLabel,rawForecast,forecast,cost,risks,reasons,sweepSide:microSetup&&microSetup.sweepSide,reclaimLevel:microSetup&&microSetup.reclaimLevel,sweepDepthPct:microSetup&&microSetup.sweepDepthPct,testTier:microSetup&&microSetup.testTier};
     }
     function rows(){ return activeSymbols().map(scoreRow).sort((a,b)=>b.score-a.score||Math.abs(b.f60.net)-Math.abs(a.f60.net)||Number(b.m.quoteVolume||0)-Number(a.m.quoteVolume||0)); }
     function allowedStrategySet(){
@@ -2918,7 +2943,7 @@ HTML = r"""
       board.innerHTML=cards.map(renderStrategyCard).join("");
     }
     function renderEvents(){ const list=document.getElementById("eventList"); if(!list)return; const text=[`价格流 ${state.priceConnected?"正常":"异常"}`,`大单流 ${state.tradeConnected?"正常":"异常"}`,`爆仓流 ${state.liqConnected?"正常":"异常"}`,`事件 ${state.events.length}`]; const latest=state.events.slice(0,4).map(ev=>{ const cls=ev.side==="BUY"?"buy":"sell"; return `<div class="event"><div class="event-side ${cls}">${ev.label}</div><div><div class="event-title"><span>${base(ev.symbol)}</span><span>${money(ev.notional)}</span></div><div class="event-meta">${new Date(ev.ts).toLocaleTimeString()} · 后台记录</div></div></div>`; }).join(""); list.innerHTML=`<div class="event"><div></div><div><div class="event-title">后台监控状态</div><div class="event-meta">${text.join(" · ")}</div></div></div>${latest}`; }
-    function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,strategy:r.strategy,strategy_label:r.strategyLabel,main_signal:r.mainSignal,signal_variant:r.signalVariant,test_tier:r.testTier||"",price:r.price,forecast_side:r.forecast.side,forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),forecast_5m_expected_pct:Number(r.forecast.expected5Pct.toFixed(3)),required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),take_profit_pct:r.forecast.targets?Number(r.forecast.targets.takeProfit.toFixed(3)):null,trail_arm_pct:r.forecast.targets?Number(r.forecast.targets.trailArm.toFixed(3)):null,funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),price_1m_pct:Number(r.p1.toFixed(3)),price_3m_pct:Number(r.p3.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,atr_pct:r.cm.atrPct,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),long_liq_5m_usd:Math.round(r.l5.longLiq||0),short_liq_5m_usd:Math.round(r.l5.shortLiq||0),sweep_side:r.sweepSide||"",reclaim_level:r.reclaimLevel||0,sweep_depth_pct:r.sweepDepthPct||0,largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_5m_pct:r.d.oi5Pct,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,book_spread_pct:r.d.bookSpreadPct,book_imbalance:r.d.bookImbalance,bid_depth_usd:r.d.bidDepthUsd,ask_depth_usd:r.d.askDepthUsd,risks:r.risks,reasons:r.reasons})); }
+    function compactRows(){ return rows().slice(0,18).map(r=>({symbol:r.symbol,base:r.base,label:r.label,follow:r.follow,score:r.score,strategy:r.strategy,strategy_label:r.strategyLabel,main_signal:r.mainSignal,signal_variant:r.signalVariant,test_tier:r.testTier||"",price:r.price,forecast_side:r.forecast.side,forecast_5m_prob:Number(r.forecast.prob5.toFixed(1)),forecast_5m_expected_pct:Number(r.forecast.expected5Pct.toFixed(3)),required_cost_pct:Number(r.cost.requiredPct.toFixed(3)),net_edge_pct:Number(r.forecast.netEdgePct.toFixed(3)),take_profit_pct:r.forecast.targets?Number(r.forecast.targets.takeProfit.toFixed(3)):null,trail_arm_pct:r.forecast.targets?Number(r.forecast.targets.trailArm.toFixed(3)):null,funding_cost_pct:Number(r.cost.fundingPct.toFixed(4)),price_1m_pct:Number(r.p1.toFixed(3)),price_3m_pct:Number(r.p3.toFixed(3)),price_5m_pct:Number(r.p5.toFixed(3)),volume_24h_usd:Math.round(r.m.quoteVolume||0),volume_spike:r.cm.volSpike,atr_pct:r.cm.atrPct,channel_high_55:r.cm.high55,channel_low_20:r.cm.low20,ema_trend_gap_pct:r.cm.emaTrendGapPct,trend_ret_24h:r.cm.ret24h,trend_ret_72h:r.cm.ret72h,btc_ema_trend_gap_pct:r.btcCm&&r.btcCm.emaTrendGapPct,btc_trend_ret_24h:r.btcCm&&r.btcCm.ret24h,net_60s_usd:Math.round(r.f60.net),net_5m_usd:Math.round(r.f5.net),long_liq_5m_usd:Math.round(r.l5.longLiq||0),short_liq_5m_usd:Math.round(r.l5.shortLiq||0),sweep_side:r.sweepSide||"",reclaim_level:r.reclaimLevel||0,sweep_depth_pct:r.sweepDepthPct||0,largest_usd:Math.round(r.f60.largest||r.f5.largest),streak_side:r.f60.lastSide,streak_count:r.f60.streak,oi_5m_pct:r.d.oi5Pct,oi_15m_pct:r.d.oi15Pct,taker_ratio:r.d.takerRatio,book_spread_pct:r.d.bookSpreadPct,book_imbalance:r.d.bookImbalance,bid_depth_usd:r.d.bidDepthUsd,ask_depth_usd:r.d.askDepthUsd,risks:r.risks,reasons:r.reasons})); }
     function compactEvents(){ return state.events.slice(0,40).map(e=>({symbol:e.symbol,base:base(e.symbol),label:e.label,side:e.side,price:e.price,notional:Math.round(e.notional),time:new Date(e.ts).toLocaleTimeString()})); }
     function trimOld(){ const cut=now()-6*60*1000; for(const map of [state.trades,state.liquidations]){ for(const [sym,list] of map){ while(list.length&&list[0].ts<cut)list.shift(); if(!list.length)map.delete(sym); } } }
 
@@ -2955,6 +2980,13 @@ HTML = r"""
         book_imbalance:r.d.bookImbalance,
         bid_depth_usd:r.d.bidDepthUsd,
         ask_depth_usd:r.d.askDepthUsd,
+        channel_high_55:r.cm.high55,
+        channel_low_20:r.cm.low20,
+        ema_trend_gap_pct:r.cm.emaTrendGapPct,
+        trend_ret_24h:r.cm.ret24h,
+        trend_ret_72h:r.cm.ret72h,
+        btc_ema_trend_gap_pct:r.btcCm&&r.btcCm.emaTrendGapPct,
+        btc_trend_ret_24h:r.btcCm&&r.btcCm.ret24h,
         risks:r.risks,
       }));
       const payload=toLog.map(r=>({
@@ -2973,6 +3005,13 @@ HTML = r"""
         largest_usd:Math.round(r.f60.largest||r.f5.largest||0),
         streak_side:r.f60.lastSide, streak_count:r.f60.streak,
         volume_spike:r.cm.volSpike, volume_24h_usd:Math.round((r.m&&r.m.quoteVolume)||0),
+        channel_high_55:r.cm.high55,
+        channel_low_20:r.cm.low20,
+        ema_trend_gap_pct:r.cm.emaTrendGapPct,
+        trend_ret_24h:r.cm.ret24h,
+        trend_ret_72h:r.cm.ret72h,
+        btc_ema_trend_gap_pct:r.btcCm&&r.btcCm.emaTrendGapPct,
+        btc_trend_ret_24h:r.btcCm&&r.btcCm.ret24h,
         candle_close_location:isNum(r.cm.closeLocation)?Number(r.cm.closeLocation.toFixed(4)):null,
         candle_body_pct:isNum(r.cm.bodyPct)?Number(r.cm.bodyPct.toFixed(4)):null,
         upper_wick_pct:isNum(r.cm.upperWickPct)?Number(r.cm.upperWickPct.toFixed(4)):null,
@@ -3203,7 +3242,7 @@ HTML = r"""
       document.getElementById("maxPositions").value=data.max_positions||10;
       document.getElementById("autoCloseMinutes").value=data.auto_close_minutes||5;
       document.getElementById("strategyMode").value="current";
-      document.getElementById("strategyModeLabel").value=data.strategy_mode_label||"当前策略：VWAP趋势主信号";
+      document.getElementById("strategyModeLabel").value=data.strategy_mode_label||"当前策略：4h突破趋势";
       updateExecutionModeUi(mode);
     }
     function renderTestnetStatus(data, forceForm=false){
