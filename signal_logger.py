@@ -86,6 +86,8 @@ def init_db() -> None:
                 grade          TEXT,
                 reason         TEXT,
                 margin         REAL,
+                fee            REAL DEFAULT NULL,
+                gross_realized REAL DEFAULT NULL,
                 created_at     TEXT DEFAULT (datetime('now'))
             )
             """
@@ -107,6 +109,13 @@ def init_db() -> None:
             "filled_3m": "ALTER TABLE signals ADD COLUMN filled_3m INTEGER DEFAULT 0",
         }.items():
             if name not in existing_cols:
+                conn.execute(ddl)
+        close_cols = {row["name"] for row in conn.execute("PRAGMA table_info(trade_closes)").fetchall()}
+        for name, ddl in {
+            "fee": "ALTER TABLE trade_closes ADD COLUMN fee REAL DEFAULT NULL",
+            "gross_realized": "ALTER TABLE trade_closes ADD COLUMN gross_realized REAL DEFAULT NULL",
+        }.items():
+            if name not in close_cols:
                 conn.execute(ddl)
         conn.commit()
 
@@ -236,6 +245,8 @@ def _infer_event_type(item: dict) -> str:
 
 
 def log_trade_event(item: dict) -> None:
+    if _infer_event_type(item) == "skip":
+        return
     order = item.get("order") if isinstance(item.get("order"), dict) else {}
     close = item.get("close") if isinstance(item.get("close"), dict) else {}
     symbol = item.get("symbol") or order.get("symbol") or close.get("symbol")
@@ -277,9 +288,9 @@ def log_trade_close(item: dict) -> None:
             """
             INSERT INTO trade_closes (
                 ts, symbol, realized, strategy, strategy_label, main_signal,
-                signal_variant, grade, reason, margin
+                signal_variant, grade, reason, margin, fee, gross_realized
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(item.get("ts") or time.time() * 1000),
@@ -292,8 +303,17 @@ def log_trade_close(item: dict) -> None:
                 item.get("grade"),
                 item.get("reason"),
                 _num(item.get("margin")) if item.get("margin") is not None else None,
+                _num(item.get("fee")) if item.get("fee") is not None else None,
+                _num(item.get("gross_realized")) if item.get("gross_realized") is not None else None,
             ),
         )
+        conn.commit()
+
+
+def clear_trade_history() -> None:
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM trade_events")
+        conn.execute("DELETE FROM trade_closes")
         conn.commit()
 
 
@@ -330,7 +350,7 @@ def get_trade_closes(limit: int = 400) -> list[dict]:
         rows = conn.execute(
             """
             SELECT ts, symbol, realized, strategy, strategy_label, main_signal,
-                   signal_variant, grade, reason, margin
+                   signal_variant, grade, reason, margin, fee, gross_realized
             FROM trade_closes
             ORDER BY ts DESC, id DESC
             LIMIT ?
